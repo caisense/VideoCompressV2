@@ -1,0 +1,59 @@
+__pycache__/
+*.py[cod]
+artifacts/
+.codex_tmp/
+runs/
+tmp/
+cpp/build/
+cpp/install/
+.idea/
+.venv/
+*.wav
+*.h265
+*.sdp
+
+# ============================================================
+# cpp/3rdparty - unused platforms for RK3588 Buildroot Linux
+# ============================================================
+
+# Bundled OpenCV is unused.
+# Current build uses OpenCV from the cross-toolchain sysroot.
+cpp/3rdparty/opencv/
+
+# OpenCL stub is not used by the current RK3588 build.
+cpp/3rdparty/opencl/
+
+# RKNN NPU1 is for older RK1808/RV1109/RV1126 platforms.
+# RK3588 uses rknpu2.
+cpp/3rdparty/rknpu1/
+
+# ------------------------------------------------------------
+# libjpeg-turbo
+# Keep:
+#   cpp/3rdparty/jpeg_turbo/include/
+#   cpp/3rdparty/jpeg_turbo/Linux/aarch64/
+# ------------------------------------------------------------
+cpp/3rdparty/jpeg_turbo/Android/
+cpp/3rdparty/jpeg_turbo/Linux/armhf/
+cpp/3rdparty/jpeg_turbo/Linux/armhf_uclibc/
+cpp/3rdparty/jpeg_turbo/Linux/x64/
+
+# ------------------------------------------------------------
+# librga
+# Keep:
+#   cpp/3rdparty/librga/include/
+#   cpp/3rdparty/librga/Linux/aarch64/
+# ------------------------------------------------------------
+cpp/3rdparty/librga/Android/
+cpp/3rdparty/librga/Linux/armhf/
+cpp/3rdparty/librga/Linux/armhf_uclibc/
+
+# ------------------------------------------------------------
+# RKNN Runtime 2
+# Keep:
+#   cpp/3rdparty/rknpu2/include/
+#   cpp/3rdparty/rknpu2/Linux/aarch64/
+# ------------------------------------------------------------
+cpp/3rdparty/rknpu2/Android/
+cpp/3rdparty/rknpu2/Linux/armhf/
+cpp/3rdparty/rknpu2/Linux/armhf-uclibc/
