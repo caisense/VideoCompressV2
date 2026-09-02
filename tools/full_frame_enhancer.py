@@ -397,6 +397,8 @@ class LatestOnlyEnhancerWorker:
         self.pending: Optional[EnhancementInput] = None
         self.output: Optional[EnhancementOutput] = None
         self.running = False
+        self.running_started_at: Optional[float] = None
+        self.running_sequence: Optional[int] = None
         self.stopping = False
         self.closed = False
         self.error: Optional[str] = None
@@ -498,15 +500,20 @@ class LatestOnlyEnhancerWorker:
                     break
                 item = self.pending
                 self.pending = None
-                self.running = True
             if item is None:
                 continue
             started = time.monotonic()
+            with self.condition:
+                self.running = True
+                self.running_started_at = started
+                self.running_sequence = item.source_sequence
             queue_wait_ms = (started - item.arrived_at) * 1000.0
             if queue_wait_ms > self.max_latency_ms:
                 self._drop(item, "stale_before_infer", queue_wait_ms=queue_wait_ms)
                 with self.condition:
                     self.running = False
+                    self.running_started_at = None
+                    self.running_sequence = None
                     self.condition.notify_all()
                 continue
             infer_started = time.perf_counter()
@@ -553,6 +560,8 @@ class LatestOnlyEnhancerWorker:
             finally:
                 with self.condition:
                     self.running = False
+                    self.running_started_at = None
+                    self.running_sequence = None
                     self.condition.notify_all()
         with self.lock:
             self.closed = True
@@ -566,6 +575,8 @@ class LatestOnlyEnhancerWorker:
                              for timestamp in self.completion_times)
             rolling_5s = sum(timestamp >= now - 5.0
                              for timestamp in self.completion_times)
+            running_age_ms = (0.0 if self.running_started_at is None else
+                              max(0.0, (now - self.running_started_at) * 1000.0))
             return {
                 "backend": self.backend,
                 "provider": self.provider,
@@ -588,6 +599,8 @@ class LatestOnlyEnhancerWorker:
                 "rolling_5s_fps": rolling_5s / 5.0,
                 "rolling_10s_fps": len(self.completion_times) / 10.0,
                 "running": self.running,
+                "running_age_ms": running_age_ms,
+                "running_sequence": self.running_sequence,
                 "pending": self.pending is not None,
                 "output_ready": self.output is not None,
                 "max_latency_ms": self.max_latency_ms,

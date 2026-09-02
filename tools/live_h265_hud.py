@@ -480,6 +480,38 @@ def postprocess_frame(frame: np.ndarray, rotation: str, denoise: bool) -> np.nda
     return frame
 
 
+def gan_fallback_stale_after_ms(source_fps: float, max_latency_ms: float) -> float:
+    """Bound a stalled enhancer to two source-frame intervals at most.
+
+    The worker's latency budget rejects a late result only after its provider
+    call returns.  This separate display budget prevents one stuck CUDA/ORT
+    call from leaving the last enhanced canvas on screen indefinitely.
+    """
+    fps = max(1.0, float(source_fps))
+    return max(2000.0 / fps, 1.5 * max(1.0, float(max_latency_ms)))
+
+
+def should_use_gan_fallback(frame: Optional[np.ndarray], source_sequence: Optional[int],
+                            current_source_sequence: Optional[int], current_updated: float,
+                            fallback_active: bool, now: float, source_fps: float,
+                            max_latency_ms: float) -> bool:
+    """Return whether the current GAN canvas must be refreshed from decoded video."""
+    if frame is None or source_sequence is None:
+        return False
+    if current_source_sequence is None:
+        return True
+    if fallback_active and source_sequence != current_source_sequence:
+        return True
+    return (now - current_updated) * 1000.0 >= gan_fallback_stale_after_ms(
+        source_fps, max_latency_ms)
+
+
+def gan_lanczos_fallback(frame: np.ndarray, rotation: str) -> np.ndarray:
+    """Keep GAN video live while an asynchronous neural enhancer is stalled."""
+    output = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LANCZOS4)
+    return postprocess_frame(output, rotation, False)
+
+
 def display_dimensions(width: int, height: int, rotation: str, scale: int) -> Tuple[int, int]:
     """Return the OpenCV window size after display rotation."""
     if rotation in ("cw90", "ccw90"):
@@ -817,6 +849,7 @@ def main() -> int:
     current_updated = 0.0
     current_source_sequence: Optional[int] = None
     current_mode = "normal"
+    gan_fallback_active = False
     try:
         while not stopping.is_set():
             now = time.monotonic()
@@ -836,6 +869,7 @@ def main() -> int:
                 next_rebuild_present = now
                 next_gan_present = now
                 current_mode = requested_mode
+                gan_fallback_active = False
                 if previous_mode == "rebuild" and not is_rebuild:
                     disable_rebuild_components()
                 if previous_mode == "gan" and not is_gan:
@@ -869,10 +903,31 @@ def main() -> int:
                         break
                     newest_output = output
                 if newest_output is not None:
+                    if gan_fallback_active:
+                        print("GAN enhancer recovered; leaving Lanczos4 fallback", flush=True)
                     current_canvas = postprocess_frame(
                         newest_output.frame, args.rotate, False)
                     current_updated = newest_output.completed_at
                     current_source_sequence = newest_output.source_sequence
+                    gan_fallback_active = False
+                else:
+                    worker_values = worker.snapshot()
+                    entering_fallback = (current_source_sequence is not None and
+                                         not gan_fallback_active)
+                    if should_use_gan_fallback(
+                            frame, source_sequence, current_source_sequence, current_updated,
+                            gan_fallback_active, now, float(profile["fps"]),
+                            float(worker_values["max_latency_ms"])):
+                        current_canvas = gan_lanczos_fallback(frame, args.rotate)
+                        current_updated = updated
+                        current_source_sequence = source_sequence
+                        gan_fallback_active = True
+                        if entering_fallback:
+                            print(
+                                "GAN enhancer stalled for %.0f ms; using live Lanczos4 fallback" %
+                                worker_values["running_age_ms"],
+                                flush=True,
+                            )
                 if now >= next_gan_present:
                     interval = 1.0 / (args.gan_display_fps or float(profile["fps"]))
                     skipped = max(0, int((now - next_gan_present) / interval))
@@ -880,7 +935,8 @@ def main() -> int:
                     if current_source_sequence is not None:
                         presentation.present(
                             current_source_sequence,
-                            f"GAN-{worker.backend.upper()}",
+                            ("GAN-FALLBACK-LANCZOS" if gan_fallback_active else
+                             f"GAN-{worker.backend.upper()}"),
                             int(profile["generation"]),
                             now,
                         )
@@ -982,9 +1038,11 @@ def main() -> int:
                             f" pc_p99_ms={gan_values['p99_ms']:.1f}"
                             f" queue_wait_ms={gan_values['last_queue_wait_ms']:.1f}"
                             f" running={int(gan_values['running'])}"
+                            f" running_age_ms={gan_values['running_age_ms']:.1f}"
                             f" pending={int(gan_values['pending'])}"
                             f" dropped={gan_values['dropped']}"
                             f" dropped_pct={gan_values['drop_percent']:.1f}"
+                            f" fallback={int(gan_fallback_active)}"
                             f" rtp_kbps={values['rtp_kbps']:.1f}"
                             f" wire_kbps={values['wire_kbps']:.1f}"
                             f" link_cap_kbps=100"
@@ -1075,11 +1133,15 @@ def main() -> int:
                     f"S{composer_values['sr_stale']}",
                 ]
             elif is_gan:
+                output_backend = (
+                    "FALLBACK / Lanczos4" if gan_fallback_active else
+                    f"{gan_values['backend'].upper()} / {gan_values['provider']}"
+                )
                 lines = [
                     f"GAN H265-only  RX {values['rx_fps']:.1f}  DEC {values['decode_fps']:.1f}  "
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
-                    f"INPUT 256x144  NATIVE 512x288  OUTPUT 640x360  "
-                    f"{gan_values['backend'].upper()} / {gan_values['provider']}",
+                    "INPUT 256x144  NATIVE 512x288",
+                    f"OUTPUT 640x360  {output_backend}",
                     f"H265 {values['rtp_kbps']:.1f} kbps  WIRE {values['wire_kbps']:.1f} kbps  LINK CAP 100",
                     f"PC LAST {gan_values['last_total_pc_ms']:.1f} ms  "
                     f"P50/P95/P99 {gan_values['p50_ms']:.1f}/"
@@ -1089,6 +1151,10 @@ def main() -> int:
                     f"P/I {values['p_fps']:.1f}/{values['i_fps']:.1f}  "
                     f"PACKETS {values['packets']}  LOSS {values['lost']}  ERR {values['decode_errors']}",
                 ]
+                if gan_fallback_active:
+                    lines.append(
+                        f"FALLBACK Lanczos4  SR running {gan_values['running_age_ms']:.0f} ms"
+                    )
                 if profile is not None:
                     lines.append(
                         f"Profile {profile['name']}   {profile['width']}x{profile['height']} @ "

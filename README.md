@@ -68,6 +68,14 @@ per-source-frame fields needed to reproduce those rates. The source H.265 frame 
 map is reused on the board, while the PC enhancer still receives the live full
 frame cadence.
 
+A CUDA/ONNX call cannot be safely cancelled from the Python worker thread. If a
+valid enhanced result has not arrived for the larger of two source-frame periods
+and `1.5 × --gan-max-inference-latency-ms`, the HUD switches immediately to a
+fresh `640×360` Lanczos4 frame from the newest decoded video. It labels that
+state as `OUTPUT ... FALLBACK / Lanczos4` and returns to the selected enhancer
+when it recovers, so a stuck enhancer cannot freeze the displayed frame or let
+`Source age` grow for seconds.
+
 Start the board and receiver as separate processes. Run the sender in the
 Linux shell on board `root@192.168.0.101`, and run the receiver in a separate
 PowerShell window from `D:\workspace\videoCompressV2`:

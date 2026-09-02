@@ -166,6 +166,19 @@ class HudTests(unittest.TestCase):
         self.assertEqual(rotated.shape, (7, 4, 3))
         self.assertEqual(tuple(rotated[6, 0]), (255, 0, 0))
 
+    def test_gan_fallback_bounds_stalled_enhancer_and_preserves_output_size(self):
+        frame = HUD.np.zeros((144, 256, 3), dtype=HUD.np.uint8)
+        self.assertEqual(HUD.gan_fallback_stale_after_ms(10, 100), 200.0)
+        self.assertTrue(HUD.should_use_gan_fallback(
+            frame, 1, None, 0.0, False, 10.0, 10.0, 100.0))
+        self.assertFalse(HUD.should_use_gan_fallback(
+            frame, 1, 1, 10.0, False, 10.19, 10.0, 100.0))
+        self.assertTrue(HUD.should_use_gan_fallback(
+            frame, 1, 1, 10.0, False, 10.21, 10.0, 100.0))
+        self.assertTrue(HUD.should_use_gan_fallback(
+            frame, 2, 1, 10.01, True, 10.02, 10.0, 100.0))
+        self.assertEqual(HUD.gan_lanczos_fallback(frame, "none").shape, (360, 640, 3))
+
     def test_window_dimensions_follow_rotation(self):
         self.assertEqual(HUD.display_dimensions(320, 180, "ccw90", 3), (540, 960))
         self.assertEqual(HUD.display_dimensions(320, 180, "none", 3), (960, 540))

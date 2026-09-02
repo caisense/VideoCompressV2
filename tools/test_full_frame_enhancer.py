@@ -93,6 +93,21 @@ class FullFrameEnhancerTests(unittest.TestCase):
         finally:
             worker.stop()
 
+    def test_snapshot_reports_age_of_an_inflight_enhancement(self) -> None:
+        fake = SlowFakeEnhancer(0.08)
+        worker = LatestOnlyEnhancerWorker(fake, max_latency_ms=500)
+        frame = np.zeros((144, 256, 3), dtype=np.uint8)
+        try:
+            self.assertTrue(worker.submit(frame, 11, input_fps=10))
+            self.assertTrue(fake.started.wait(1.0))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["running_age_ms"] >= 5.0))
+            values = worker.snapshot()
+            self.assertTrue(values["running"])
+            self.assertEqual(values["running_sequence"], 11)
+            self.assertGreater(values["running_age_ms"], 0.0)
+        finally:
+            worker.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
