@@ -11,6 +11,9 @@ enum PipelineMode {
     PIPELINE_BASELINE = 0,
     PIPELINE_BBOX_ROI = 1,
     PIPELINE_SEGMENTATION_ROI = 2,
+    // YOLO remains on the board for semantic ROI/QP control. The PC does not
+    // receive semantic/reference side-channel data in this mode.
+    PIPELINE_GAN = 3,
 };
 
 enum RateProfile {
@@ -20,6 +23,8 @@ enum RateProfile {
     // A low-rate live base layer plus semantic state and sparse source-camera
     // references.  The PC reconstructs a 640x360@12 display from this stream.
     RATE_PROFILE_REBUILD = 3,
+    // Full-frame enhancement is a PC-side presentation path over H.265 only.
+    RATE_PROFILE_GAN = 4,
 };
 
 // Video is the normal H.265/RTP path.  Image mode leaves capture and YOLO
@@ -134,6 +139,18 @@ struct EncoderConfig {
     EncoderConfig();
 };
 
+struct GanConfig {
+    // The board source/encoder cadence is one of the three acceptance rates.
+    int fps;
+    // Zero means run YOLO at the source cadence; a positive value enables
+    // latest-map reuse between less frequent inference passes.
+    int inference_fps;
+    int video_bitrate_kbps;
+    int max_inference_latency_ms;
+
+    GanConfig();
+};
+
 struct TransportConfig {
     std::string udp_host;
     int udp_port;
@@ -144,7 +161,7 @@ struct TransportConfig {
     // Optional receiver SDP emitted from the first IDR access unit.  It carries
     // the H.265 VPS/SPS/PPS required by FFmpeg to determine frame dimensions.
     std::string rtp_sdp_path;
-    // Runtime profile commands are written as low/medium/high/rebuild lines to this
+    // Runtime profile commands are written as low/medium/high/rebuild/gan lines to this
     // FIFO. image/snapshot switches to detection-triggered JPEG transfer;
     // video returns to H.265. Empty disables live switching.
     std::string profile_control_path;
@@ -245,6 +262,7 @@ struct AppConfig {
     RateProfile rate_profile;
     CameraConfig camera;
     EncoderConfig encoder;
+    GanConfig gan;
     RoiConfig roi;
     TransportConfig transport;
     AudioConfig audio;

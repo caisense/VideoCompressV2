@@ -22,6 +22,7 @@ import numpy as np
 _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
+from full_frame_enhancer import FullFrameEnhancer, LatestOnlyEnhancerWorker
 from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
@@ -71,7 +72,7 @@ class RtpStats:
         payload = packet[offset + 4:offset + 4 + words * 4]
         if len(payload) < 8 or payload[0] != 1:
             return None
-        names = {0: "low", 1: "medium", 2: "high", 3: "rebuild"}
+        names = {0: "low", 1: "medium", 2: "high", 3: "rebuild", 4: "gan"}
         return {
             "name": names.get(payload[1], "unknown"),
             "width": int.from_bytes(payload[2:4], "big"),
@@ -321,12 +322,13 @@ class LatestFrame:
         self.sequence = 0
         self.rtp_timestamp: Optional[int] = None
 
-    def put(self, frame: np.ndarray, rtp_timestamp: Optional[int] = None) -> None:
+    def put(self, frame: np.ndarray, rtp_timestamp: Optional[int] = None) -> int:
         with self.lock:
             self.frame = frame
             self.updated = time.monotonic()
             self.sequence += 1
             self.rtp_timestamp = rtp_timestamp
+            return self.sequence
 
     def get(self) -> Tuple[Optional[np.ndarray], float]:
         with self.lock:
@@ -511,6 +513,25 @@ def main() -> int:
                         help="small-ROI Real-ESRGAN; auto falls back to Lanczos4")
     parser.add_argument("--esrgan-model", default=None)
     parser.add_argument("--esrgan-threads", type=int, default=2)
+    parser.add_argument("--gan-enhancer", choices=("none", "esrnet", "esrgan"), default="none",
+                        help="GAN profile full-frame backend; none is the Lanczos4 baseline")
+    parser.add_argument("--gan-esrnet-model", default=None,
+                        help="Real-ESRNet x2 ONNX model; required with --gan-enhancer=esrnet")
+    parser.add_argument(
+        "--gan-esrgan-model",
+        default=str(Path(__file__).resolve().parents[1] / "model" / "RealESRGAN_x2_dynamic.onnx"),
+        help="Real-ESRGAN x2 ONNX model; used with --gan-enhancer=esrgan",
+    )
+    parser.add_argument("--gan-require-cuda", action="store_true",
+                        help="fail instead of falling back to CPU for a GAN model")
+    parser.add_argument("--gan-threads", type=int, default=2)
+    parser.add_argument("--gan-warmup", type=int, default=4,
+                        help="live-shape model warmup frames before output")
+    parser.add_argument("--gan-max-inference-latency-ms", type=int, default=100)
+    parser.add_argument("--gan-display-fps", type=float, default=0.0,
+                        help="presentation cadence; 0 follows the encoded source fps")
+    parser.add_argument("--gan-debug-log", default=None,
+                        help="JSONL per-frame enhancer telemetry path")
     parser.add_argument("--rebuild-boxes", choices=("on", "off"), default="off",
                         help="diagnostic target rectangles; off avoids display overlays")
     parser.add_argument("--headless", action="store_true", help="print HUD metrics without opening a window")
@@ -520,7 +541,8 @@ def main() -> int:
             args.rebuild_width <= 0 or args.rebuild_height <= 0 or
             args.rebuild_fps <= 0 or args.rebuild_reference_max_age <= 0 or
             args.rebuild_max_sync_ms <= 0 or
-            args.esrgan_threads < 0):
+            args.esrgan_threads < 0 or args.gan_threads < 0 or args.gan_warmup < 0 or
+            args.gan_max_inference_latency_ms <= 0 or args.gan_display_fps < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
 
     _, listen_port = parse_sdp(args.sdp)
@@ -533,21 +555,48 @@ def main() -> int:
     rebuild_port = args.rebuild_port or listen_port + 5
     if rebuild_port < 1 or rebuild_port > 65535 or rebuild_port == listen_port:
         parser.error("rebuild port must be a valid UDP port distinct from video RTP")
-    rebuild_receiver = RebuildReceiver(
-        rebuild_port, max_sync_ms=args.rebuild_max_sync_ms)
-    resolver = SuperResolver(
-        enabled=False, model_path=args.esrgan_model,
-        cpu_threads=args.esrgan_threads)
-    rebuild_composer = RebuildComposer(
-        output_size=(args.rebuild_width, args.rebuild_height), resolver=resolver,
-        reference_max_age=args.rebuild_reference_max_age,
-        draw_targets=args.rebuild_boxes == "on")
+    # Rebuild objects are lazy.  In particular, the GAN receiver must not bind
+    # the RB/1 port or instantiate any semantic/reference compositor.
+    rebuild_receiver: Optional[RebuildReceiver] = None
+    resolver: Optional[SuperResolver] = None
+    rebuild_composer: Optional[RebuildComposer] = None
+
+    def ensure_rebuild_components() -> bool:
+        nonlocal rebuild_receiver, resolver, rebuild_composer
+        if rebuild_receiver is not None and rebuild_composer is not None:
+            return True
+        candidate_receiver = RebuildReceiver(
+            rebuild_port, max_sync_ms=args.rebuild_max_sync_ms)
+        candidate_resolver = SuperResolver(
+            enabled=False, model_path=args.esrgan_model,
+            cpu_threads=args.esrgan_threads)
+        candidate_composer = RebuildComposer(
+            output_size=(args.rebuild_width, args.rebuild_height), resolver=candidate_resolver,
+            reference_max_age=args.rebuild_reference_max_age,
+            draw_targets=args.rebuild_boxes == "on")
+        try:
+            candidate_receiver.start(stopping)
+        except OSError as error:
+            candidate_composer.close()
+            print(f"cannot bind RB/1 UDP {rebuild_port}: {error}", file=sys.stderr)
+            return False
+        rebuild_receiver = candidate_receiver
+        resolver = candidate_resolver
+        rebuild_composer = candidate_composer
+        print(f"RB/1 rebuild companion listening on UDP {rebuild_port}", flush=True)
+        return True
+
+    def disable_rebuild_components() -> None:
+        nonlocal rebuild_receiver, resolver, rebuild_composer
+        if rebuild_receiver is not None:
+            rebuild_receiver.close()
+        if rebuild_composer is not None:
+            rebuild_composer.close()
+        rebuild_receiver = None
+        rebuild_composer = None
+        resolver = None
+
     presentation = PresentationStats()
-    try:
-        rebuild_receiver.start(stopping)
-    except OSError as error:
-        parser.error(f"cannot bind RB/1 UDP {rebuild_port}: {error}")
-    print(f"RB/1 rebuild companion listening on UDP {rebuild_port}", flush=True)
 
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
@@ -565,6 +614,76 @@ def main() -> int:
     decoder_lock = threading.Lock()
     decoder_state = {"process": None, "generation": None, "token": 0}
     decoder_threads = []
+    gan_worker_lock = threading.Lock()
+    gan_worker_holder = {"worker": None}
+
+    def set_gan_worker(worker: Optional[LatestOnlyEnhancerWorker]) -> None:
+        with gan_worker_lock:
+            gan_worker_holder["worker"] = worker
+
+    def get_gan_worker() -> Optional[LatestOnlyEnhancerWorker]:
+        with gan_worker_lock:
+            return gan_worker_holder["worker"]
+
+    gan_worker: Optional[LatestOnlyEnhancerWorker] = None
+
+    def ensure_gan_worker(profile: dict) -> bool:
+        nonlocal gan_worker
+        if gan_worker is not None:
+            return True
+        if profile.get("width") != 256 or profile.get("height") != 144:
+            print(
+                f"GAN profile has unexpected input size {profile.get('width')}x"
+                f"{profile.get('height')} (expected 256x144)",
+                file=sys.stderr,
+            )
+            return False
+        model_path = (
+            args.gan_esrnet_model
+            if args.gan_enhancer == "esrnet"
+            else args.gan_esrgan_model
+        )
+        try:
+            print(
+                f"GAN WARMING: backend={args.gan_enhancer} input=256x144 "
+                f"warmup={args.gan_warmup}",
+                flush=True,
+            )
+            enhancer = FullFrameEnhancer(
+                args.gan_enhancer,
+                model_path=model_path,
+                input_size=(256, 144),
+                native_size=(512, 288),
+                output_size=(640, 360),
+                require_cuda=args.gan_require_cuda,
+                threads=args.gan_threads,
+                warmup=args.gan_warmup,
+            )
+            worker = LatestOnlyEnhancerWorker(
+                enhancer,
+                max_latency_ms=args.gan_max_inference_latency_ms,
+                debug_log=args.gan_debug_log,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"GAN enhancer initialization failed: {error}", file=sys.stderr)
+            return False
+        gan_worker = worker
+        set_gan_worker(worker)
+        print(
+            f"GAN READY: full-frame enhancer ready: backend={worker.backend} "
+            f"provider={worker.provider} input=256x144 native=512x288 output=640x360 "
+            f"max_latency_ms={args.gan_max_inference_latency_ms}",
+            flush=True,
+        )
+        return True
+
+    def disable_gan_worker() -> None:
+        nonlocal gan_worker
+        worker = gan_worker
+        gan_worker = None
+        set_gan_worker(None)
+        if worker is not None:
+            worker.stop()
 
     def decode_loop(process: subprocess.Popen, token: int) -> None:
         assert process.stdout is not None
@@ -575,8 +694,16 @@ def main() -> int:
             with decoder_lock:
                 current = token == decoder_state["token"]
             if current:
-                latest.put(frame, decoded_pts.pop())
+                rtp_timestamp = decoded_pts.pop()
+                source_sequence = latest.put(frame, rtp_timestamp)
                 stats.on_decoded_frame()
+                worker = get_gan_worker()
+                if worker is not None:
+                    profile = stats.snapshot()["profile"]
+                    worker.submit(
+                        frame, source_sequence, rtp_timestamp,
+                        input_fps=0.0 if profile is None else float(profile["fps"]),
+                    )
 
     def stderr_loop(process: subprocess.Popen) -> None:
         assert process.stderr is not None
@@ -685,6 +812,7 @@ def main() -> int:
     started_at = time.monotonic()
     last_report = 0.0
     next_rebuild_present = started_at
+    next_gan_present = started_at
     current_canvas: Optional[np.ndarray] = None
     current_updated = 0.0
     current_source_sequence: Optional[int] = None
@@ -699,29 +827,68 @@ def main() -> int:
             values = stats.snapshot()
             profile = values["profile"]
             is_rebuild = profile is not None and profile["name"] == "rebuild"
-            if current_mode != ("rebuild" if is_rebuild else "normal"):
+            is_gan = profile is not None and profile["name"] == "gan"
+            requested_mode = "gan" if is_gan else ("rebuild" if is_rebuild else "normal")
+            if current_mode != requested_mode:
+                previous_mode = current_mode
                 current_canvas = None
                 current_source_sequence = None
                 next_rebuild_present = now
-                current_mode = "rebuild" if is_rebuild else "normal"
-                if is_rebuild and args.esrgan != "off":
-                    resolver.enable_async()
+                next_gan_present = now
+                current_mode = requested_mode
+                if previous_mode == "rebuild" and not is_rebuild:
+                    disable_rebuild_components()
+                if previous_mode == "gan" and not is_gan:
+                    disable_gan_worker()
+                if is_rebuild:
+                    if not ensure_rebuild_components():
+                        stopping.set()
+                        break
+                    if args.esrgan != "off" and resolver is not None:
+                        resolver.enable_async()
+                if is_gan and not ensure_gan_worker(profile):
+                    stopping.set()
+                    break
 
             # A completed RB/1 reference reaches this queue on the socket
             # thread.  Give Real-ESRGAN the crop immediately; do not wait for
             # the 12 fps renderer to find a STATE/PTS-valid moment to paint
             # it.  The compositor still applies all existing fail-closed
             # generation, STATE, PTS and registration checks at blend time.
-            if is_rebuild:
+            if is_rebuild and rebuild_receiver is not None and rebuild_composer is not None:
                 for reference in rebuild_receiver.take_completed_references():
                     rebuild_composer.prefetch(reference)
                 rebuild_composer.prefetch_pending()
 
-            if is_rebuild and now >= next_rebuild_present:
+            worker = gan_worker if is_gan else None
+            if is_gan and worker is not None:
+                newest_output = None
+                while True:
+                    output = worker.poll_output()
+                    if output is None:
+                        break
+                    newest_output = output
+                if newest_output is not None:
+                    current_canvas = postprocess_frame(
+                        newest_output.frame, args.rotate, False)
+                    current_updated = newest_output.completed_at
+                    current_source_sequence = newest_output.source_sequence
+                if now >= next_gan_present:
+                    interval = 1.0 / (args.gan_display_fps or float(profile["fps"]))
+                    skipped = max(0, int((now - next_gan_present) / interval))
+                    next_gan_present += (skipped + 1) * interval
+                    if current_source_sequence is not None:
+                        presentation.present(
+                            current_source_sequence,
+                            f"GAN-{worker.backend.upper()}",
+                            int(profile["generation"]),
+                            now,
+                        )
+            elif is_rebuild and now >= next_rebuild_present:
                 interval = 1.0 / args.rebuild_fps
                 skipped = max(0, int((now - next_rebuild_present) / interval))
                 next_rebuild_present += (skipped + 1) * interval
-                if frame is not None:
+                if frame is not None and rebuild_receiver is not None and rebuild_composer is not None:
                     base = frame
                     if args.denoise == "on":
                         base = cv2.bilateralFilter(base, 5, 24.0, 24.0)
@@ -740,22 +907,32 @@ def main() -> int:
                     current_source_sequence = source_sequence
                     presentation.present(source_sequence, spatial,
                                          profile_generation, now)
-            elif not is_rebuild:
+            elif not is_rebuild and not is_gan:
                 if frame is not None and current_source_sequence != source_sequence:
                     current_canvas = postprocess_frame(
                         frame, args.rotate, args.denoise == "on")
                     current_updated = updated
                     current_source_sequence = source_sequence
 
-            rebuild_values = rebuild_receiver.snapshot()
-            composer_values = rebuild_composer.snapshot()
+            rebuild_values = (
+                rebuild_receiver.snapshot()
+                if is_rebuild and rebuild_receiver is not None
+                else {}
+            )
+            composer_values = (
+                rebuild_composer.snapshot()
+                if is_rebuild and rebuild_composer is not None
+                else {}
+            )
+            gan_values = worker.snapshot() if is_gan and worker is not None else {}
             presentation_values = presentation.snapshot()
             if args.headless:
                 # A headless report can fall between two rebuild presentation
                 # ticks (12 fps).  Refresh the synchronized PTS here so the
                 # log never hides a live value as ``none`` merely because the
                 # reporting wall-clock tick did not render a frame.
-                if is_rebuild and sync_ms is None and source_rtp_timestamp is not None:
+                if (is_rebuild and rebuild_receiver is not None and
+                        sync_ms is None and source_rtp_timestamp is not None):
                     _, _, _, _, sync_ms = rebuild_receiver.scene_synced(
                         source_rtp_timestamp)
                     # scene_synced may learn a new median bias; report the
@@ -791,6 +968,28 @@ def main() -> int:
                             f" sync_drops={rebuild_values['sync_drops']}"
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
+                    elif is_gan:
+                        gan_text = (
+                            f" source_fps={profile['fps']}"
+                            f" enhanced_fps={gan_values['rolling_1s_fps']:.1f}"
+                            f" display_fps={presentation_values['fps']:.1f}"
+                            f" enhancer={gan_values['backend']}"
+                            f" provider={gan_values['provider']}"
+                            f" input=256x144 native=512x288 output=640x360"
+                            f" infer_last_ms={gan_values['last_infer_ms']:.1f}"
+                            f" pc_p50_ms={gan_values['p50_ms']:.1f}"
+                            f" pc_p95_ms={gan_values['p95_ms']:.1f}"
+                            f" pc_p99_ms={gan_values['p99_ms']:.1f}"
+                            f" queue_wait_ms={gan_values['last_queue_wait_ms']:.1f}"
+                            f" running={int(gan_values['running'])}"
+                            f" pending={int(gan_values['pending'])}"
+                            f" dropped={gan_values['dropped']}"
+                            f" dropped_pct={gan_values['drop_percent']:.1f}"
+                            f" rtp_kbps={values['rtp_kbps']:.1f}"
+                            f" wire_kbps={values['wire_kbps']:.1f}"
+                            f" link_cap_kbps=100"
+                        )
+                        rebuild_text = gan_text
                     print(
                         f"profile={profile_text} "
                         f"rx_fps={values['rx_fps']:.1f} decode_fps={values['decode_fps']:.1f} "
@@ -804,14 +1003,14 @@ def main() -> int:
                 time.sleep(0.01)
                 continue
             if current_canvas is None:
-                blank_width = args.rebuild_width if is_rebuild else args.width
-                blank_height = args.rebuild_height if is_rebuild else args.height
+                blank_width = args.rebuild_width if is_rebuild else (640 if is_gan else args.width)
+                blank_height = args.rebuild_height if is_rebuild else (360 if is_gan else args.height)
                 canvas = postprocess_frame(
                     np.zeros((blank_height, blank_width, 3), dtype=np.uint8),
                     args.rotate, False)
             else:
                 canvas = current_canvas.copy()
-            effective_scale = args.scale or (1 if is_rebuild else 3)
+            effective_scale = args.scale or (1 if (is_rebuild or is_gan) else 3)
             display_size = (canvas.shape[1] * effective_scale,
                             canvas.shape[0] * effective_scale)
             if not args.headless and display_size != window_size:
@@ -819,7 +1018,7 @@ def main() -> int:
                 window_size = display_size
             if effective_scale != 1:
                 canvas = cv2.resize(canvas, display_size, interpolation=cv2.INTER_LANCZOS4)
-            if is_rebuild:
+            if is_rebuild and rebuild_receiver is not None:
                 state, _, _, _, sync_ms = rebuild_receiver.scene_synced(
                     source_rtp_timestamp)
                 output_width = state.output_width if state is not None else args.rebuild_width
@@ -875,6 +1074,26 @@ def main() -> int:
                     f"P{1 if composer_values['sr_pending'] else 0} "
                     f"S{composer_values['sr_stale']}",
                 ]
+            elif is_gan:
+                lines = [
+                    f"GAN H265-only  RX {values['rx_fps']:.1f}  DEC {values['decode_fps']:.1f}  "
+                    f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
+                    f"INPUT 256x144  NATIVE 512x288  OUTPUT 640x360  "
+                    f"{gan_values['backend'].upper()} / {gan_values['provider']}",
+                    f"H265 {values['rtp_kbps']:.1f} kbps  WIRE {values['wire_kbps']:.1f} kbps  LINK CAP 100",
+                    f"PC LAST {gan_values['last_total_pc_ms']:.1f} ms  "
+                    f"P50/P95/P99 {gan_values['p50_ms']:.1f}/"
+                    f"{gan_values['p95_ms']:.1f}/{gan_values['p99_ms']:.1f} ms",
+                    f"QUEUE running={int(gan_values['running'])} pending={int(gan_values['pending'])} "
+                    f"drop={gan_values['dropped']} ({gan_values['drop_percent']:.1f}%)",
+                    f"P/I {values['p_fps']:.1f}/{values['i_fps']:.1f}  "
+                    f"PACKETS {values['packets']}  LOSS {values['lost']}  ERR {values['decode_errors']}",
+                ]
+                if profile is not None:
+                    lines.append(
+                        f"Profile {profile['name']}   {profile['width']}x{profile['height']} @ "
+                        f"{profile['fps']} fps   Gen {profile['generation']}"
+                    )
             else:
                 lines = [
                     f"RX {values['rx_fps']:.1f} fps   Decode {values['decode_fps']:.1f} fps   "
@@ -898,22 +1117,22 @@ def main() -> int:
                 age_ms = max(0.0, (time.monotonic() - current_updated) * 1000.0)
                 idr = "none" if values["idr_age"] is None else f"{values['idr_age']:.1f}s ago"
                 lines.append(f"Source age {age_ms:.0f} ms   Last IDR {idr}")
-            font_scale = 0.40 if is_rebuild else 0.58
-            line_height = 21 if is_rebuild else 26
+            font_scale = 0.40 if (is_rebuild or is_gan) else 0.58
+            line_height = 21 if (is_rebuild or is_gan) else 26
             for index, line in enumerate(lines):
                 cv2.putText(canvas, line, (8 if is_rebuild else 10,
                             20 + index * line_height if is_rebuild else 24 + index * line_height),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                             (80, 255, 80), 1, cv2.LINE_AA)
             cv2.imshow(window, canvas)
-            key = cv2.waitKey(1 if is_rebuild else 20) & 0xFF
+            key = cv2.waitKey(1 if (is_rebuild or is_gan) else 20) & 0xFF
             if key in (ord("q"), 27):
                 break
     finally:
         stopping.set()
         receiver.close()
-        rebuild_receiver.close()
-        rebuild_composer.close()
+        disable_rebuild_components()
+        disable_gan_worker()
         with decoder_lock:
             stop_decoder_locked()
         if not args.headless:

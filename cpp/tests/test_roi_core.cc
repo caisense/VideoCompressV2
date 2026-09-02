@@ -303,6 +303,40 @@ void testCommandLineConfig() {
     CHECK(!rebuild.encoder.grayscale_encode);
     CHECK(std::string(roi_h265::rateProfileName(rebuild.rate_profile)) == "rebuild");
 
+    char gan_mode[] = "--mode=gan";
+    char gan_fps[] = "--gan-fps=8";
+    char gan_inference_fps[] = "--gan-inference-fps=4";
+    char gan_bitrate[] = "--gan-video-bitrate-kbps=75";
+    char gan_latency[] = "--gan-max-inference-latency-ms=90";
+    char *gan_argv[] = {profile_app, gan_mode, gan_fps, gan_inference_fps,
+                        gan_bitrate, gan_latency};
+    AppConfig gan;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(6, gan_argv, &gan, &error));
+    CHECK(gan.mode == roi_h265::PIPELINE_GAN);
+    CHECK(gan.rate_profile == roi_h265::RATE_PROFILE_GAN);
+    CHECK(gan.encoder.width == 256 && gan.encoder.height == 144);
+    CHECK(gan.encoder.fps == 8 && gan.gan.fps == 8 && gan.encoder.gop == 16);
+    CHECK(gan.gan.inference_fps == 4 && gan.gan.max_inference_latency_ms == 90);
+    CHECK(gan.encoder.target_bitrate_bps == 75000);
+    CHECK(gan.transport.pacing_bitrate_bps == 100000);
+    CHECK(gan.transport.mode == roi_h265::TRANSPORT_MODE_VIDEO);
+    CHECK(!gan.transport.event.enabled);
+    CHECK(!gan.encoder.grayscale_encode);
+    CHECK(std::string(roi_h265::pipelineModeName(gan.mode)) == "gan");
+    CHECK(std::string(roi_h265::rateProfileName(gan.rate_profile)) == "gan");
+
+    char bad_gan_fps[] = "--gan-fps=9";
+    char *bad_gan_argv[] = {profile_app, gan_mode, bad_gan_fps};
+    AppConfig invalid_gan;
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, bad_gan_argv, &invalid_gan, &error));
+
+    char bad_gan_transport[] = "--transport-mode=image";
+    char *bad_gan_transport_argv[] = {profile_app, gan_mode, bad_gan_transport};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, bad_gan_transport_argv, &invalid_gan, &error));
+
     char rebuild_override[] = "--encoder-width=320";
     char *invalid_rebuild_argv[] = {profile_app, profile_rebuild, rebuild_override};
     AppConfig invalid_rebuild;

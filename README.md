@@ -9,11 +9,12 @@
 ```
 ## Rate profiles
 
-Use `--rate-profile=low|medium|high|rebuild` (or the shorter `--profile=`) to select a
+Use `--rate-profile=low|medium|high|rebuild|gan` (or the shorter `--profile=`) to select a
 complete synchronized sender profile. Options written after `low`/`medium`/`high`
 can override individual values. `rebuild` is deliberately atomic: its wire size,
 FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
-options from another profile.
+options from another profile. `gan` is also atomic: it is H.265-only on the wire,
+uses a 100 kbps shared physical ceiling, and never starts the rebuild side channels.
 
 | Profile | Wire source / FPS | H.265 target | Shared physical A/V cap | PC display |
 | --- | --- | ---: | ---: | --- |
@@ -21,6 +22,7 @@ options from another profile.
 | `medium` | 480×270 / 15 fps | 110 kbps | 150 kbps | decoded color video |
 | `high` | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
 | `rebuild` | 256×144 / 6 fps | 28 kbps | **100 kbps** | reconstructed 640×360 / 12 fps |
+| `gan` | 256×144 / 8/10/12 fps | 75 kbps | **100 kbps** | full-frame 640×360 / selected enhancer |
 
 Examples:
 
@@ -35,7 +37,125 @@ Examples:
 ./rknn_yolov8_seg_cam --rate-profile=rebuild --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
   --rebuild-udp-port=5009
+./rknn_yolov8_seg_cam --mode=gan --gan-fps=10 --gan-inference-fps=0 \
+  --gan-video-bitrate-kbps=75 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=""
 ```
+
+## `gan`：H.265-only full-frame enhancement
+
+`gan` keeps the board path small and deterministic: camera input is processed by
+YOLOv8-Seg only to produce the encoder ROI/QP map, then MPP emits colour H.265 at
+exactly `256×144` and `8`, `10`, or `12` source fps. The PC receives only H.265
+(plus optional audio), so GAN mode does not open or parse `RB/1`, `RSNP`, or `ROEV`
+and its sender telemetry remains `RB/1=0 PATCH=0 STATE=0`.
+
+The PC path is independent of rebuild state and semantic side data:
+
+```text
+decoded H.265 256×144 -> none/Lanczos4 | Real-ESRNet x2 | Real-ESRGAN x2
+                         native 512×288 -> presentation Lanczos4 -> 640×360
+```
+
+`tools/full_frame_enhancer.py` owns the three full-frame backends. Its worker has
+one running item and one replaceable pending item, copies decoded input before
+background processing, drops stale results, and records queue/inference/total
+latency, completed/dropped counts, and provider. HUD/worker telemetry exposes
+rolling 1/5/10-second rates, while the optional JSONL debug log records the
+per-source-frame fields needed to reproduce those rates. The source H.265 frame is never modified. The
+`--gan-inference-fps` value may be lower than the source fps; the latest ROI/QP
+map is reused on the board, while the PC enhancer still receives the live full
+frame cadence.
+
+Start the board and receiver as separate processes. Run the sender in the
+Linux shell on board `root@192.168.0.101`, and run the receiver in a separate
+PowerShell window from `D:\workspace\videoCompressV2`:
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --mode=gan --gan-fps=10 --gan-inference-fps=4 --gan-video-bitrate-kbps=75 \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 --audio=off --preview=off \
+  --rtp-sdp-path=/tmp/gan.sdp --profile-control=""
+```
+
+`--profile-control=""` is an explicit empty value that disables the runtime
+profile FIFO; it does not wait for console input. The live sender runs in the
+foreground, so the shell prompt does not return until `Ctrl+C` is pressed. For
+a short board-side startup check, append `--max-frames=2` and then run
+`echo "RC=$?"`; success includes `Wrote H.265 RTP SDP:` and `RC=0`.
+
+After the board logs `Wrote H.265 RTP SDP: /tmp/gan.sdp`, copy that real SDP
+file to the PC and start the receiver window. Do not add `--headless` when a
+video window is required:
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+New-Item -ItemType Directory -Force .\runs\gan | Out-Null
+scp root@192.168.0.101:/tmp/gan.sdp .\runs\gan\gan.sdp
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
+  --gan-enhancer=none --rotate=none `
+  --gan-debug-log=.\runs\gan\none.jsonl
+```
+
+Do not type `<SDP>` literally: it is only a placeholder and PowerShell parses
+`<` as redirection. If a previously copied SDP is available, start the PC
+receiver first with `.\runs\gan\board-smoke.sdp`, then start the board sender.
+Use `--headless` only for a no-window metrics run. When the receiver starts
+after the sender, it waits for the next complete IDR before displaying video.
+
+For ESRGAN, pass the real model explicitly and require CUDA when the host is
+configured for it:
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
+  --gan-require-cuda --gan-debug-log=runs\gan\esrgan.jsonl
+```
+
+`model/RealESRGAN_x2_dynamic.onnx` is the existing x2 model. ESRNet is a separate
+model and must be exported from its actual checkpoint with
+`tools/export_esrnet_onnx.py`; the exporter refuses to copy or rename an ESRGAN
+model. The benchmark uses at least 10 warmup and 200 measured frames. If CUDA is
+requested but ONNX Runtime does not activate `CUDAExecutionProvider`, the result
+is `NOT RUN` rather than a CPU result labelled as CUDA.
+
+The explicit 9-cell command matrix is generated with:
+
+```powershell
+python tools\run_gan_ab.py --output-root artifacts\gan_ab
+```
+
+It covers `8/10/12 fps × none/esrnet/esrgan`, holds the sender bitrate at the
+same 75 kbps target, and requires at least 60 seconds per capture and the four
+scene conditions (`empty`, `person1`, `person2`, `person3_or_more`). The matrix
+is declarative; missing models or inactive CUDA are recorded as not run and are
+not replaced with fabricated A/B data.
+
+The following real board-to-PC checks were collected on 2026-09-02. The `none`
+8-fps run is a 63.7-second acceptance run; the other rows are short cadence or
+enhancer feasibility runs and are not presented as the complete 9-cell,
+four-scene A/B campaign:
+
+| source / enhancer | observed duration | unique outputs | enhanced fps | dropped | total PC p95 | wire peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 / none | 63.7 s | 512 | 8.04 | 0.78% | 6.82 ms | 37.8 kbps |
+| 10 / none | 11.1 s | 114 | 10.27 | 4.20% | 7.20 ms | 38.4 kbps |
+| 12 / none | 11.3 s | 139 | 12.25 | 2.80% | 6.72 ms | 48.5 kbps |
+| 8 / ESRGAN CUDA | 10.9 s | 88 | 8.08 | 0% | 89.00 ms | 35.5 kbps |
+| 10 / ESRGAN CUDA | 8.6 s | 87 | 10.10 | 0% | 93.90 ms | 39.1 kbps |
+| 12 / ESRGAN CUDA | 9.2 s | 27 | 2.94 | 75.68% | 99.27 ms | 54.2 kbps |
+
+All rows reported `lost=0`, `reorder=0`, and `decode_errors=0`, with a 100 kbps
+link cap. The 12-fps ESRGAN worker kept at most one running plus one pending
+frame and discarded stale work instead of accumulating delay. There is no
+`RealESRNet_x2_dynamic.onnx` in this checkout, so all ESRNet cells remain
+`NOT RUN`; `tools/export_esrnet_onnx.py` documents the real-checkpoint export
+path and does not rename the ESRGAN model.
 
 ## Runtime profile and transport switching
 
@@ -47,13 +167,15 @@ echo low > /tmp/roi-rate-profile
 echo medium > /tmp/roi-rate-profile
 echo high > /tmp/roi-rate-profile
 echo rebuild > /tmp/roi-rate-profile
+echo gan > /tmp/roi-rate-profile
 echo image > /tmp/roi-rate-profile
 echo video > /tmp/roi-rate-profile
 ```
 
 Use `--profile-control=/another/path` to move the FIFO, or
 `--profile-control=` to disable runtime control. `low`/`medium`/`high`/`rebuild` enter
-video mode. `image` (or `snapshot`) drains the H.265 access unit currently on
+video mode; `gan` enters the H.265-only full-frame path and keeps RB/1, RSNP and
+ROEV disabled. `image` (or `snapshot`) drains the H.265 access unit currently on
 the wire, drops queued dependency frames, shuts down MPP, and keeps camera plus
 RKNN running. `video` cancels any in-flight JPEG transfer, rebuilds MPP, and
 returns with VPS/SPS/PPS plus an IDR. The process, camera and RKNN model remain
@@ -103,7 +225,7 @@ queue capped at 160 ms, so stale speech is discarded instead of replayed late.
 
 ## 四类检测事件推送：ROEV/1 UDP `5010`
 
-完成本次版本的编译与部署后，YOLOv8-Seg 在任意非 `baseline` 模式中检测到
+完成本次版本的编译与部署后，YOLOv8-Seg 在任意启用事件且非 `baseline`/`gan` 模式中检测到
 `person`、`car`、`boat` 或 `airplane` 时，会额外发送一个很小的 **ROEV/1** 私有 UDP
 状态数据报。它不是 RTP 扩展，不修改标准 H.265 码流，也不需要 SDP；因此可与视频 HUD、
 RB/1、图片接收和 Codec2 音频接收器同时运行。
@@ -112,7 +234,8 @@ RB/1、图片接收和 Codec2 音频接收器同时运行。
 RKNN 结果生成：目标集合变化时立即发送 `STATE`；目标持续存在时按
 `--event-heartbeat-ms=1000` 重复当前完整状态，以便 UDP 丢失一次进入/退出通知后仍能恢复。
 空闲且没有目标时不发保活包。默认启用，端口为 `5010`；可通过
-`--event-push=off` 关闭，或用 `--event-udp-port` 改端口。
+`--event-push=off` 关闭，或用 `--event-udp-port` 改端口。`gan` 为严格 H.265-only
+模式，即使传入 `--event-push=on` 也不会启动 ROEV/1。
 
 先在 Windows PC 的独立终端启动接收器：
 
@@ -333,7 +456,7 @@ python tools\receive_codec2_rtp.py runs\audio.sdp --play `
 
 ```mermaid
 flowchart TD
-    CAM["RK3588 摄像头 / V4L2"] --> CAP["采集线程\n档位帧率 10 / 15 / 20 / rebuild 6 fps"]
+    CAM["RK3588 摄像头 / V4L2"] --> CAP["采集线程\n档位帧率 10 / 15 / 20 / rebuild 6 / gan 8-12 fps"]
     CAP --> RGA["RGA 预处理\n源RGB + 档位NV12/灰度帧"]
 
     RGA --> IQ["最新帧推理队列"]
@@ -346,7 +469,7 @@ flowchart TD
     TEMP --> MERGE["ROI矩形合并\n最多64个区域"]
 
     RGA --> EQ["最新帧编码队列"]
-    EQ --> MPP["RK3588 MPP H.265硬编码\nCBR目标 42 / 110 / 240 / rebuild 28 kbps\n低档灰度，其余彩色"]
+    EQ --> MPP["RK3588 MPP H.265硬编码\nCBR目标 42 / 110 / 240 / rebuild 28 / gan 75 kbps\n低档灰度，其余彩色"]
     MERGE --> MPP
     MPP --> AU["完整H.265 Access Unit"]
     AU --> SENDQ["有界整帧发送队列\n过期P帧丢弃 + 恢复IDR"]
@@ -355,7 +478,7 @@ flowchart TD
     SNAPQ --> CROP["相关目标联合框 + 25% 上下文\nfull 可回退全景"]
     CROP --> JPEG["最大 1280×720 → 逆时针 90° JPEG"]
     JPEG --> SREL["RSNP 可靠分块\nSTART / DATA / ACK / RESUME / END"]
-    RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild 100 kbps"]
+    RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild/gan 100 kbps"]
     SREL --> PACER
     EVENT --> PACER
     MIC["板载麦克风 / 当前新板 card 3"] --> ARECORD["arecord 采集\nhw:3,0 44.1 kHz 双声道"]
@@ -478,7 +601,10 @@ Copy `cpp/install/rk3588_linux_aarch64/atk_rknn_yolov8_seg_cam/` to the board.
 Run the executable from that installed directory so its `model/` and `lib/`
 paths are available.
 
-The current cross-built deployable archive is
+The 2026-08-27 `rebuild` archive below is historical. The current 2026-09-02
+GAN build is recorded separately immediately after it.
+
+The historical cross-built deployable archive is
 `artifacts/rk3588_rebuild_refprefetch_20260827.tar.gz` (SHA-256
 `721a8a32a7a7e76685e0a5e3531f1aa58a9fdfc5ad03e509f4f6d8cf696130f7`; binary
 SHA-256 `ca6195cb0fa5e0c58a88f79b2810cab3eda19902329404586e47306012307234`). It retains
@@ -501,6 +627,23 @@ H.265 decode errors.
 > 上述 `20260827` 历史归档早于 ROEV/1 检测事件功能，不能用于本节的 `--event-*` 参数。
 > 使用事件推送前必须按前述 `./build-linux.sh` 从当前源码重新构建并部署；本次仅完成编译验证，
 > 未替换开发板上的历史归档。
+
+**2026-09-02 GAN cross-build and board-101 deployment**: the current source was
+archived, checksum-verified, and cross-built on Ubuntu `192.168.0.10` with the
+RK3588 AArch64 toolchain and Codec2 1.2.0. The deployable archive is
+`artifacts/videoCompressV2-goal0902-rk3588.tar.gz` (SHA-256
+`58e924f2b065b264e70203211d8cb010d3364f8931961780a3851be54f71a607`); the
+installed AArch64 binary SHA-256 is
+`2e57ee58d1e30c745fec7da510539dfdba5232637de8e6258a57da502619182b`.
+It was staged and atomically swapped into
+`/opt/atk/rknn_yolov8_seg_cam` on board `192.168.0.101`; the previous directory
+was retained as a timestamped backup. A board camera smoke run with
+`--mode=gan --gan-fps=8 --gan-inference-fps=4 --max-frames=2` loaded RKNN, RGA,
+MPP H.265, and Codec2 dependencies, wrote a 256-byte SDP, emitted IDR/P frames,
+reported `RB/1=0 PATCH=0 STATE=0`, and exited with code 0. A real board RTP to PC
+run then received and decoded `256×144@8` with no loss, reorder, or decode errors;
+the `none` full-frame path produced `640×360` output with p50/p95/p99 total PC
+latency of `2.519/3.614/4.602 ms` under the 100 ms budget.
 
 Upload and unpack it with:
 

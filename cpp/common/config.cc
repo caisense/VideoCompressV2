@@ -17,6 +17,10 @@ EncoderConfig::EncoderConfig()
       intra_refresh(true), intra_refresh_rows(1), max_reencode_times(3),
       super_i_frame_bits(12000), super_p_frame_bits(5500), grayscale_encode(true) {}
 
+GanConfig::GanConfig()
+    : fps(10), inference_fps(0), video_bitrate_kbps(75),
+      max_inference_latency_ms(100) {}
+
 SnapshotConfig::SnapshotConfig()
     // Balanced 60 kbps evidence defaults: cap payload bytes before they enter
     // the physical rate limiter.  A user can still request the source-size
@@ -161,6 +165,32 @@ void applyRateProfileValues(RateProfile profile, AppConfig *config) {
         config->transport.send_max_latency_ms = 250;
         return;
     }
+    if (profile == RATE_PROFILE_GAN) {
+        config->rate_profile = RATE_PROFILE_GAN;
+        config->mode = PIPELINE_GAN;
+        config->transport.mode = TRANSPORT_MODE_VIDEO;
+        // GAN is deliberately a standards-compliant H.265 stream.  The
+        // receiver may enhance the decoded full frame, but no RB/1, RSNP, or
+        // ROEV packet is part of this profile.
+        config->encoder.width = 256;
+        config->encoder.height = 144;
+        config->encoder.fps = config->gan.fps;
+        config->encoder.target_bitrate_bps = config->gan.video_bitrate_kbps * 1000;
+        config->encoder.gop = config->gan.fps * 2;
+        config->encoder.qp_init = 39;
+        config->encoder.qp_min_i = 36;
+        config->encoder.qp_max_i = 49;
+        config->encoder.super_i_frame_bits = 10000;
+        config->encoder.super_p_frame_bits = 4500;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 14;
+        config->roi.core_delta_qp = -7;
+        config->roi.edge_delta_qp = -11;
+        config->transport.pacing_bitrate_bps = 100000;
+        config->transport.send_max_latency_ms = 250;
+        config->transport.event.enabled = false;
+        return;
+    }
 }
 
 }  // namespace
@@ -169,6 +199,7 @@ const char *pipelineModeName(PipelineMode mode) {
     switch (mode) {
     case PIPELINE_BASELINE: return "baseline";
     case PIPELINE_BBOX_ROI: return "bbox";
+    case PIPELINE_GAN: return "gan";
     default: return "segmentation";
     }
 }
@@ -179,6 +210,7 @@ const char *rateProfileName(RateProfile profile) {
     case RATE_PROFILE_MEDIUM: return "medium";
     case RATE_PROFILE_HIGH: return "high";
     case RATE_PROFILE_REBUILD: return "rebuild";
+    case RATE_PROFILE_GAN: return "gan";
     }
     return "unknown";
 }
@@ -189,6 +221,7 @@ bool parseRateProfile(const std::string &name, RateProfile *profile) {
     else if (name == "medium") *profile = RATE_PROFILE_MEDIUM;
     else if (name == "high") *profile = RATE_PROFILE_HIGH;
     else if (name == "rebuild") *profile = RATE_PROFILE_REBUILD;
+    else if (name == "gan") *profile = RATE_PROFILE_GAN;
     else return false;
     return true;
 }
@@ -239,7 +272,14 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
             if (value == "baseline") config->mode = PIPELINE_BASELINE;
             else if (value == "bbox") config->mode = PIPELINE_BBOX_ROI;
             else if (value == "segmentation") config->mode = PIPELINE_SEGMENTATION_ROI;
-            else { if (error) *error = "mode must be baseline, bbox, or segmentation"; return false; }
+            else if (value == "rebuild") {
+                applyRateProfile(RATE_PROFILE_REBUILD, config);
+            } else if (value == "gan") {
+                applyRateProfile(RATE_PROFILE_GAN, config);
+            } else {
+                if (error) *error = "mode must be baseline, bbox, segmentation, rebuild, or gan";
+                return false;
+            }
         } else if (key == "preview" && parseBool(value, &boolean)) config->preview = boolean;
         else if (key == "preview-width" && parseInt(value, &integer)) config->preview_width = integer;
         else if (key == "preview-height" && parseInt(value, &integer)) config->preview_height = integer;
@@ -256,7 +296,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "rate-profile" || key == "profile") {
             RateProfile profile;
             if (!parseRateProfile(value, &profile)) {
-                if (error) *error = "rate profile must be low, medium, high, or rebuild";
+                if (error) *error = "rate profile must be low, medium, high, rebuild, or gan";
                 return false;
             }
             applyRateProfile(profile, config);
@@ -266,6 +306,25 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "fps" && parseInt(value, &integer)) config->encoder.fps = integer;
         else if (key == "target-bitrate" && parseInt(value, &integer)) config->encoder.target_bitrate_bps = integer;
         else if (key == "gop" && parseInt(value, &integer)) config->encoder.gop = integer;
+        else if (key == "gan-fps" && parseInt(value, &integer)) {
+            config->gan.fps = integer;
+            if (config->rate_profile == RATE_PROFILE_GAN) {
+                config->encoder.fps = integer;
+                config->encoder.gop = integer * 2;
+            }
+        }
+        else if (key == "gan-inference-fps" && parseInt(value, &integer)) {
+            config->gan.inference_fps = integer;
+        }
+        else if (key == "gan-video-bitrate-kbps" && parseInt(value, &integer)) {
+            config->gan.video_bitrate_kbps = integer;
+            if (config->rate_profile == RATE_PROFILE_GAN) {
+                config->encoder.target_bitrate_bps = integer * 1000;
+            }
+        }
+        else if (key == "gan-max-inference-latency-ms" && parseInt(value, &integer)) {
+            config->gan.max_inference_latency_ms = integer;
+        }
         else if (key == "qp-min" && parseInt(value, &integer)) config->encoder.qp_min = integer;
         else if (key == "qp-max" && parseInt(value, &integer)) config->encoder.qp_max = integer;
         else if (key == "qp-init" && parseInt(value, &integer)) config->encoder.qp_init = integer;
@@ -381,6 +440,26 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         return false;
     }
 
+    if (config->rate_profile == RATE_PROFILE_GAN &&
+        (config->mode != PIPELINE_GAN || config->transport.mode != TRANSPORT_MODE_VIDEO ||
+         config->encoder.width != 256 || config->encoder.height != 144 ||
+         config->encoder.fps != config->gan.fps ||
+         config->encoder.target_bitrate_bps != config->gan.video_bitrate_kbps * 1000 ||
+         config->encoder.gop != config->gan.fps * 2 ||
+         config->transport.pacing_bitrate_bps != 100000 ||
+         config->encoder.grayscale_encode)) {
+        if (error) {
+            *error = "gan is an atomic 256x144@8|10|12 H.265-only profile; "
+                     "use --gan-fps/--gan-video-bitrate-kbps instead of generic encoder overrides";
+        }
+        return false;
+    }
+    if (config->mode == PIPELINE_GAN) {
+        // The default event switch is on for the legacy profiles.  GAN always
+        // suppresses it so the only optional companion traffic is audio.
+        config->transport.event.enabled = false;
+    }
+
     if (config->encoder.width <= 0 || config->encoder.height <= 0 || config->encoder.fps <= 0 ||
         config->encoder.target_bitrate_bps <= 0 || config->encoder.gop <= 0 ||
         config->transport.pacing_bitrate_bps <= 0 || config->transport.udp_port < 1 ||
@@ -477,6 +556,15 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
                                    config->audio.udp_port == config->transport.event.udp_port)) ||
         (config->transport.mode == TRANSPORT_MODE_IMAGE && config->mode == PIPELINE_BASELINE) ||
         (config->rate_profile == RATE_PROFILE_REBUILD && config->mode == PIPELINE_BASELINE) ||
+        (config->mode == PIPELINE_GAN && config->transport.mode != TRANSPORT_MODE_VIDEO) ||
+        config->gan.fps < 8 || config->gan.fps > 12 ||
+        (config->gan.fps != 8 && config->gan.fps != 10 && config->gan.fps != 12) ||
+        config->gan.inference_fps < 0 || config->gan.inference_fps > 30 ||
+        config->gan.max_inference_latency_ms < 1 ||
+        config->gan.max_inference_latency_ms > 2000 ||
+        config->gan.video_bitrate_kbps < 1 || config->gan.video_bitrate_kbps > 85 ||
+        (config->mode == PIPELINE_GAN &&
+         config->gan.video_bitrate_kbps * 1000 + 15000 > 100000) ||
         config->roi.cell_size != 16 || config->roi.max_regions <= 0 || config->roi.max_age_frames < 0 ||
         config->roi.hold_frames <= 0 || config->roi.erosion_radius < 0 || config->roi.dilation_radius < 0 ||
         config->camera.width <= 0 || config->camera.height <= 0 || config->camera.queue_depth <= 0 ||

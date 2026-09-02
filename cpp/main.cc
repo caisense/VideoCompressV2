@@ -86,10 +86,11 @@ std::string debugPathForFrame(const std::string &pattern, uint64_t frame_id) {
 
 void printUsage(const char *program) {
     std::fprintf(stderr,
-        "Usage: %s [--rate-profile=low|medium|high|rebuild] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation]\n"
+        "Usage: %s [--rate-profile=low|medium|high|rebuild|gan] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan]\n"
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
+        "          [--gan-fps=8|10|12 --gan-inference-fps=0 --gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
         "          [--intra-refresh=on --intra-refresh-rows=1 --max-reencode-times=3]\n"
         "          [--super-i-frame-bits=12000 --super-p-frame-bits=5500]\n"
         "          [--grayscale-encode=on|off]\n"
@@ -300,29 +301,44 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "UDP initialization failed: %s\n", error.c_str());
         return EXIT_FAILURE;
     }
-    SnapshotSender snapshot_sender(config.transport.snapshot, config.transport.udp_host,
-                                   config.transport.mtu, video_pacer);
-    if (!snapshot_sender.start(&error)) {
-        std::fprintf(stderr, "snapshot UDP initialization failed: %s\n", error.c_str());
-        return EXIT_FAILURE;
+    // GAN is intentionally H.265-only (plus optional audio).  Do not even
+    // construct the legacy side-channel senders on that path: this keeps the
+    // RB socket, reference JPEG worker, snapshot sender, and ROEV sender out
+    // of the process rather than merely disabling their packets later.
+    std::unique_ptr<SnapshotSender> snapshot_sender;
+    std::unique_ptr<RebuildSender> rebuild_sender;
+    std::unique_ptr<DetectionEventSender> event_sender;
+    const bool gan_mode = config.mode == PIPELINE_GAN ||
+                          config.rate_profile == RATE_PROFILE_GAN;
+    if (!gan_mode) {
+        snapshot_sender.reset(new SnapshotSender(config.transport.snapshot,
+            config.transport.udp_host, config.transport.mtu, video_pacer));
+        if (!snapshot_sender->start(&error)) {
+            std::fprintf(stderr, "snapshot UDP initialization failed: %s\n", error.c_str());
+            return EXIT_FAILURE;
+        }
+        snapshot_sender->setEnabled(config.transport.mode == TRANSPORT_MODE_IMAGE);
+
+        rebuild_sender.reset(new RebuildSender(config.transport.rebuild,
+            config.transport.udp_host, config.transport.mtu, video_pacer));
+        if (!rebuild_sender->start(&error)) {
+            std::fprintf(stderr, "rebuild UDP initialization failed: %s\n", error.c_str());
+            return EXIT_FAILURE;
+        }
+        rebuild_sender->setEnabled(config.transport.mode == TRANSPORT_MODE_VIDEO &&
+                                   config.rate_profile == RATE_PROFILE_REBUILD);
+
+        if (config.transport.event.enabled) {
+            event_sender.reset(new DetectionEventSender(config.transport.event,
+                config.transport.udp_host, config.transport.mtu, video_pacer));
+            if (!event_sender->start(&error)) {
+                std::fprintf(stderr, "detection event UDP initialization failed: %s\n", error.c_str());
+                return EXIT_FAILURE;
+            }
+            event_sender->setEnabled(true);
+        }
     }
-    snapshot_sender.setEnabled(config.transport.mode == TRANSPORT_MODE_IMAGE);
-    RebuildSender rebuild_sender(config.transport.rebuild, config.transport.udp_host,
-                                 config.transport.mtu, video_pacer);
-    if (!rebuild_sender.start(&error)) {
-        std::fprintf(stderr, "rebuild UDP initialization failed: %s\n", error.c_str());
-        return EXIT_FAILURE;
-    }
-    rebuild_sender.setEnabled(config.transport.mode == TRANSPORT_MODE_VIDEO &&
-                              config.rate_profile == RATE_PROFILE_REBUILD);
-    DetectionEventSender event_sender(config.transport.event, config.transport.udp_host,
-                                      config.transport.mtu, video_pacer);
-    if (!event_sender.start(&error)) {
-        std::fprintf(stderr, "detection event UDP initialization failed: %s\n", error.c_str());
-        return EXIT_FAILURE;
-    }
-    event_sender.setEnabled(config.transport.event.enabled);
-    if (config.transport.event.enabled) {
+    if (config.transport.event.enabled && !gan_mode) {
         std::fprintf(stderr,
             "Detection event push enabled: person/car/boat/airplane UDP %d, confidence >= %.2f, heartbeat %d ms\n",
             config.transport.event.udp_port, config.transport.event.min_confidence,
@@ -335,6 +351,13 @@ int main(int argc, char **argv) {
             config.transport.rebuild.output_width, config.transport.rebuild.output_height,
             config.transport.rebuild.output_fps, config.transport.rebuild.udp_port,
             config.transport.pacing_bitrate_bps);
+    }
+    if (gan_mode) {
+        std::fprintf(stderr,
+            "GAN H.265-only mode enabled: source/bitstream %dx%d@%d, video=%d bps, GOP=%d, "
+            "YOLO ROI/QP only, PC enhancer owns full-frame reconstruction, RB/1=0 PATCH=0 STATE=0\n",
+            config.encoder.width, config.encoder.height, config.encoder.fps,
+            config.encoder.target_bitrate_bps, config.encoder.gop);
     }
     if (config.transport.mode == TRANSPORT_MODE_IMAGE) {
         std::fprintf(stderr,
@@ -425,7 +448,25 @@ int main(int argc, char **argv) {
     if (use_inference) {
         inference_thread = std::thread([&] {
             std::shared_ptr<FramePacket> frame;
+            uint64_t next_gan_inference_pts_us = 0;
             while (running.load() && inference_queue.pop(&frame)) {
+                const AppConfig live = runtimeConfig();
+                const bool gan_active = static_cast<RateProfile>(active_profile.load()) ==
+                                        RATE_PROFILE_GAN;
+                if (gan_active && live.gan.inference_fps > 0) {
+                    const uint64_t interval_us = static_cast<uint64_t>(1000000 /
+                        live.gan.inference_fps);
+                    if (next_gan_inference_pts_us != 0 &&
+                        frame->meta.pts_us < next_gan_inference_pts_us) {
+                        // The last semantic map remains active in RoiManager;
+                        // this is intentional latest-map reuse, not a video
+                        // frame hold or a reconstructed pixel path.
+                        continue;
+                    }
+                    next_gan_inference_pts_us = frame->meta.pts_us + interval_us;
+                } else {
+                    next_gan_inference_pts_us = 0;
+                }
                 image_buffer_t image;
                 std::memset(&image, 0, sizeof(image));
                 image.width = frame->source_width;
@@ -442,12 +483,12 @@ int main(int argc, char **argv) {
                                  static_cast<unsigned long long>(frame->meta.frame_id));
                     continue;
                 }
-                const AppConfig live = runtimeConfig();
                 // Publish semantic events from the raw RKNN result.  ROI/image
                 // filtering may use a different threshold, so it must not hide
                 // a configured event from the independent ROEV/1 channel.
                 std::string event_error;
-                if (!event_sender.submit(result, &event_error)) {
+                if (event_sender && !gan_active &&
+                    !event_sender->submit(result, &event_error)) {
                     std::fprintf(stderr, "Detection event submit failed: %s\n",
                                  event_error.c_str());
                     running.store(false);
@@ -470,13 +511,14 @@ int main(int argc, char **argv) {
                 }
                 const uint16_t class_mask = relevantDetectionClassMask(result, 0.0f);
                 if (class_mask != 0 && static_cast<TransportMode>(
-                    active_transport_mode.load()) == TRANSPORT_MODE_IMAGE) {
+                    active_transport_mode.load()) == TRANSPORT_MODE_IMAGE &&
+                    snapshot_sender) {
                     std::string snapshot_error;
                     const SnapshotCrop crop = live.transport.snapshot.crop_mode ==
                         SNAPSHOT_CROP_RELEVANT ? snapshotCropForRelevantDetections(
                             result, frame->source_width, frame->source_height,
                             live.transport.snapshot.crop_margin_percent) : SnapshotCrop();
-                    if (!snapshot_sender.submit(frame, class_mask, crop, &snapshot_error)) {
+                    if (!snapshot_sender->submit(frame, class_mask, crop, &snapshot_error)) {
                         std::fprintf(stderr, "Snapshot submit failed: %s\n", snapshot_error.c_str());
                     }
                 }
@@ -486,14 +528,14 @@ int main(int argc, char **argv) {
                 if (static_cast<TransportMode>(active_transport_mode.load()) ==
                     TRANSPORT_MODE_VIDEO) {
                     const RoiMapper mapper(live.roi);
-                    const RoiMap map = config.mode == PIPELINE_BBOX_ROI
+                    const RoiMap map = live.mode == PIPELINE_BBOX_ROI
                         ? mapper.buildBboxMap(result, live.encoder.width, live.encoder.height)
                         : mapper.build(result, live.encoder.width, live.encoder.height);
                     roi_manager.submit(map);
                     if (static_cast<RateProfile>(active_profile.load()) ==
-                        RATE_PROFILE_REBUILD) {
+                        RATE_PROFILE_REBUILD && rebuild_sender) {
                         std::string rebuild_error;
-                        if (!rebuild_sender.submit(frame, result,
+                        if (!rebuild_sender->submit(frame, result,
                             static_cast<uint8_t>(profile_generation.load() & 0xffU),
                             live.encoder.fps, &rebuild_error)) {
                             std::fprintf(stderr, "Rebuild submit failed: %s\n",
@@ -537,7 +579,7 @@ int main(int argc, char **argv) {
                     break;
                 }
                 if (desired_transport == TRANSPORT_MODE_IMAGE) {
-                    rebuild_sender.setEnabled(false);
+                    if (rebuild_sender) rebuild_sender->setEnabled(false);
                     // Finish at most one H.265 access unit, discard the rest,
                     // then hand the same media bucket to the screenshot worker.
                     if (!sender.switchProfile(next_video_pacing_bps, &encoder_error)) {
@@ -553,7 +595,7 @@ int main(int argc, char **argv) {
                     }
                     camera.updateEncoderConfig(next.encoder);
                     roi_manager.reconfigure(next.roi);
-                    snapshot_sender.setEnabled(true);
+                    if (snapshot_sender) snapshot_sender->setEnabled(true);
                     {
                         std::lock_guard<std::mutex> lock(runtime_config_mutex);
                         runtime_config = next;
@@ -572,8 +614,8 @@ int main(int argc, char **argv) {
 
                 // Stop-and-wait snapshot traffic is cancelled and joined before
                 // H.265 is allowed to reclaim the shared media bucket.
-                snapshot_sender.setEnabled(false);
-                rebuild_sender.setEnabled(false);
+                if (snapshot_sender) snapshot_sender->setEnabled(false);
+                if (rebuild_sender) rebuild_sender->setEnabled(false);
                 if (!sender.switchProfile(next_video_pacing_bps, &encoder_error)) {
                     std::fprintf(stderr, "RTP profile switch failed: %s\n", encoder_error.c_str());
                     running.store(false);
@@ -600,7 +642,9 @@ int main(int argc, char **argv) {
                 active_profile.store(static_cast<int>(desired));
                 active_transport_mode.store(static_cast<int>(TRANSPORT_MODE_VIDEO));
                 const unsigned int generation = profile_generation.fetch_add(1) + 1;
-                rebuild_sender.setEnabled(desired == RATE_PROFILE_REBUILD);
+                if (rebuild_sender) rebuild_sender->setEnabled(desired == RATE_PROFILE_REBUILD);
+                if (event_sender) event_sender->setEnabled(desired != RATE_PROFILE_GAN &&
+                                                            next.transport.event.enabled);
                 encoded_frame_count = 0;
                 rtp_sdp_written = next.transport.rtp_sdp_path.empty();
                 std::fprintf(stderr,
@@ -611,7 +655,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (active_transport == TRANSPORT_MODE_IMAGE) {
-                if (event_sender.failed(&encoder_error)) {
+                if (event_sender && event_sender->failed(&encoder_error)) {
                     std::fprintf(stderr, "Detection event transport error: %s\n",
                                  encoder_error.c_str());
                     running.store(false);
@@ -639,12 +683,12 @@ int main(int argc, char **argv) {
                 running.store(false);
                 break;
             }
-            if (rebuild_sender.failed(&encoder_error)) {
+            if (rebuild_sender && rebuild_sender->failed(&encoder_error)) {
                 std::fprintf(stderr, "Rebuild transport error: %s\n", encoder_error.c_str());
                 running.store(false);
                 break;
             }
-            if (event_sender.failed(&encoder_error)) {
+            if (event_sender && event_sender->failed(&encoder_error)) {
                 std::fprintf(stderr, "Detection event transport error: %s\n",
                              encoder_error.c_str());
                 running.store(false);
@@ -662,7 +706,7 @@ int main(int argc, char **argv) {
             RoiMap map = roi_manager.select(frame->meta.frame_id, frame->meta.pts_us,
                                             live.encoder.width, live.encoder.height);
             std::vector<RoiRegion> regions;
-            if (config.mode != PIPELINE_BASELINE) {
+            if (live.mode != PIPELINE_BASELINE) {
                 const RoiRegionMerger merger(live.roi);
                 regions = merger.merge(map);
             }
@@ -712,8 +756,10 @@ int main(int argc, char **argv) {
                                      tx.queued_frames);
             const Codec2AudioSenderSnapshot audio_tx = audio_sender
                 ? audio_sender->snapshot() : Codec2AudioSenderSnapshot();
-            const RebuildSenderSnapshot rebuild_tx = rebuild_sender.snapshot();
-            const DetectionEventSenderSnapshot event_tx = event_sender.snapshot();
+            const RebuildSenderSnapshot rebuild_tx = rebuild_sender
+                ? rebuild_sender->snapshot() : RebuildSenderSnapshot();
+            const DetectionEventSenderSnapshot event_tx = event_sender
+                ? event_sender->snapshot() : DetectionEventSenderSnapshot();
             std::printf("%s tx_bytes=%zu tx_drop_p=%llu tx_drop_idr=%llu tx_wait_idr=%d "
                         "tx_last_frame=%llu tx_send_e2e_us=%llu audio_rtp=%llu audio_frames=%llu "
                         "audio_q=%zu audio_q_age_ms=%llu audio_q_drop=%llu audio_q_drop_frames=%llu "
@@ -806,9 +852,9 @@ int main(int argc, char **argv) {
     running.store(false);
     if (profile_control_thread.joinable()) profile_control_thread.join();
     if (audio_sender) audio_sender->stop();
-    event_sender.stop();
-    rebuild_sender.stop();
-    snapshot_sender.stop();
+    if (event_sender) event_sender->stop();
+    if (rebuild_sender) rebuild_sender->stop();
+    if (snapshot_sender) snapshot_sender->stop();
     sender.stop();
     preview_queue.stop();
     camera.close();

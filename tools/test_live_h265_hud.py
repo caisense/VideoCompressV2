@@ -83,6 +83,15 @@ class HudTests(unittest.TestCase):
         self.assertEqual(presentation.snapshot()["held_percent"], 50.0)
         self.assertEqual(HUD.display_dimensions(640, 360, "ccw90", 1), (360, 640))
 
+    def test_gan_profile_extension_is_distinct_from_rebuild(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(33, 4, 256, 144, 8, 6))
+        profile = stats.snapshot()["profile"]
+        self.assertEqual(profile["name"], "gan")
+        self.assertEqual(profile["width"], 256)
+        self.assertEqual(profile["height"], 144)
+        self.assertEqual(profile["fps"], 8)
+
     def test_decoded_pts_handoff_preserves_fifo_order_with_bounded_backlog(self):
         queue = HUD.DecodedPtsQueue()
         queue.push_rtp_timestamp(90000)
