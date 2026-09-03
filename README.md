@@ -37,10 +37,10 @@ Examples:
 ./rknn_yolov8_seg_cam --rate-profile=rebuild --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
   --rebuild-udp-port=5009
-./rknn_yolov8_seg_cam --mode=gan --gan-fps=10 --gan-inference-fps=0 \
+./rknn_yolov8_seg_cam --mode=gan --gan-fps=8 --gan-inference-fps=4 \
   --gan-video-bitrate-kbps=75 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --audio=off --preview=off --profile-control=""
+  --rtp-sdp-path=/tmp/gan.sdp --audio=off --preview=off --profile-control=""
 ```
 
 ## `gan`：H.265-only full-frame enhancement
@@ -68,13 +68,20 @@ per-source-frame fields needed to reproduce those rates. The source H.265 frame 
 map is reused on the board, while the PC enhancer still receives the live full
 frame cadence.
 
-A CUDA/ONNX call cannot be safely cancelled from the Python worker thread. If a
-valid enhanced result has not arrived for the larger of two source-frame periods
-and `1.5 × --gan-max-inference-latency-ms`, the HUD switches immediately to a
-fresh `640×360` Lanczos4 frame from the newest decoded video. It labels that
-state as `OUTPUT ... FALLBACK / Lanczos4` and returns to the selected enhancer
-when it recovers, so a stuck enhancer cannot freeze the displayed frame or let
-`Source age` grow for seconds.
+A CUDA/ONNX call cannot be safely cancelled from the Python worker thread. The
+receiver therefore uses an FPS-aware output-age budget by default:
+`1.15 × 1000 / source_fps` (about `143.8/115.0/95.8 ms` at 8/10/12 fps).
+`--gan-output-latency-budget-ms` can set an explicit budget; `0` means AUTO.
+The old `--gan-max-inference-latency-ms` remains only as a deprecated explicit
+fixed override and is reported as `LEGACY_FIXED`.
+
+The HUD distinguishes `DEC AGE`, last accepted GAN `GOOD AGE`, current
+in-flight `RUN AGE`, and completed `OUTPUT AGE`. A missing fresh GAN result
+enters `SOFT-FALLBACK` and displays the newest decoded frame through Lanczos4;
+only `RUN AGE >= --gan-hard-stall-ms` (default 500 ms) is a hard stall. Recovery
+requires three fresh outputs by default and applies a one-frame sequence-lag
+gate, so an old GAN result cannot replace a source frame already displayed by
+the fallback. Decode and fallback stay live while the provider call runs.
 
 Start the board and receiver as separate processes. Run the sender in the
 Linux shell on board `root@192.168.0.101`, and run the receiver in a separate
@@ -83,7 +90,7 @@ PowerShell window from `D:\workspace\videoCompressV2`:
 ```bash
 cd /opt/atk/rknn_yolov8_seg_cam
 env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
-  --mode=gan --gan-fps=10 --gan-inference-fps=4 --gan-video-bitrate-kbps=75 \
+  --mode=gan --gan-fps=8 --gan-inference-fps=4 --gan-video-bitrate-kbps=75 \
   --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5004 --audio=off --preview=off \
   --rtp-sdp-path=/tmp/gan.sdp --profile-control=""
@@ -122,7 +129,13 @@ Set-Location D:\workspace\videoCompressV2
 & D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
   --gan-enhancer=esrgan `
   --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
-  --gan-require-cuda --gan-debug-log=runs\gan\esrgan.jsonl
+  --gan-require-cuda `
+  --gan-output-latency-budget-ms=0 `
+  --gan-output-latency-factor=1.15 `
+  --gan-hard-stall-ms=500 `
+  --gan-recovery-good-frames=3 `
+  --gan-recovery-max-sequence-lag=1 `
+  --gan-debug-log=.\runs\gan\esrgan.jsonl
 ```
 
 `model/RealESRGAN_x2_dynamic.onnx` is the existing x2 model. ESRNet is a separate
@@ -131,6 +144,14 @@ model and must be exported from its actual checkpoint with
 model. The benchmark uses at least 10 warmup and 200 measured frames. If CUDA is
 requested but ONNX Runtime does not activate `CUDAExecutionProvider`, the result
 is `NOT RUN` rather than a CPU result labelled as CUDA.
+
+The full-frame ESRGAN/ESRNet postprocessor uses the model contract `ZERO_TO_ONE`:
+outputs are clipped to `[0,1]` and then multiplied by 255. Small negative or above-1
+values are normal convolution overshoot and must not cause per-frame switching to a
+`[-1,1]` mapping. When `--gan-debug-log` is enabled, each `GAN_WORKER` record also
+contains `RAW_MIN`, `RAW_MAX`, `POSTPROCESS_MODE`, clip counts, and
+`OUTPUT_LUMA_MEAN`. Analyze a new run with `tools/analyze_gan_run.py`; use a new
+JSONL filename instead of appending unrelated runs to an old log.
 
 The explicit 9-cell command matrix is generated with:
 
@@ -157,6 +178,15 @@ four-scene A/B campaign:
 | 8 / ESRGAN CUDA | 10.9 s | 88 | 8.08 | 0% | 89.00 ms | 35.5 kbps |
 | 10 / ESRGAN CUDA | 8.6 s | 87 | 10.10 | 0% | 93.90 ms | 39.1 kbps |
 | 12 / ESRGAN CUDA | 9.2 s | 27 | 2.94 | 75.68% | 99.27 ms | 54.2 kbps |
+| 8 / ESRGAN CUDA (goal0902a) | 634.1 s | 5068 | 7.99 | 0% | 90.92 ms | 38.9 kbps |
+
+The fixed-100-ms comparison is now explicit: the captured old 8-fps sample had
+88/88 accepted outputs with a 98.88-ms maximum, while the deterministic 8-fps
+110-ms test is accepted by AUTO `143.75 ms` and would have been rejected by the
+old fixed budget. In the old 12-fps sample, 82 results were `stale_after_infer`
+and 2 pending items were replaced; the dropped-after-infer total was
+`p50/p95/p99/max=130.82/164.71/170.59/173.59 ms`, with inference-only
+`85.40/94.08/97.59/105.23 ms` (the full all-inference p99 was 95.74 ms).
 
 All rows reported `lost=0`, `reorder=0`, and `decode_errors=0`, with a 100 kbps
 link cap. The 12-fps ESRGAN worker kept at most one running plus one pending
@@ -530,6 +560,21 @@ flowchart TD
 它会从 `.jpg.part` 已持久化偏移继续，不需要 SDP。
 
 ## HUD 指标含义
+
+### GAN 档：按屏幕从上到下的关键字段
+
+GAN 档的第一行以 `GAN H265-only` 开头；`OUTPUT ... NONE` 中的 `NONE` 表示未启用
+AI 超分，`ESRGAN/CUDA` 或 `ESRNET/...` 才表示实际使用的增强后端。关键字段如下：
+
+| HUD 字段 | 含义 |
+| --- | --- |
+| `RX/DEC/ENH/DISP` | RTP 访问单元接收率、FFmpeg 解码率、GAN 成功输出率、实际呈现率。 |
+| `INFER ALL L/P50/P95/P99/MAX` | 所有已经返回的推理调用延迟，包含 `stale_after_infer`，不只统计被接受的输出。 |
+| `GOOD PC P50/P95/P99/MAX` | 输出策略接受的 source-to-output 总时延；`BUDGET` 是当前 FPS 对应的输出年龄预算。 |
+| `AGE DEC … GAN … RUN … OUT …` | 最新解码帧年龄、最近有效 GAN 输出年龄、当前运行中调用年龄、最近完成调用的输出年龄。它们不是同一个指标。 |
+| `DROP REPL/OUT/PRE/POST/ERR` | pending 被替换、输出槽被替换、推理前过期、推理后过期、推理异常；latest-only 背压不会阻塞解码。 |
+| `PRESENT OLD` | 因 source sequence 或输出总时延不新鲜而拒绝呈现的 GAN 结果。 |
+| `STATE/REC/HARDSTALL` | `HEALTHY`、`SOFT-FALLBACK` 或 `HARD-STALL`；`REC` 是连续新鲜输出恢复进度；硬卡死只在 `RUN AGE` 达到默认 500 ms 后计数。 |
 
 ### rebuild 档：按屏幕从上到下的顺序
 

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Deque, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -480,6 +480,32 @@ def postprocess_frame(frame: np.ndarray, rotation: str, denoise: bool) -> np.nda
     return frame
 
 
+def gan_effective_output_budget_ms(
+    source_fps: float,
+    requested_budget_ms: float = 0.0,
+    latency_factor: float = 1.15,
+    legacy_budget_ms: Optional[float] = None,
+) -> float:
+    """Resolve the output-age budget for one encoded source profile.
+
+    The old fixed 100 ms budget is intentionally not the default anymore.
+    An explicit legacy value still wins so existing scripts can opt into the
+    old policy while receiving a clear log line from the receiver.
+    """
+    if legacy_budget_ms is not None:
+        if legacy_budget_ms <= 0.0:
+            raise ValueError("legacy GAN latency budget must be positive")
+        return float(legacy_budget_ms)
+    if requested_budget_ms < 0.0:
+        raise ValueError("GAN output latency budget must be non-negative")
+    if requested_budget_ms > 0.0:
+        return float(requested_budget_ms)
+    if latency_factor <= 0.0:
+        raise ValueError("GAN output latency factor must be positive")
+    fps = max(1.0, float(source_fps))
+    return float(latency_factor) * 1000.0 / fps
+
+
 def gan_fallback_stale_after_ms(source_fps: float, max_latency_ms: float) -> float:
     """Bound a stalled enhancer to two source-frame intervals at most.
 
@@ -489,6 +515,378 @@ def gan_fallback_stale_after_ms(source_fps: float, max_latency_ms: float) -> flo
     """
     fps = max(1.0, float(source_fps))
     return max(2000.0 / fps, 1.5 * max(1.0, float(max_latency_ms)))
+
+
+class GanAction:
+    """Actions returned by :class:`GanFallbackController`."""
+
+    KEEP_GAN = "KEEP_GAN"
+    USE_LANCZOS = "USE_LANCZOS"
+    ACCEPT_GAN = "ACCEPT_GAN"
+    DISCARD_STALE_GAN = "DISCARD_STALE_GAN"
+
+
+class GanControllerDecision:
+    __slots__ = (
+        "action", "state", "good_age_ms", "run_age_ms", "soft_threshold_ms",
+        "output_age_ms", "recovery_streak", "events",
+    )
+
+    def __init__(self, action: str, state: str, good_age_ms: Optional[float],
+                 run_age_ms: float, soft_threshold_ms: float,
+                 output_age_ms: Optional[float], recovery_streak: int,
+                 events: Tuple[dict, ...] = ()) -> None:
+        self.action = action
+        self.state = state
+        self.good_age_ms = good_age_ms
+        self.run_age_ms = run_age_ms
+        self.soft_threshold_ms = soft_threshold_ms
+        self.output_age_ms = output_age_ms
+        self.recovery_streak = recovery_streak
+        self.events = events
+
+
+class GanFallbackController:
+    """Pure state/age policy for the asynchronous full-frame GAN path.
+
+    The decoder never calls into this controller while holding its socket or
+    decoder locks.  It only decides which already-decoded source should be
+    displayed.  This makes the soft-overdue, hard-stall, freshness and
+    recovery policies deterministic in unit tests and keeps fallback off the
+    H.265 decode path.
+    """
+
+    HEALTHY = "HEALTHY"
+    SOFT_FALLBACK = "SOFT_FALLBACK"
+    HARD_STALLED = "HARD_STALLED"
+
+    def __init__(
+        self,
+        output_budget_ms: float,
+        hard_stall_ms: float = 500.0,
+        recovery_good_frames: int = 3,
+        recovery_max_sequence_lag: int = 1,
+    ) -> None:
+        if output_budget_ms <= 0.0:
+            raise ValueError("GAN output budget must be positive")
+        if hard_stall_ms <= 0.0:
+            raise ValueError("GAN hard-stall threshold must be positive")
+        if recovery_good_frames <= 0:
+            raise ValueError("GAN recovery frame count must be positive")
+        if recovery_max_sequence_lag < 0:
+            raise ValueError("GAN recovery sequence lag must be non-negative")
+        self.output_budget_ms = float(output_budget_ms)
+        self.hard_stall_ms = float(hard_stall_ms)
+        self.recovery_good_frames = int(recovery_good_frames)
+        self.recovery_max_sequence_lag = int(recovery_max_sequence_lag)
+        self.state = self.HEALTHY
+        self.last_good_completed_at: Optional[float] = None
+        self.last_good_sequence: Optional[int] = None
+        self.fallback_started_at: Optional[float] = None
+        self.fallback_displayed_sequence: Optional[int] = None
+        self.recovery_streak = 0
+        self.current_run_age_ms = 0.0
+        self.last_output_age_ms: Optional[float] = None
+        self.last_output_arrived_at: Optional[float] = None
+        self.soft_fallback_entries = 0
+        self.recoveries = 0
+        self.hard_stall_count = 0
+        self.max_run_age_ms = 0.0
+        self.hard_stall_sequences = []
+        self.presentation_stale_drops = 0
+        self.recovery_stale_drops = 0
+        self._hard_stall_reported_sequence: Optional[int] = None
+        self._hard_stall_returned_sequences = set()
+        self._last_drop_counts = collections.Counter()
+
+    @property
+    def fallback_active(self) -> bool:
+        return self.state in (self.SOFT_FALLBACK, self.HARD_STALLED)
+
+    def _transition(self, state: str, now: float, good_age_ms: Optional[float],
+                    run_age_ms: float, soft_threshold_ms: float) -> Optional[dict]:
+        if self.state == state:
+            return None
+        previous = self.state
+        if state in (self.SOFT_FALLBACK, self.HARD_STALLED):
+            if self.fallback_started_at is None:
+                self.fallback_started_at = now
+        elif state == self.HEALTHY:
+            self.fallback_started_at = None
+            self.fallback_displayed_sequence = None
+        self.state = state
+        if state == self.SOFT_FALLBACK:
+            self.soft_fallback_entries += 1
+            return {
+                "TYPE": "GAN_STATE",
+                "STATE": self.SOFT_FALLBACK,
+                "PREVIOUS_STATE": previous,
+                "AT": now,
+                "GOOD_AGE_MS": good_age_ms,
+                "RUN_AGE_MS": run_age_ms,
+                "SOFT_THRESHOLD_MS": soft_threshold_ms,
+                "EFFECTIVE_BUDGET_MS": self.output_budget_ms,
+            }
+        if state == self.HARD_STALLED:
+            return {
+                "TYPE": "GAN_STATE",
+                "STATE": self.HARD_STALLED,
+                "PREVIOUS_STATE": previous,
+                "AT": now,
+                "GOOD_AGE_MS": good_age_ms,
+                "RUN_AGE_MS": run_age_ms,
+                "HARD_STALL_MS": self.hard_stall_ms,
+                "EFFECTIVE_BUDGET_MS": self.output_budget_ms,
+            }
+        return None
+
+    def note_lanczos_display(self, source_sequence: Optional[int]) -> None:
+        """Remember source identities already shown by the live fallback."""
+        if source_sequence is None:
+            return
+        sequence = int(source_sequence)
+        if (self.fallback_displayed_sequence is None or
+                sequence > self.fallback_displayed_sequence):
+            self.fallback_displayed_sequence = sequence
+
+    def _reset_recovery_on_worker_drops(self, worker_snapshot: dict) -> None:
+        counts = worker_snapshot.get("drop_reason_counts", {}) or {}
+        for reason in ("stale_before_infer", "stale_after_infer", "inference_error"):
+            current = int(counts.get(reason, 0))
+            if current > int(self._last_drop_counts.get(reason, 0)):
+                self.recovery_streak = 0
+        for key, value in counts.items():
+            self._last_drop_counts[key] = int(value)
+
+    def _hard_return_event(self, now: float, worker_snapshot: dict) -> Optional[dict]:
+        sequence = worker_snapshot.get("last_finished_sequence")
+        if sequence is None or worker_snapshot.get("running"):
+            return None
+        sequence = int(sequence)
+        if (self._hard_stall_reported_sequence != sequence or
+                sequence in self._hard_stall_returned_sequences):
+            return None
+        self._hard_stall_returned_sequences.add(sequence)
+        return {
+            "TYPE": "GAN_HARD_STALL_RETURNED",
+            "SEQ": sequence,
+            "AT": now,
+            "RUN_AGE_MS": float(worker_snapshot.get("last_finished_infer_ms", 0.0)),
+            "HARD_STALL_MS": self.hard_stall_ms,
+        }
+
+    def update(
+        self,
+        now: float,
+        source_fps: float,
+        latest_sequence: Optional[int],
+        worker_snapshot: dict,
+        candidate: Optional[Any] = None,
+    ) -> GanControllerDecision:
+        """Consume one renderer tick and at most one completed GAN output."""
+        now = float(now)
+        fps = max(1.0, float(source_fps))
+        soft_threshold_ms = gan_fallback_stale_after_ms(
+            fps, self.output_budget_ms)
+        running_age_ms = max(0.0, float(worker_snapshot.get("running_age_ms", 0.0)))
+        self.current_run_age_ms = running_age_ms
+        self.max_run_age_ms = max(self.max_run_age_ms, running_age_ms)
+        self._reset_recovery_on_worker_drops(worker_snapshot)
+        events = []
+
+        return_event = self._hard_return_event(now, worker_snapshot)
+        if return_event is not None:
+            events.append(return_event)
+
+        running_sequence = worker_snapshot.get("running_sequence")
+        if (running_age_ms >= self.hard_stall_ms and running_sequence is not None and
+                int(running_sequence) != self._hard_stall_reported_sequence):
+            sequence = int(running_sequence)
+            self._hard_stall_reported_sequence = sequence
+            self.hard_stall_count += 1
+            self.hard_stall_sequences.append(sequence)
+            event = {
+                "TYPE": "GAN_HARD_STALL",
+                "SEQ": sequence,
+                "AT": now,
+                "RUN_AGE_MS": running_age_ms,
+                "HARD_STALL_MS": self.hard_stall_ms,
+            }
+            events.append(event)
+            transition = self._transition(
+                self.HARD_STALLED, now,
+                None if self.last_good_completed_at is None else
+                max(0.0, (now - self.last_good_completed_at) * 1000.0),
+                running_age_ms, soft_threshold_ms)
+            if transition is not None:
+                events.append(transition)
+
+        good_age_ms = (
+            None if self.last_good_completed_at is None else
+            max(0.0, (now - self.last_good_completed_at) * 1000.0)
+        )
+        output_age_ms: Optional[float] = None
+        if candidate is not None:
+            arrived_at = getattr(candidate, "arrived_at", None)
+            if arrived_at is not None:
+                self.last_output_arrived_at = float(arrived_at)
+                output_age_ms = max(0.0, (now - self.last_output_arrived_at) * 1000.0)
+            else:
+                output_age_ms = max(0.0, float(getattr(candidate, "total_pc_ms", 0.0)))
+            self.last_output_age_ms = output_age_ms
+            sequence = int(getattr(candidate, "source_sequence", -1))
+            lag = None if latest_sequence is None else int(latest_sequence) - sequence
+            too_old = (
+                lag is None or lag < 0 or
+                lag > self.recovery_max_sequence_lag or
+                output_age_ms > self.output_budget_ms
+            )
+            same_source_as_lanczos = (
+                self.fallback_displayed_sequence is not None and
+                sequence <= self.fallback_displayed_sequence
+            )
+            if too_old or same_source_as_lanczos:
+                self.presentation_stale_drops += 1
+                if self.fallback_active:
+                    self.recovery_stale_drops += 1
+                    self.recovery_streak = 0
+                    reason = "RECOVERY_NOT_FRESH"
+                else:
+                    reason = "OUTPUT_TOO_OLD"
+                events.append({
+                    "TYPE": "GAN_PRESENTATION_DROP",
+                    "REASON": reason,
+                    "SEQ": sequence,
+                    "AT": now,
+                    "SEQUENCE_LAG": lag,
+                    "OUTPUT_AGE_MS": output_age_ms,
+                    "EFFECTIVE_BUDGET_MS": self.output_budget_ms,
+                    "MAX_SEQUENCE_LAG": self.recovery_max_sequence_lag,
+                })
+                return GanControllerDecision(
+                    GanAction.DISCARD_STALE_GAN, self.state, good_age_ms, running_age_ms,
+                    soft_threshold_ms, output_age_ms, self.recovery_streak,
+                    tuple(events),
+                )
+
+            self.last_good_completed_at = float(candidate.completed_at)
+            self.last_good_sequence = sequence
+            good_age_ms = max(0.0, (now - self.last_good_completed_at) * 1000.0)
+            if self.fallback_active:
+                self.recovery_streak += 1
+                if self.recovery_streak >= self.recovery_good_frames:
+                    previous = self.state
+                    fallback_duration_ms = (
+                        0.0 if self.fallback_started_at is None else
+                        max(0.0, (now - self.fallback_started_at) * 1000.0)
+                    )
+                    self.recoveries += 1
+                    self.state = self.HEALTHY
+                    self.fallback_started_at = None
+                    self.fallback_displayed_sequence = None
+                    events.append({
+                        "TYPE": "GAN_STATE",
+                        "STATE": "RECOVERED",
+                        "PREVIOUS_STATE": previous,
+                        "AT": now,
+                        "RECOVERY_STREAK": self.recovery_streak,
+                        "GOOD_AGE_MS": good_age_ms,
+                        "FALLBACK_DURATION_MS": fallback_duration_ms,
+                    })
+                    return GanControllerDecision(
+                        GanAction.ACCEPT_GAN, self.state, good_age_ms,
+                        running_age_ms, soft_threshold_ms, output_age_ms,
+                        self.recovery_streak, tuple(events),
+                    )
+                return GanControllerDecision(
+                    GanAction.KEEP_GAN, self.state, good_age_ms, running_age_ms,
+                    soft_threshold_ms, output_age_ms, self.recovery_streak,
+                    tuple(events),
+                )
+            return GanControllerDecision(
+                GanAction.ACCEPT_GAN, self.state, good_age_ms, running_age_ms,
+                soft_threshold_ms, output_age_ms, self.recovery_streak,
+                tuple(events),
+            )
+
+        good_age_ms = (
+            None if self.last_good_completed_at is None else
+            max(0.0, (now - self.last_good_completed_at) * 1000.0)
+        )
+        if (self.state == self.HEALTHY and good_age_ms is not None and
+                good_age_ms >= soft_threshold_ms):
+            transition = self._transition(
+                self.SOFT_FALLBACK, now, good_age_ms, running_age_ms,
+                soft_threshold_ms)
+            if transition is not None:
+                events.append(transition)
+        action = (
+            GanAction.USE_LANCZOS if self.fallback_active or
+            self.last_good_completed_at is None else GanAction.KEEP_GAN
+        )
+        return GanControllerDecision(
+            action, self.state, good_age_ms, running_age_ms,
+            soft_threshold_ms, output_age_ms, self.recovery_streak,
+            tuple(events),
+        )
+
+    def snapshot(self, now: Optional[float] = None, source_fps: float = 0.0) -> dict:
+        now = time.monotonic() if now is None else float(now)
+        good_age_ms = (
+            None if self.last_good_completed_at is None else
+            max(0.0, (now - self.last_good_completed_at) * 1000.0)
+        )
+        soft_threshold_ms = gan_fallback_stale_after_ms(
+            max(1.0, float(source_fps)), self.output_budget_ms)
+        fallback_duration_ms = (
+            0.0 if self.fallback_started_at is None else
+            max(0.0, (now - self.fallback_started_at) * 1000.0)
+        )
+        last_output_age_ms = self.last_output_age_ms
+        if self.last_output_arrived_at is not None:
+            last_output_age_ms = max(0.0, (now - self.last_output_arrived_at) * 1000.0)
+        return {
+            "state": self.state,
+            "fallback_active": self.fallback_active,
+            "output_budget_ms": self.output_budget_ms,
+            "soft_threshold_ms": soft_threshold_ms,
+            "hard_stall_ms": self.hard_stall_ms,
+            "good_age_ms": good_age_ms,
+            "run_age_ms": self.max_run_age_ms,
+            "current_run_age_ms": self.current_run_age_ms,
+            "last_output_age_ms": last_output_age_ms,
+            "recovery_streak": self.recovery_streak,
+            "recovery_good_frames": self.recovery_good_frames,
+            "recovery_max_sequence_lag": self.recovery_max_sequence_lag,
+            "soft_fallback_entries": self.soft_fallback_entries,
+            "recoveries": self.recoveries,
+            "hard_stall_count": self.hard_stall_count,
+            "hard_stall_max_run_age_ms": self.max_run_age_ms,
+            "hard_stall_sequences": list(self.hard_stall_sequences),
+            "presentation_stale_drops": self.presentation_stale_drops,
+            "recovery_stale_drops": self.recovery_stale_drops,
+            "fallback_duration_ms": fallback_duration_ms,
+            "last_good_sequence": self.last_good_sequence,
+            "fallback_displayed_sequence": self.fallback_displayed_sequence,
+        }
+
+    def finish(self, now: Optional[float] = None) -> dict:
+        """Return a final event so an active fallback has a closed interval."""
+        now = time.monotonic() if now is None else float(now)
+        duration_ms = (
+            0.0 if self.fallback_started_at is None else
+            max(0.0, (now - self.fallback_started_at) * 1000.0)
+        )
+        return {
+            "TYPE": "GAN_RUN_END",
+            "AT": now,
+            "STATE": self.state,
+            "FALLBACK_ACTIVE": self.fallback_active,
+            "FALLBACK_DURATION_MS": duration_ms,
+            "SOFT_FALLBACK_ENTRIES": self.soft_fallback_entries,
+            "RECOVERIES": self.recoveries,
+            "HARD_STALLS": self.hard_stall_count,
+        }
 
 
 def should_use_gan_fallback(frame: Optional[np.ndarray], source_sequence: Optional[int],
@@ -559,7 +957,30 @@ def main() -> int:
     parser.add_argument("--gan-threads", type=int, default=2)
     parser.add_argument("--gan-warmup", type=int, default=4,
                         help="live-shape model warmup frames before output")
-    parser.add_argument("--gan-max-inference-latency-ms", type=int, default=100)
+    parser.add_argument(
+        "--gan-output-latency-budget-ms", type=float, default=0.0,
+        help="accepted source-to-output age budget; 0 selects FPS-aware AUTO",
+    )
+    parser.add_argument(
+        "--gan-output-latency-factor", type=float, default=1.15,
+        help="AUTO output budget multiplier over one source-frame period",
+    )
+    parser.add_argument(
+        "--gan-max-inference-latency-ms", type=float, default=None,
+        help="deprecated fixed output budget override (use --gan-output-latency-budget-ms)",
+    )
+    parser.add_argument(
+        "--gan-hard-stall-ms", type=float, default=500.0,
+        help="RUN_AGE threshold used to report a hard enhancer stall",
+    )
+    parser.add_argument(
+        "--gan-recovery-good-frames", type=int, default=3,
+        help="fresh consecutive GAN outputs required to leave fallback",
+    )
+    parser.add_argument(
+        "--gan-recovery-max-sequence-lag", type=int, default=1,
+        help="maximum decoded-frame sequence lag for GAN presentation/recovery",
+    )
     parser.add_argument("--gan-display-fps", type=float, default=0.0,
                         help="presentation cadence; 0 follows the encoded source fps")
     parser.add_argument("--gan-debug-log", default=None,
@@ -574,7 +995,13 @@ def main() -> int:
             args.rebuild_fps <= 0 or args.rebuild_reference_max_age <= 0 or
             args.rebuild_max_sync_ms <= 0 or
             args.esrgan_threads < 0 or args.gan_threads < 0 or args.gan_warmup < 0 or
-            args.gan_max_inference_latency_ms <= 0 or args.gan_display_fps < 0):
+            args.gan_output_latency_budget_ms < 0 or
+            args.gan_output_latency_factor <= 0 or
+            (args.gan_max_inference_latency_ms is not None and
+             args.gan_max_inference_latency_ms <= 0) or
+            args.gan_hard_stall_ms <= 0 or args.gan_recovery_good_frames <= 0 or
+            args.gan_recovery_max_sequence_lag < 0 or
+            args.gan_display_fps < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
 
     _, listen_port = parse_sdp(args.sdp)
@@ -648,6 +1075,7 @@ def main() -> int:
     decoder_threads = []
     gan_worker_lock = threading.Lock()
     gan_worker_holder = {"worker": None}
+    gan_controller: Optional[GanFallbackController] = None
 
     def set_gan_worker(worker: Optional[LatestOnlyEnhancerWorker]) -> None:
         with gan_worker_lock:
@@ -660,7 +1088,7 @@ def main() -> int:
     gan_worker: Optional[LatestOnlyEnhancerWorker] = None
 
     def ensure_gan_worker(profile: dict) -> bool:
-        nonlocal gan_worker
+        nonlocal gan_worker, gan_controller
         if gan_worker is not None:
             return True
         if profile.get("width") != 256 or profile.get("height") != 144:
@@ -675,6 +1103,16 @@ def main() -> int:
             if args.gan_enhancer == "esrnet"
             else args.gan_esrgan_model
         )
+        try:
+            output_budget_ms = gan_effective_output_budget_ms(
+                float(profile["fps"]),
+                requested_budget_ms=args.gan_output_latency_budget_ms,
+                latency_factor=args.gan_output_latency_factor,
+                legacy_budget_ms=args.gan_max_inference_latency_ms,
+            )
+        except ValueError as error:
+            print(f"GAN latency budget invalid: {error}", file=sys.stderr)
+            return False
         try:
             print(
                 f"GAN WARMING: backend={args.gan_enhancer} input=256x144 "
@@ -693,28 +1131,48 @@ def main() -> int:
             )
             worker = LatestOnlyEnhancerWorker(
                 enhancer,
-                max_latency_ms=args.gan_max_inference_latency_ms,
+                max_latency_ms=output_budget_ms,
                 debug_log=args.gan_debug_log,
             )
         except (OSError, RuntimeError, ValueError) as error:
             print(f"GAN enhancer initialization failed: {error}", file=sys.stderr)
             return False
         gan_worker = worker
+        gan_controller = GanFallbackController(
+            output_budget_ms=output_budget_ms,
+            hard_stall_ms=args.gan_hard_stall_ms,
+            recovery_good_frames=args.gan_recovery_good_frames,
+            recovery_max_sequence_lag=args.gan_recovery_max_sequence_lag,
+        )
         set_gan_worker(worker)
+        budget_mode = (
+            f"LEGACY_FIXED {output_budget_ms:.1f}ms"
+            if args.gan_max_inference_latency_ms is not None else
+            f"AUTO {output_budget_ms:.1f}ms factor={args.gan_output_latency_factor:.2f}"
+            if args.gan_output_latency_budget_ms <= 0.0 else
+            f"FIXED {output_budget_ms:.1f}ms"
+        )
         print(
             f"GAN READY: full-frame enhancer ready: backend={worker.backend} "
             f"provider={worker.provider} input=256x144 native=512x288 output=640x360 "
-            f"max_latency_ms={args.gan_max_inference_latency_ms}",
+            f"output_budget_ms={output_budget_ms:.1f} ({budget_mode}) "
+            f"hard_stall_ms={args.gan_hard_stall_ms:.0f} "
+            f"recovery={args.gan_recovery_good_frames}frames/"
+            f"lag<={args.gan_recovery_max_sequence_lag}",
             flush=True,
         )
         return True
 
     def disable_gan_worker() -> None:
-        nonlocal gan_worker
+        nonlocal gan_worker, gan_controller
         worker = gan_worker
+        controller = gan_controller
         gan_worker = None
+        gan_controller = None
         set_gan_worker(None)
         if worker is not None:
+            if controller is not None:
+                worker.debug_event(controller.finish())
             worker.stop()
 
     def decode_loop(process: subprocess.Popen, token: int) -> None:
@@ -849,7 +1307,7 @@ def main() -> int:
     current_updated = 0.0
     current_source_sequence: Optional[int] = None
     current_mode = "normal"
-    gan_fallback_active = False
+    gan_display_fallback = False
     try:
         while not stopping.is_set():
             now = time.monotonic()
@@ -869,7 +1327,7 @@ def main() -> int:
                 next_rebuild_present = now
                 next_gan_present = now
                 current_mode = requested_mode
-                gan_fallback_active = False
+                gan_display_fallback = False
                 if previous_mode == "rebuild" and not is_rebuild:
                     disable_rebuild_components()
                 if previous_mode == "gan" and not is_gan:
@@ -902,32 +1360,90 @@ def main() -> int:
                     if output is None:
                         break
                     newest_output = output
-                if newest_output is not None:
-                    if gan_fallback_active:
-                        print("GAN enhancer recovered; leaving Lanczos4 fallback", flush=True)
+                worker_values = worker.snapshot()
+                if gan_controller is None:
+                    # This should only be reachable during profile startup;
+                    # keep the display path fail-safe if initialization races
+                    # with the first decoded frame.
+                    gan_controller = GanFallbackController(
+                        output_budget_ms=float(worker_values["max_latency_ms"]),
+                        hard_stall_ms=args.gan_hard_stall_ms,
+                        recovery_good_frames=args.gan_recovery_good_frames,
+                        recovery_max_sequence_lag=args.gan_recovery_max_sequence_lag,
+                    )
+                decision = gan_controller.update(
+                    now=now,
+                    source_fps=float(profile["fps"]),
+                    latest_sequence=source_sequence,
+                    worker_snapshot=worker_values,
+                    candidate=newest_output,
+                )
+                for event in decision.events:
+                    worker.debug_event(event)
+                    event_type = event.get("TYPE")
+                    if event_type == "GAN_STATE" and event.get("STATE") == "SOFT_FALLBACK":
+                        print(
+                            "GAN output overdue GOOD_AGE=%.0fms SOFT_THRESHOLD=%.0fms "
+                            "RUN_AGE=%.0fms; using live Lanczos4 fallback" % (
+                                float(event.get("GOOD_AGE_MS") or 0.0),
+                                float(event.get("SOFT_THRESHOLD_MS") or 0.0),
+                                float(event.get("RUN_AGE_MS") or 0.0),
+                            ),
+                            flush=True,
+                        )
+                    elif event_type == "GAN_HARD_STALL":
+                        print(
+                            "GAN HARD STALL seq=%s RUN_AGE=%.0fms threshold=%.0fms; "
+                            "fallback remains Lanczos4" % (
+                                event.get("SEQ"),
+                                float(event.get("RUN_AGE_MS") or 0.0),
+                                float(event.get("HARD_STALL_MS") or 0.0),
+                            ),
+                            flush=True,
+                        )
+                    elif event_type == "GAN_HARD_STALL_RETURNED":
+                        print(
+                            "GAN hard-stall seq=%s returned after RUN_AGE=%.0fms" % (
+                                event.get("SEQ"),
+                                float(event.get("RUN_AGE_MS") or 0.0),
+                            ),
+                            flush=True,
+                        )
+                    elif event_type == "GAN_STATE" and event.get("STATE") == "RECOVERED":
+                        print(
+                            "GAN recovered after %d consecutive fresh outputs" %
+                            int(event.get("RECOVERY_STREAK") or 0),
+                            flush=True,
+                        )
+
+                if decision.action == GanAction.ACCEPT_GAN and newest_output is not None:
                     current_canvas = postprocess_frame(
                         newest_output.frame, args.rotate, False)
                     current_updated = newest_output.completed_at
                     current_source_sequence = newest_output.source_sequence
-                    gan_fallback_active = False
-                else:
-                    worker_values = worker.snapshot()
-                    entering_fallback = (current_source_sequence is not None and
-                                         not gan_fallback_active)
-                    if should_use_gan_fallback(
-                            frame, source_sequence, current_source_sequence, current_updated,
-                            gan_fallback_active, now, float(profile["fps"]),
-                            float(worker_values["max_latency_ms"])):
+                    gan_display_fallback = False
+
+                # Once fallback is active, every newly decoded source frame is
+                # painted through the live Lanczos path.  It never waits for
+                # the provider call and never reuses an old GAN canvas.
+                if gan_controller.fallback_active and frame is not None and source_sequence is not None:
+                    if (current_source_sequence is None or
+                            source_sequence != current_source_sequence or
+                            not gan_display_fallback):
                         current_canvas = gan_lanczos_fallback(frame, args.rotate)
                         current_updated = updated
                         current_source_sequence = source_sequence
-                        gan_fallback_active = True
-                        if entering_fallback:
-                            print(
-                                "GAN enhancer stalled for %.0f ms; using live Lanczos4 fallback" %
-                                worker_values["running_age_ms"],
-                                flush=True,
-                            )
+                        gan_display_fallback = True
+                        gan_controller.note_lanczos_display(source_sequence)
+                elif (current_canvas is None and frame is not None and
+                      source_sequence is not None):
+                    # Warmup has no last good GAN output yet.  This is a
+                    # display-only Lanczos path, not a soft-fallback entry.
+                    current_canvas = gan_lanczos_fallback(frame, args.rotate)
+                    current_updated = updated
+                    current_source_sequence = source_sequence
+                    gan_display_fallback = True
+                    gan_controller.note_lanczos_display(source_sequence)
                 if now >= next_gan_present:
                     interval = 1.0 / (args.gan_display_fps or float(profile["fps"]))
                     skipped = max(0, int((now - next_gan_present) / interval))
@@ -935,7 +1451,7 @@ def main() -> int:
                     if current_source_sequence is not None:
                         presentation.present(
                             current_source_sequence,
-                            ("GAN-FALLBACK-LANCZOS" if gan_fallback_active else
+                            ("GAN-FALLBACK-LANCZOS" if gan_display_fallback else
                              f"GAN-{worker.backend.upper()}"),
                             int(profile["generation"]),
                             now,
@@ -981,6 +1497,11 @@ def main() -> int:
                 else {}
             )
             gan_values = worker.snapshot() if is_gan and worker is not None else {}
+            gan_controller_values = (
+                gan_controller.snapshot(now, float(profile["fps"]))
+                if is_gan and gan_controller is not None and profile is not None
+                else {}
+            )
             presentation_values = presentation.snapshot()
             if args.headless:
                 # A headless report can fall between two rebuild presentation
@@ -1025,6 +1546,7 @@ def main() -> int:
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
                     elif is_gan:
+                        drop_counts = gan_values["drop_reason_counts"]
                         gan_text = (
                             f" source_fps={profile['fps']}"
                             f" enhanced_fps={gan_values['rolling_1s_fps']:.1f}"
@@ -1032,17 +1554,35 @@ def main() -> int:
                             f" enhancer={gan_values['backend']}"
                             f" provider={gan_values['provider']}"
                             f" input=256x144 native=512x288 output=640x360"
-                            f" infer_last_ms={gan_values['last_infer_ms']:.1f}"
-                            f" pc_p50_ms={gan_values['p50_ms']:.1f}"
-                            f" pc_p95_ms={gan_values['p95_ms']:.1f}"
-                            f" pc_p99_ms={gan_values['p99_ms']:.1f}"
+                            f" output_budget_ms={gan_values['max_latency_ms']:.1f}"
+                            f" infer_all_p50_ms={gan_values['infer_all_p50_ms']:.1f}"
+                            f" infer_all_p95_ms={gan_values['infer_all_p95_ms']:.1f}"
+                            f" infer_all_p99_ms={gan_values['infer_all_p99_ms']:.1f}"
+                            f" infer_all_max_ms={gan_values['infer_all_max_ms']:.1f}"
+                            f" infer_last_ms={gan_values['last_finished_infer_ms']:.1f}"
+                            f" good_total_p50_ms={gan_values['good_total_p50_ms']:.1f}"
+                            f" good_total_p95_ms={gan_values['good_total_p95_ms']:.1f}"
+                            f" good_total_p99_ms={gan_values['good_total_p99_ms']:.1f}"
+                            f" good_total_max_ms={gan_values['good_total_max_ms']:.1f}"
+                            f" good_last_ms={gan_values['last_good_total_ms']:.1f}"
                             f" queue_wait_ms={gan_values['last_queue_wait_ms']:.1f}"
                             f" running={int(gan_values['running'])}"
                             f" running_age_ms={gan_values['running_age_ms']:.1f}"
                             f" pending={int(gan_values['pending'])}"
                             f" dropped={gan_values['dropped']}"
                             f" dropped_pct={gan_values['drop_percent']:.1f}"
-                            f" fallback={int(gan_fallback_active)}"
+                            f" drop_repl={drop_counts['replaced_pending']}"
+                            f" drop_output={drop_counts['output_replaced']}"
+                            f" drop_pre={drop_counts['stale_before_infer']}"
+                            f" drop_post={drop_counts['stale_after_infer']}"
+                            f" drop_err={drop_counts['inference_error']}"
+                            f" present_old={gan_controller_values.get('presentation_stale_drops', 0)}"
+                            f" state={gan_controller_values.get('state', 'WAIT')}"
+                            f" good_age_ms={gan_controller_values.get('good_age_ms')}"
+                            f" run_age_ms={gan_values['running_age_ms']:.1f}"
+                            f" recovery={gan_controller_values.get('recovery_streak', 0)}/"
+                            f"{gan_controller_values.get('recovery_good_frames', 0)}"
+                            f" hard_stalls={gan_controller_values.get('hard_stall_count', 0)}"
                             f" rtp_kbps={values['rtp_kbps']:.1f}"
                             f" wire_kbps={values['wire_kbps']:.1f}"
                             f" link_cap_kbps=100"
@@ -1134,27 +1674,52 @@ def main() -> int:
                 ]
             elif is_gan:
                 output_backend = (
-                    "FALLBACK / Lanczos4" if gan_fallback_active else
+                    "FALLBACK / Lanczos4" if gan_display_fallback else
                     f"{gan_values['backend'].upper()} / {gan_values['provider']}"
                 )
+                drop_counts = gan_values["drop_reason_counts"]
+                decode_age_ms = (
+                    None if frame is None else max(0.0, (now - updated) * 1000.0)
+                )
+                good_age_ms = gan_controller_values.get("good_age_ms")
+                good_age_text = "none" if good_age_ms is None else f"{good_age_ms:.0f}"
+                output_age_ms = gan_controller_values.get("last_output_age_ms")
+                output_age_text = "none" if output_age_ms is None else f"{output_age_ms:.0f}"
+                state_text = gan_controller_values.get("state", "WAIT")
+                if state_text == GanFallbackController.HARD_STALLED:
+                    state_text = "HARD-STALL"
                 lines = [
-                    f"GAN H265-only  RX {values['rx_fps']:.1f}  DEC {values['decode_fps']:.1f}  "
+                    f"GAN H265-only RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} "
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
-                    "INPUT 256x144  NATIVE 512x288",
+                    "INPUT 256x144 NATIVE 512x288",
                     f"OUTPUT 640x360  {output_backend}",
-                    f"H265 {values['rtp_kbps']:.1f} kbps  WIRE {values['wire_kbps']:.1f} kbps  LINK CAP 100",
-                    f"PC LAST {gan_values['last_total_pc_ms']:.1f} ms  "
-                    f"P50/P95/P99 {gan_values['p50_ms']:.1f}/"
-                    f"{gan_values['p95_ms']:.1f}/{gan_values['p99_ms']:.1f} ms",
-                    f"QUEUE running={int(gan_values['running'])} pending={int(gan_values['pending'])} "
-                    f"drop={gan_values['dropped']} ({gan_values['drop_percent']:.1f}%)",
+                    f"H265 {values['rtp_kbps']:.1f} WIRE {values['wire_kbps']:.1f} LINK CAP 100",
+                    f"INFER ALL L/P50/P95/P99/MAX "
+                    f"{gan_values['last_finished_infer_ms']:.0f}/"
+                    f"{gan_values['infer_all_p50_ms']:.0f}/"
+                    f"{gan_values['infer_all_p95_ms']:.0f}/"
+                    f"{gan_values['infer_all_p99_ms']:.0f}/"
+                    f"{gan_values['infer_all_max_ms']:.0f} ms",
+                    f"GOOD PC P50/P95/P99/MAX {gan_values['good_total_p50_ms']:.0f}/"
+                    f"{gan_values['good_total_p95_ms']:.0f}/"
+                    f"{gan_values['good_total_p99_ms']:.0f}/"
+                    f"{gan_values['good_total_max_ms']:.0f} ms",
+                    f"AGE DEC {('none' if decode_age_ms is None else f'{decode_age_ms:.0f}')} "
+                    f"GAN {good_age_text} RUN {gan_values['running_age_ms']:.0f} "
+                    f"OUT {output_age_text} ms",
+                    f"BUDGET {gan_values['max_latency_ms']:.0f} SOFT "
+                    f"{gan_controller_values.get('soft_threshold_ms', 0.0):.0f} ms",
+                    f"QUEUE RUN{int(gan_values['running'])} PEND{int(gan_values['pending'])}",
+                    f"DROP REPL {drop_counts['replaced_pending']} OUT {drop_counts['output_replaced']} "
+                    f"PRE {drop_counts['stale_before_infer']} "
+                    f"POST {drop_counts['stale_after_infer']} ERR {drop_counts['inference_error']}",
+                    f"PRESENT OLD {gan_controller_values.get('presentation_stale_drops', 0)}",
                     f"P/I {values['p_fps']:.1f}/{values['i_fps']:.1f}  "
                     f"PACKETS {values['packets']}  LOSS {values['lost']}  ERR {values['decode_errors']}",
+                    f"STATE {state_text}  REC {gan_controller_values.get('recovery_streak', 0)}/"
+                    f"{gan_controller_values.get('recovery_good_frames', 0)}  "
+                    f"HARDSTALL {gan_controller_values.get('hard_stall_count', 0)}",
                 ]
-                if gan_fallback_active:
-                    lines.append(
-                        f"FALLBACK Lanczos4  SR running {gan_values['running_age_ms']:.0f} ms"
-                    )
                 if profile is not None:
                     lines.append(
                         f"Profile {profile['name']}   {profile['width']}x{profile['height']} @ "
@@ -1179,6 +1744,9 @@ def main() -> int:
                     )
             if frame is None:
                 lines.append("WAITING FOR COMPLETE IDR - start/restart the board sender now")
+            elif is_gan:
+                idr = "none" if values["idr_age"] is None else f"{values['idr_age']:.1f}s ago"
+                lines.append(f"Last IDR {idr}")
             else:
                 age_ms = max(0.0, (time.monotonic() - current_updated) * 1000.0)
                 idr = "none" if values["idr_age"] is None else f"{values['idr_age']:.1f}s ago"

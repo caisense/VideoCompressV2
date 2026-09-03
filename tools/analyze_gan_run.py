@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import re
 import statistics
@@ -21,6 +22,30 @@ def percentile(values: list[float], percent: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(values) - 1)
     return values[lower] + (values[upper] - values[lower]) * (position - lower)
+
+
+def summary(values: list[float]) -> dict[str, Any]:
+    return {
+        "p50": percentile(values, 50),
+        "p95": percentile(values, 95),
+        "p99": percentile(values, 99),
+        "max": max(values) if values else None,
+    }
+
+
+def numeric_field(records: list[dict[str, Any]], name: str) -> list[float]:
+    values = []
+    for record in records:
+        value = record.get(name)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number == number:
+            values.append(number)
+    return values
 
 
 def read_records(path: Path) -> list[dict[str, Any]]:
@@ -68,6 +93,19 @@ def read_receiver_metrics(path: Path) -> dict[str, Any]:
     }
 
 
+def normalized_drop_reason(record: dict[str, Any]) -> str | None:
+    reason = str(record.get("DROP_REASON", record.get("REASON", "")))
+    return {
+        "replaced_pending": "replaced_pending",
+        "stale_before_infer": "stale_before",
+        "stale_after_infer": "stale_after",
+        "inference_error": "inference_error",
+        "output_replaced": "output_replaced",
+        "OUTPUT_TOO_OLD": "presentation_old",
+        "RECOVERY_NOT_FRESH": "recovery_not_fresh",
+    }.get(reason)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path)
@@ -77,49 +115,207 @@ def main() -> int:
     parser.add_argument("--latency-budget-ms", type=float, default=None)
     args = parser.parse_args()
     records = read_records(args.log)
-    ready = [item for item in records if item.get("OUTPUT_READY") and not item.get("DROPPED")]
-    dropped = [item for item in records if item.get("DROPPED")]
-    latencies = [float(item["TOTAL_PC_MS"]) for item in ready if "TOTAL_PC_MS" in item]
-    infer = [float(item["INFER_MS"]) for item in ready if "INFER_MS" in item]
-    queue_wait = [float(item["QUEUE_WAIT"]) for item in records if "QUEUE_WAIT" in item]
-    arrivals = [float(item["ARRIVAL"]) for item in records if "ARRIVAL" in item]
+    worker_records = [
+        item for item in records
+        if item.get("TYPE") in (None, "GAN_WORKER") and
+        ("SEQ" in item or "OUTPUT_READY" in item)
+    ]
+    worker_drop_events = [
+        item for item in records if item.get("TYPE") == "GAN_WORKER_DROP"
+    ]
+    presentation_events = [
+        item for item in records if item.get("TYPE") == "GAN_PRESENTATION_DROP"
+    ]
+    state_events = [item for item in records if item.get("TYPE") == "GAN_STATE"]
+    run_end_events = [item for item in records if item.get("TYPE") == "GAN_RUN_END"]
+    hard_stall_events = [item for item in records if item.get("TYPE") == "GAN_HARD_STALL"]
+    ready = [item for item in worker_records
+             if item.get("OUTPUT_READY") and not item.get("DROPPED")]
+    dropped = [item for item in worker_records if item.get("DROPPED")]
+    inference_records = [
+        item for item in worker_records
+        if item.get("INFER_RETURNED") or (
+            float(item.get("INFER_MS", 0.0) or 0.0) > 0.0 and
+            item.get("DROP_REASON") != "stale_before_infer"
+        )
+    ]
+    latencies = [float(item["TOTAL_PC_MS"]) for item in ready
+                 if item.get("TOTAL_PC_MS") is not None]
+    all_total = [float(item["TOTAL_PC_MS"]) for item in inference_records
+                 if item.get("TOTAL_PC_MS") is not None]
+    infer = [float(item["INFER_MS"]) for item in inference_records
+             if item.get("INFER_MS") is not None]
+    dropped_after_infer = [
+        float(item["TOTAL_PC_MS"]) for item in dropped
+        if item.get("DROP_REASON") == "stale_after_infer" and
+        item.get("TOTAL_PC_MS") is not None
+    ]
+    dropped_after_infer_infer = [
+        float(item["INFER_MS"]) for item in dropped
+        if item.get("DROP_REASON") == "stale_after_infer" and
+        item.get("INFER_MS") is not None
+    ]
+    queue_wait = [float(item["QUEUE_WAIT"]) for item in worker_records
+                  if item.get("QUEUE_WAIT") is not None]
+    raw_min_values = numeric_field(worker_records, "RAW_MIN")
+    raw_max_values = numeric_field(worker_records, "RAW_MAX")
+    output_luma_values = numeric_field(worker_records, "OUTPUT_LUMA_MEAN")
+    postprocess_mode_counts = dict(collections.Counter(
+        str(item["POSTPROCESS_MODE"])
+        for item in worker_records
+        if item.get("POSTPROCESS_MODE") not in (None, "")
+    ))
+    clipped_low_total = sum(
+        int(float(item.get("CLIP_LOW_COUNT", 0) or 0))
+        for item in worker_records
+        if item.get("CLIP_LOW_COUNT") is not None
+    )
+    clipped_high_total = sum(
+        int(float(item.get("CLIP_HIGH_COUNT", 0) or 0))
+        for item in worker_records
+        if item.get("CLIP_HIGH_COUNT") is not None
+    )
+    arrivals = [float(item["ARRIVAL"]) for item in worker_records
+                if item.get("ARRIVAL") is not None]
     output_sequences = [int(item["SEQ"]) for item in ready if "SEQ" in item]
-    duration = max(arrivals) - min(arrivals) if len(arrivals) >= 2 else 0.0
-    backend = next((item.get("ENHANCER") for item in records if item.get("ENHANCER")), None)
-    provider = next((item.get("PROVIDER") for item in records if item.get("PROVIDER")), None)
+    event_times = [
+        float(item["AT"]) for item in records
+        if item.get("AT") is not None
+    ]
+    timeline = arrivals + event_times
+    duration = max(timeline) - min(timeline) if len(timeline) >= 2 else 0.0
+    backend = next((item.get("ENHANCER") for item in worker_records if item.get("ENHANCER")), None)
+    provider = next((item.get("PROVIDER") for item in worker_records if item.get("PROVIDER")), None)
+    source_fps_values = [
+        float(item["INPUT_FPS"]) for item in worker_records
+        if float(item.get("INPUT_FPS", 0.0) or 0.0) > 0.0
+    ]
+    source_fps = statistics.fmean(source_fps_values) if source_fps_values else None
+    budget_values = [
+        float(item["EFFECTIVE_BUDGET_MS"]) for item in worker_records
+        if item.get("EFFECTIVE_BUDGET_MS") is not None
+    ]
+    output_budget_ms = (
+        statistics.fmean(budget_values) if budget_values else args.latency_budget_ms
+    )
+    drop_reason_counts = {
+        "replaced_pending": 0,
+        "stale_before": 0,
+        "stale_after": 0,
+        "inference_error": 0,
+        "output_replaced": 0,
+        "presentation_old": 0,
+        "recovery_not_fresh": 0,
+    }
+    for item in dropped:
+        reason = normalized_drop_reason(item)
+        if reason is not None:
+            drop_reason_counts[reason] += 1
+    for item in worker_drop_events + presentation_events:
+        reason = normalized_drop_reason(item)
+        if reason is not None:
+            drop_reason_counts[reason] += 1
+    drop_denominator = len(worker_records) or 1
+    drop_reason_percent = {
+        reason: count * 100.0 / drop_denominator
+        for reason, count in drop_reason_counts.items()
+    }
+    soft_events = [item for item in state_events if item.get("STATE") == "SOFT_FALLBACK"]
+    recovered_events = [item for item in state_events if item.get("STATE") == "RECOVERED"]
+    fallback_durations = [
+        float(item["FALLBACK_DURATION_MS"])
+        for item in recovered_events if item.get("FALLBACK_DURATION_MS") is not None
+    ]
+    fallback_durations.extend(
+        float(item["FALLBACK_DURATION_MS"])
+        for item in run_end_events
+        if item.get("FALLBACK_ACTIVE") and item.get("FALLBACK_DURATION_MS") is not None
+    )
+    fallback_total_duration_ms = sum(fallback_durations)
+    fallback_longest_duration_ms = max(fallback_durations) if fallback_durations else None
+    if not fallback_durations and soft_events and recovered_events:
+        paired = zip(soft_events, recovered_events)
+        fallback_total_duration_ms = sum(
+            max(0.0, float(recovered.get("AT", 0.0)) - float(start.get("AT", 0.0))) * 1000.0
+            for start, recovered in paired
+            if start.get("AT") is not None and recovered.get("AT") is not None
+        )
+    fallback_percent = (
+        fallback_total_duration_ms * 100.0 / (duration * 1000.0)
+        if duration > 0.0 else 0.0
+    )
+    stale_recovery_rejects = sum(
+        1 for item in presentation_events if item.get("REASON") == "RECOVERY_NOT_FRESH"
+    )
+    hard_run_ages = [
+        float(item["RUN_AGE_MS"]) for item in hard_stall_events
+        if item.get("RUN_AGE_MS") is not None
+    ]
     result: dict[str, Any] = {
         "status": "PASS",
         "log": str(args.log),
         "records": len(records),
+        "worker_records": len(worker_records),
         "backend": backend,
         "provider": provider,
-        "input_fps_mean": (statistics.fmean(float(item["INPUT_FPS"])
-                            for item in records if float(item.get("INPUT_FPS", 0)) > 0)
-                           if any(float(item.get("INPUT_FPS", 0)) > 0 for item in records) else None),
+        "input_fps_mean": source_fps,
+        "source_fps": source_fps,
+        "output_budget_ms": output_budget_ms,
         "duration_s": duration,
-        "submitted": len(records),
+        "submitted": len(worker_records),
         "completed": len(ready),
-        "dropped": len(dropped),
-        "drop_percent": len(dropped) * 100.0 / len(records) if records else 0.0,
+        "inference_completed": len(inference_records),
+        "worker_dropped": len(dropped) + len(worker_drop_events),
+        "presentation_dropped": len(presentation_events),
+        "dropped": len(dropped) + len(worker_drop_events),
+        "drop_percent": (len(dropped) + len(worker_drop_events)) * 100.0 /
+        len(worker_records) if worker_records else 0.0,
         "enhanced_fps": len(ready) / duration if duration > 0 else None,
         "unique_output_sequences": len(set(output_sequences)),
         "duplicate_output_sequences": len(output_sequences) - len(set(output_sequences)),
-        "latency_ms": {
-            "p50": percentile(latencies, 50),
-            "p95": percentile(latencies, 95),
-            "p99": percentile(latencies, 99),
-            "max": max(latencies) if latencies else None,
+        "drop_reason_counts": drop_reason_counts,
+        "drop_reason_percent": drop_reason_percent,
+        "latency_ms": summary(latencies),
+        "infer_ms": summary(infer),
+        "infer_all_ms": summary(infer),
+        "inference_all": summary(infer),
+        "all_total_ms": summary(all_total),
+        "successful_total_ms": summary(latencies),
+        "dropped_after_infer_ms": summary(dropped_after_infer),
+        "dropped_after_infer_infer_ms": summary(dropped_after_infer_infer),
+        "postprocess_mode_counts": postprocess_mode_counts,
+        "raw_output_range": {
+            "min": min(raw_min_values) if raw_min_values else None,
+            "max": max(raw_max_values) if raw_max_values else None,
         },
-        "infer_ms": {
-            "p50": percentile(infer, 50),
-            "p95": percentile(infer, 95),
-            "p99": percentile(infer, 99),
-        },
+        "clipped_low_total": clipped_low_total,
+        "clipped_high_total": clipped_high_total,
+        "output_luma": summary(output_luma_values),
         "queue_wait_ms": {
             "p50": percentile(queue_wait, 50),
             "p95": percentile(queue_wait, 95),
             "max": max(queue_wait) if queue_wait else None,
         },
+        "fallback": {
+            "soft_fallback_entries": len(soft_events),
+            "fallback_total_duration_ms": fallback_total_duration_ms,
+            "fallback_longest_duration_ms": fallback_longest_duration_ms,
+            "fallback_percent": fallback_percent,
+            "recoveries": len(recovered_events),
+        },
+        "soft_fallback_entries": len(soft_events),
+        "fallback_total_duration_ms": fallback_total_duration_ms,
+        "fallback_longest_duration_ms": fallback_longest_duration_ms,
+        "fallback_percent": fallback_percent,
+        "recoveries": len(recovered_events),
+        "hard_stall": {
+            "count": len(hard_stall_events),
+            "max_run_age_ms": max(hard_run_ages) if hard_run_ages else 0.0,
+            "sequences": [item.get("SEQ") for item in hard_stall_events],
+        },
+        "hard_stall_count": len(hard_stall_events),
+        "hard_stall_max_run_age_ms": max(hard_run_ages) if hard_run_ages else 0.0,
+        "recovery_stale_rejects": stale_recovery_rejects,
     }
     if args.receiver_log is not None:
         result["transport"] = read_receiver_metrics(args.receiver_log)

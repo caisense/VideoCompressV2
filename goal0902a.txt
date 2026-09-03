@@ -1,0 +1,2789 @@
+/goal
+
+# VideoCompressV2 GAN 接收端实时性、Fallback 振荡与 GPU Stall 系统修复
+#
+# 当前目标平台：
+#
+# Sender:
+#   RK3588
+#   GAN mode
+#   256x144
+#   --gan-fps=8
+#
+# Receiver:
+#   Windows
+#   GeForce RTX 3060 Laptop 6GB
+#   ONNX Runtime CUDAExecutionProvider
+#   RealESRGAN_x2_dynamic.onnx
+#
+#
+# 当前实际现象：
+#
+# 日志频繁出现：
+#
+#   GAN enhancer recovered; leaving Lanczos4 fallback
+#   GAN enhancer stalled for 84 ms; using live Lanczos4 fallback
+#   GAN enhancer recovered; leaving Lanczos4 fallback
+#   GAN enhancer stalled for 95 ms; using live Lanczos4 fallback
+#   ...
+#
+# 同时此前曾出现：
+#
+#   RX正常
+#   DEC正常
+#   ENH=0
+#   worker running=1
+#   Source age > 2000ms
+#
+#
+# 本任务必须基于当前本地最新代码实际检查、修改和验证。
+#
+# 不允许凭旧版本假设修改。
+
+
+======================================================================
+0. 工作区安全
+======================================================================
+
+当前本地工作区是唯一修改对象。
+
+开始：
+
+    git status
+    git diff
+    git log -5 --oneline
+
+
+允许只读 Git 操作：
+
+    git status
+    git diff
+    git diff --cached
+    git log
+    git diff --check
+
+
+禁止：
+
+    git pull
+    git fetch
+    git push
+
+    git reset --hard
+    git clean -fd
+    git checkout -- .
+    git restore .
+
+
+不得覆盖用户现有未提交修改。
+
+不要只回复：
+
+    “已读取目标”
+
+必须实际：
+
+代码分析
+→ 修改
+→ 测试
+→ 真机/真实CUDA验证
+→ 最终报告。
+
+
+======================================================================
+1. 首先验证当前代码，而不是按 goal 猜
+======================================================================
+
+重点检查：
+
+    tools/full_frame_enhancer.py
+    tools/live_h265_hud.py
+    tools/analyze_gan_run.py
+
+    tools/test_full_frame_enhancer.py
+    tools/test_live_h265_hud.py
+
+
+必须确认当前代码实际是否仍具有：
+
+A.
+
+LatestOnlyEnhancerWorker:
+
+    one running
+    +
+    one replaceable pending
+
+
+B.
+
+默认：
+
+    gan max latency = 100ms
+
+
+C.
+
+worker 在：
+
+    queue_wait > max_latency
+
+时：
+
+    stale_before_infer
+
+
+D.
+
+worker 在：
+
+    total_pc_ms > max_latency
+
+时：
+
+    stale_after_infer
+
+
+E.
+
+GAN fallback stale threshold：
+
+    max(
+        2000 / source_fps,
+        1.5 * max_latency
+    )
+
+
+F.
+
+进入 fallback 的判断基于：
+
+    now - current_updated
+
+
+但日志：
+
+    "stalled for X ms"
+
+打印的是：
+
+    worker.running_age_ms
+
+
+G.
+
+fallback 状态下：
+
+只要 poll 到任意 GAN output
+
+立即：
+
+    gan_fallback_active = False
+
+
+如果当前代码已经变化：
+
+以本地代码为准，
+在最终报告中指出差异。
+
+
+======================================================================
+2. 当前已确认的第一个问题：
+日志把两种 age 混为一谈
+======================================================================
+
+当前进入 fallback 的条件本质是：
+
+    LAST DISPLAYED GOOD GAN OUTPUT AGE
+        >=
+    fallback threshold
+
+
+但日志输出的是：
+
+    CURRENT INFERENCE RUN AGE
+
+
+因此可能发生：
+
+    last_good_age = 260ms
+    fallback_threshold = 250ms
+
+    当前新 inference 才跑：
+    run_age = 84ms
+
+
+日志却打印：
+
+    GAN enhancer stalled for 84 ms
+
+
+这是错误的诊断语义。
+
+
+84ms并不是触发 stall 的原因。
+
+
+必须修复。
+
+
+======================================================================
+3. 删除误导性 "stalled for RUNAGE" 日志
+======================================================================
+
+不要再打印：
+
+    GAN enhancer stalled for 84 ms
+
+
+除非：
+
+真正判断 hard stall 的依据就是：
+
+    running_age_ms
+
+
+普通 fallback 应改成类似：
+
+    GAN output overdue:
+    GOOD_AGE=263ms
+    SOFT_THRESHOLD=250ms
+    RUN_AGE=84ms
+    -> Lanczos4 fallback
+
+
+例如：
+
+    GAN output overdue 263 ms
+    (threshold 250 ms, inference running 84 ms);
+    using Lanczos4 fallback
+
+
+如果：
+
+worker当前没有运行：
+
+    RUN_AGE=0
+
+
+也要正确显示。
+
+
+======================================================================
+4. 明确拆分四种时间
+======================================================================
+
+禁止继续混用一个：
+
+    Source age
+
+
+新增并明确：
+
+1.
+
+DECODE_AGE
+
+    距最新成功 decode frame 到达/更新多久
+
+
+2.
+
+GOOD_AGE
+
+    距最后一个被接收端真正接受并显示的
+    GAN output 完成多久
+
+
+3.
+
+RUN_AGE
+
+    当前正在执行的 inference 已运行多久
+
+
+4.
+
+OUTPUT_AGE
+
+    某个刚完成 GAN output
+    从源 decoded arrival 到现在总共多老
+
+
+HUD至少显示：
+
+    AGE DEC 15  GOOD 182  RUN 87 ms
+
+
+fallback时：
+
+    AGE DEC 12  GOOD 276  RUN 91 ms
+
+
+这样以后不再出现：
+
+    Source age=2s
+
+却不知道到底谁卡住。
+
+
+======================================================================
+5. 当前已确认的第二个问题：
+100ms固定 latency budget 不适配8fps
+======================================================================
+
+8fps：
+
+    frame_period =
+        1000 / 8
+        =
+        125ms
+
+
+当前实际 ESRGAN inference：
+
+大约：
+
+    80~98ms
+
+
+但：
+
+total_pc_ms =
+
+    queue wait
+    +
+    preprocessing
+    +
+    inference
+    +
+    postprocessing
+    +
+    output resize
+
+
+因此：
+
+例如：
+
+    queue 10ms
+    infer 95ms
+    post 5ms
+
+    TOTAL =110ms
+
+
+它仍然在：
+
+    125ms source frame period
+
+以内，
+
+但当前固定：
+
+    max_latency=100
+
+会直接：
+
+    stale_after_infer
+
+
+这会人为减少 successful output。
+
+
+======================================================================
+6. 改成 FPS-aware output latency budget
+======================================================================
+
+不要继续默认所有 fps：
+
+    100ms
+
+
+新增清晰语义：
+
+    effective_output_budget_ms
+
+
+推荐 CLI：
+
+    --gan-output-latency-budget-ms
+
+
+默认：
+
+    0
+
+
+0 表示：
+
+    AUTO
+
+
+AUTO：
+
+    frame_period =
+        1000 / source_fps
+
+
+初始推荐：
+
+    effective_output_budget =
+        1.10 ~ 1.20 * frame_period
+
+
+建议第一版：
+
+    1.15 * frame_period
+
+
+因此：
+
+8fps：
+
+    ≈144ms
+
+
+10fps：
+
+    ≈115ms
+
+
+12fps：
+
+    ≈96ms
+
+
+必须配置化：
+
+    --gan-output-latency-factor=1.15
+
+
+不要硬编码只能用于8fps。
+
+
+======================================================================
+7. 兼容旧参数
+======================================================================
+
+现有：
+
+    --gan-max-inference-latency-ms
+
+
+如果已有用户/脚本依赖，
+
+不要直接粗暴删除。
+
+
+可以：
+
+A.
+
+保留作为 deprecated alias
+
+
+或者：
+
+B.
+
+重新定义为明确 fixed override
+
+
+例如：
+
+    --gan-output-latency-budget-ms 0
+
+AUTO默认。
+
+
+若用户显式：
+
+    --gan-max-inference-latency-ms 150
+
+仍可以工作，
+
+但启动日志必须明确：
+
+    fixed legacy budget =150ms
+
+
+不要出现：
+
+CLI写100
+内部偷偷用144
+却不告诉用户。
+
+
+======================================================================
+8. Worker 应记录“所有 inference”统计
+======================================================================
+
+当前：
+
+    p50
+    p95
+    p99
+
+主要来自：
+
+successful outputs
+
+
+这是严重诊断缺陷。
+
+
+如果：
+
+慢 inference
+全部被 stale_after_infer 丢掉，
+
+HUD反而只看到：
+
+    成功的快样本
+
+
+导致性能看起来比真实更好。
+
+
+新增：
+
+    all_infer_latencies
+
+所有真正进入：
+
+    enhancer.enhance()
+
+并成功返回的 inference
+
+不论结果最终：
+
+    accepted
+    stale_after_infer
+
+
+都记录。
+
+
+======================================================================
+9. Worker 新增统计
+======================================================================
+
+snapshot() 增加：
+
+    infer_all_p50_ms
+    infer_all_p95_ms
+    infer_all_p99_ms
+    infer_all_max_ms
+
+    good_total_p50_ms
+    good_total_p95_ms
+    good_total_p99_ms
+
+    last_finished_infer_ms
+
+    last_finished_total_ms
+
+
+同时保留：
+
+    last_good...
+
+
+不要再让：
+
+LAST
+
+只能代表最后一次成功结果
+而用户误以为是当前 inference。
+
+
+======================================================================
+10. DROP reason 必须完整可见
+======================================================================
+
+HUD增加：
+
+    DROP REPL/PRE/POST/ERR
+
+
+对应：
+
+    replaced_pending
+    stale_before_infer
+    stale_after_infer
+    inference_error
+
+
+例如：
+
+    DROP R12 PRE0 POST37 ERR0
+
+
+如果：
+
+8fps主要：
+
+    POST持续增长
+
+
+就直接证明：
+
+固定100ms total budget
+正在误杀可用结果。
+
+
+======================================================================
+11. analyze_gan_run.py 必须统计 DROP_REASON
+======================================================================
+
+当前 analyzer 不应该只给：
+
+    total dropped
+
+
+增加：
+
+    drop_reason_counts
+
+
+例如：
+
+{
+  "replaced_pending": 12,
+  "stale_before_infer": 0,
+  "stale_after_infer": 54,
+  "inference_error": 0
+}
+
+
+并输出：
+
+    percentage
+
+
+这是本次问题验证的重要指标。
+
+
+======================================================================
+12. analyzer 同时统计 dropped inference latency
+======================================================================
+
+现在不能只分析：
+
+OUTPUT_READY 的 INFER_MS。
+
+
+必须分别：
+
+    accepted_infer
+    dropped_after_infer
+
+
+统计：
+
+    p50
+    p95
+    p99
+    max
+
+
+目标回答：
+
+stale_after_infer 到底是：
+
+    101~120ms 正常轻微超时
+
+还是：
+
+    500~2000ms 真正 stall。
+
+
+======================================================================
+13. Soft overdue 与 Hard GPU stall 必须彻底分离
+======================================================================
+
+禁止继续把：
+
+    250ms没有新GAN输出
+
+称为：
+
+    GPU STALL
+
+
+建立两个概念。
+
+
+SOFT OVERDUE：
+
+    视频层已经太久没有新的GAN结果
+
+行为：
+
+    使用最新decode帧
+    Lanczos4实时显示
+
+
+HARD STALL：
+
+    当前某一次 inference 自己
+    连续运行异常久
+
+依据：
+
+    RUN_AGE
+
+
+二者不能共用一个名称。
+
+
+======================================================================
+14. Soft fallback threshold
+======================================================================
+
+当前：
+
+    max(
+        2 * frame_period,
+        1.5 * latency_budget
+    )
+
+本身方向基本合理。
+
+
+可以保留或轻微重构为：
+
+    soft_fallback_ms
+
+
+对于8fps：
+
+约：
+
+    250ms
+
+
+这表示：
+
+连续两个source frame周期
+没有新的GAN画面
+
+才切实时Lanczos。
+
+
+不要：
+
+80~100ms
+就切fallback。
+
+
+======================================================================
+15. Soft fallback 不等于 GPU异常
+======================================================================
+
+进入时日志：
+
+    GAN output overdue
+
+而不是：
+
+    GPU stalled
+
+
+HUD状态：
+
+    GAN SOFT-FALLBACK
+
+
+不要：
+
+    HARDSTALL
+
+
+除非 RUN_AGE 真超过 hard threshold。
+
+
+======================================================================
+16. Hard stall threshold
+======================================================================
+
+增加：
+
+    --gan-hard-stall-ms
+
+
+默认建议：
+
+    500ms
+
+
+或者：
+
+    max(
+        500ms,
+        4 * frame_period
+    )
+
+
+8fps：
+
+    4 frames =500ms
+
+
+10fps：
+
+    floor仍500ms
+
+
+12fps：
+
+    floor仍500ms
+
+
+这样：
+
+    80
+    90
+    100
+    150ms
+
+都绝不能叫：
+
+    hard stall。
+
+
+======================================================================
+17. HARD STALL telemetry
+======================================================================
+
+如果：
+
+    worker.running
+    &&
+    running_age >= hard_stall_ms
+
+
+记录：
+
+    hard_stall_count += 1
+
+
+但同一次 inference：
+
+只计一次。
+
+
+日志：
+
+    GAN HARD STALL:
+    seq=1234
+    RUN_AGE=517ms
+    threshold=500ms
+    fallback remains Lanczos4
+
+
+若它后来返回：
+
+记录：
+
+    GAN hard-stalled inference returned after 1842ms
+
+
+这样才能真正抓到此前：
+
+    2秒卡死
+
+是否由 ORT/CUDA 调用造成。
+
+
+======================================================================
+18. 当前已确认的第三个问题：
+fallback recovery 没有迟滞
+======================================================================
+
+现在：
+
+fallback active
+
+只要：
+
+    poll_output() != None
+
+立即：
+
+    recovered
+    fallback=False
+
+
+这非常容易造成：
+
+    GAN
+    ↓
+    fallback
+    ↓
+    GAN
+    ↓
+    fallback
+
+
+视觉上：
+
+    sharp
+    blur
+    sharp
+    blur
+
+
+必须修复。
+
+
+======================================================================
+19. 新增 Recovery Hysteresis
+======================================================================
+
+fallback状态下：
+
+不能一次成功就恢复。
+
+
+新增：
+
+    --gan-recovery-good-frames
+
+
+默认：
+
+    3
+
+
+要求：
+
+连续3个：
+
+    fresh
+    valid
+    accepted GAN outputs
+
+
+才退出 fallback。
+
+
+如果中间：
+
+    timeout
+    stale output
+    hard stall
+
+则：
+
+    recovery_streak=0
+
+
+======================================================================
+20. Recovery candidate 必须足够新
+======================================================================
+
+这是非常重要的。
+
+
+fallback时：
+
+Lanczos显示的是：
+
+    最新 decode frame
+
+
+如果突然拿一张：
+
+    2 frame以前的 ESRGAN output
+
+覆盖回来，
+
+人物会：
+
+    temporal jump backward
+
+
+所以恢复 output 必须检查：
+
+    sequence lag
+
+
+例如：
+
+    latest_decoded_sequence
+        -
+    output.source_sequence
+        <=
+    1
+
+
+默认：
+
+    --gan-recovery-max-sequence-lag=1
+
+
+也可以同时检查：
+
+    total source age
+    <= output budget
+
+
+如果旧：
+
+    discard for presentation
+    keep fallback
+
+
+不要：
+
+旧ESRGAN一完成
+就把实时Lanczos画面倒退回去。
+
+
+======================================================================
+21. Healthy 状态也要防特别旧 output
+======================================================================
+
+即使不在 fallback：
+
+在提交/处理拥堵后，
+
+如果某 output 已明显落后：
+
+    latest decoded seq
+
+很多帧，
+
+也不应该显示。
+
+
+增加：
+
+    presentation freshness gate
+
+
+建议：
+
+正常允许：
+
+    lag <=1
+
+
+必要时：
+
+    lag <=2
+
+通过A/B决定。
+
+
+超出：
+
+    presentation_stale_drop++
+
+
+注意：
+
+这是 presentation drop，
+
+不要和 worker inference drop 混在一起。
+
+
+======================================================================
+22. 新增 Presentation drop 统计
+======================================================================
+
+区分：
+
+Worker drop：
+
+    REPLACED
+    STALE_PRE
+    STALE_POST
+    ERROR
+
+
+Presentation drop：
+
+    OUTPUT_TOO_OLD
+    RECOVERY_NOT_FRESH
+
+
+不能混成一个：
+
+    dropped
+
+
+HUD可以：
+
+    WDROP ...
+    PDROP OLD3
+
+
+======================================================================
+23. 建议新增 GanFallbackController
+======================================================================
+
+不要继续把状态逻辑散在：
+
+live_h265_hud.py main loop。
+
+
+新增可测试纯状态类：
+
+例如：
+
+    GanFallbackController
+
+
+状态：
+
+    HEALTHY
+    SOFT_FALLBACK
+    HARD_STALLED
+
+
+字段：
+
+    soft_entries
+    recoveries
+    hard_stalls
+
+    recovery_streak
+
+    last_good_completed_at
+    last_good_sequence
+
+    hard_stall_reported_sequence
+
+
+输入：
+
+    now
+    source_fps
+    latest_decoded_sequence
+    worker snapshot
+    candidate output
+
+
+输出：
+
+    action
+
+
+例如：
+
+    KEEP_GAN
+    USE_LANCZOS
+    ACCEPT_GAN
+    DISCARD_STALE_GAN
+
+
+目的：
+
+使 fallback/recovery
+能独立单元测试。
+
+
+======================================================================
+24. 不要让 fallback 阻塞 decode
+======================================================================
+
+必须继续保持：
+
+    RX
+    DEC
+
+独立运行。
+
+
+fallback只改变：
+
+    display source
+
+
+不能：
+
+停止 worker
+停止 decoder
+等待 GPU。
+
+
+因此即使：
+
+GAN hard stall
+
+也应该继续：
+
+    decoded H265
+    → Lanczos
+    → live display
+
+
+这条原则保留。
+
+
+======================================================================
+25. 修复 Source age HUD
+======================================================================
+
+当前 GAN mode 不再显示模糊的：
+
+    Source age
+
+
+改成：
+
+    DEC AGE
+    GAN AGE
+
+
+例如：
+
+    DEC AGE 14 ms
+    GAN AGE 183 ms
+
+
+如果 fallback：
+
+    DEC AGE 17 ms
+    GAN AGE 624 ms
+
+
+用户一眼能看出：
+
+网络视频仍实时，
+只是增强器落后。
+
+
+======================================================================
+26. HUD 推荐格式
+======================================================================
+
+例如：
+
+GAN H265-only RX 8.0 DEC 8.0 ENH 7.9 DISP 8.0
+
+INPUT 256x144 NATIVE 512x288
+OUTPUT 640x360 ESRGAN / CUDA
+
+H265 34.1 WIRE 39.2 LINK 100
+
+INFER ALL
+L/P50/P95/P99/MAX
+91/89/98/104/612 ms
+
+GOOD PC
+P50/P95 96/117 ms
+
+AGE DEC 12 GAN 128 RUN 84 ms
+
+QUEUE RUN1 PEND0
+
+DROP
+R 3 PRE 0 POST 12 ERR 0
+PRESENT OLD 1
+
+STATE HEALTHY
+REC 0/3
+HARDSTALL 0
+
+
+fallback：
+
+STATE SOFT-FALLBACK
+GOOD AGE 271 / SOFT 250
+RUN AGE 91
+REC 1/3
+
+
+hard stall：
+
+STATE HARD-STALL
+RUN AGE 587 / HARD 500
+
+
+======================================================================
+27. 日志降噪
+======================================================================
+
+当前：
+
+fallback
+recovered
+fallback
+recovered
+
+刷屏严重。
+
+
+修改后：
+
+仅状态发生真正转换时打印。
+
+
+HEALTHY
+→ SOFT_FALLBACK
+
+打印一次。
+
+
+SOFT_FALLBACK recovery streak：
+
+1/3
+2/3
+
+默认不要逐帧打印，
+HUD显示即可。
+
+
+达到：
+
+3/3
+
+打印：
+
+    GAN recovered after 3 consecutive fresh outputs
+
+
+HARDSTALL：
+
+每次 inference 只打印一次。
+
+
+======================================================================
+28. 不要把正常 replaced_pending 当故障
+======================================================================
+
+Latest-only设计下：
+
+如果模型速度略低于source fps，
+
+pending被更新是：
+
+    正常背压行为
+
+
+不能把：
+
+replaced_pending
+
+直接称为错误。
+
+
+HUD可以显示：
+
+    SKIP/REPL
+
+
+与：
+
+    ERROR
+    HARDSTALL
+
+区分。
+
+
+======================================================================
+29. 保留 Latest-only 架构
+======================================================================
+
+不要改成：
+
+    queue all frames
+
+
+必须继续：
+
+    1 running
+    +
+    1 replaceable newest pending
+
+
+否则真正会产生：
+
+    秒级累计延迟。
+
+
+这是现有正确设计，
+不要推翻。
+
+
+======================================================================
+30. 不要用提高队列长度修复 drop
+======================================================================
+
+禁止：
+
+pending queue：
+
+    1 →10
+
+来降低 drop count。
+
+
+这会牺牲：
+
+    实时性
+
+
+用户目标是：
+
+    live video
+
+不是：
+
+    所有帧都处理完。
+
+
+======================================================================
+31. Worker output buffer 继续最多1
+======================================================================
+
+如果 UI 没及时poll：
+
+旧 completed output
+可以被新 completed output 替代。
+
+
+这是合理的。
+
+
+但：
+
+output_replaced
+
+应单独统计。
+
+
+======================================================================
+32. P0 测试：
+8fps正常90ms inference不得进入fallback
+======================================================================
+
+创建 deterministic fake enhancer：
+
+    inference =90ms
+
+
+source：
+
+    8fps
+    125ms interval
+
+
+运行：
+
+至少20 frames。
+
+
+要求：
+
+    HEALTHY保持稳定
+
+    soft_fallback_entries =0
+
+    hard_stall_count=0
+
+
+不能出现：
+
+fallback/recover振荡。
+
+
+======================================================================
+33. P0 测试：
+8fps 110ms total仍应可接受
+======================================================================
+
+构造：
+
+    queue + infer + post
+    TOTAL≈110ms
+
+
+8fps：
+
+125ms interval。
+
+
+AUTO budget：
+
+必须接受。
+
+
+不得：
+
+    stale_after_infer
+
+
+证明：
+
+固定100ms误杀已修复。
+
+
+======================================================================
+34. 10fps测试
+======================================================================
+
+source：
+
+    10fps
+    period=100ms
+
+
+fake：
+
+    90ms
+
+
+AUTO budget：
+
+≈115ms
+
+
+要求：
+
+可以正常接受。
+
+
+fake：
+
+    130ms
+
+
+应出现：
+
+    replaced pending / stale policy
+
+但：
+
+queue不得增长。
+
+
+视频 fallback 仍保持 live。
+
+
+======================================================================
+35. 12fps测试
+======================================================================
+
+source：
+
+    12fps
+    ≈83.3ms
+
+
+fake：
+
+    95ms
+
+
+模型吞吐本身低于source cadence。
+
+
+要求：
+
+    latest-only replacement发生
+
+但：
+
+    不允许延迟无限增加。
+
+
+这是：
+
+THROUGHPUT LIMIT
+
+不是：
+
+GPU HARDSTALL。
+
+
+状态名不得错误。
+
+
+======================================================================
+36. Soft fallback测试
+======================================================================
+
+8fps：
+
+连续：
+
+    >250ms
+
+没有任何 valid GAN output。
+
+
+但当前 worker：
+
+    RUN_AGE只有80ms
+
+
+要求日志/状态：
+
+    SOFT_FALLBACK
+
+并明确：
+
+    GOOD_AGE >250
+    RUN_AGE=80
+
+
+绝不能打印：
+
+    stalled for 80ms。
+
+
+======================================================================
+37. Hard stall测试
+======================================================================
+
+fake enhancer：
+
+sleep：
+
+    700ms
+
+
+要求：
+
+约500ms：
+
+    HARDSTALL count=1
+
+
+但：
+
+decode/Lanczos live path
+持续更新。
+
+
+700ms fake最终返回：
+
+不能立即跳回GAN。
+
+
+必须走：
+
+    freshness
+    +
+    recovery hysteresis。
+
+
+======================================================================
+38. Recovery hysteresis测试
+======================================================================
+
+进入 fallback 后：
+
+success frame1
+
+    streak=1
+    仍fallback
+
+
+success frame2
+
+    streak=2
+    仍fallback
+
+
+success frame3
+
+    streak=3
+    切HEALTHY
+
+
+断一次：
+
+    streak reset。
+
+
+======================================================================
+39. Stale recovery测试
+======================================================================
+
+当前 decode：
+
+    seq=100
+
+
+GAN output：
+
+    seq=95
+
+
+即使 inference 成功：
+
+也不能：
+
+    fallback → GAN
+
+
+保持：
+
+    live Lanczos。
+
+
+记录：
+
+    recovery_stale_drop
+
+
+随后：
+
+    seq=99/100 fresh output
+
+才允许进入 recovery streak。
+
+
+======================================================================
+40. 同一source frame不可输出两种版本
+======================================================================
+
+保持：
+
+same source identity
+immutable presentation。
+
+
+不要：
+
+seq100先Lanczos
+稍后同一个seq100再ESRGAN
+
+
+如果 fallback 已经展示：
+
+seq100 Lanczos，
+
+该 seq100 的 GAN output 到达后：
+
+不得替换同一 source identity。
+
+
+只能影响：
+
+后续 source sequence。
+
+
+防止：
+
+同一静止帧内
+
+blur → sharp。
+
+
+======================================================================
+41. GAN fallback presentation 规则
+======================================================================
+
+fallback active：
+
+每次新的 decoded source frame：
+
+    Lanczos latest
+    display
+
+
+保持真实运动。
+
+
+不要 HOLD：
+
+旧GAN frame。
+
+
+这正是此次避免视频卡死的目的。
+
+
+======================================================================
+42. DEBUG JSONL 扩展
+======================================================================
+
+worker record 增加：
+
+    FRAME_PERIOD_MS
+    EFFECTIVE_BUDGET_MS
+
+    INFER_START
+    INFER_END
+
+如可行。
+
+
+fallback state event
+单独写：
+
+    EVENT
+
+例如：
+
+{
+  "TYPE":"GAN_STATE",
+  "STATE":"SOFT_FALLBACK",
+  "GOOD_AGE_MS":271,
+  "RUN_AGE_MS":84,
+  "SOFT_THRESHOLD_MS":250
+}
+
+
+恢复：
+
+{
+  "TYPE":"GAN_STATE",
+  "STATE":"RECOVERED",
+  "RECOVERY_STREAK":3
+}
+
+
+hard stall：
+
+{
+  "TYPE":"GAN_HARD_STALL",
+  "RUN_AGE_MS":517
+}
+
+
+======================================================================
+43. analyze_gan_run 输出新增
+======================================================================
+
+最终至少：
+
+    source_fps
+
+    output_budget_ms
+
+    completed
+    worker_dropped
+    presentation_dropped
+
+
+Drop reasons：
+
+    replaced_pending
+    stale_before
+    stale_after
+    inference_error
+    presentation_old
+
+
+Inference all:
+
+    p50
+    p95
+    p99
+    max
+
+
+Successful total:
+
+    p50
+    p95
+    p99
+    max
+
+
+Fallback：
+
+    soft_fallback_entries
+    fallback_total_duration
+    fallback_percent
+    recoveries
+
+Hard stall：
+
+    count
+    max_run_age
+
+
+Recovery：
+
+    stale_recovery_rejects
+
+
+======================================================================
+44. 第一阶段只修逻辑，不先优化模型
+======================================================================
+
+本轮第一阶段不要：
+
+    TensorRT
+    FP16
+    换ESRNet
+    降输入分辨率
+
+
+先证明：
+
+当前ESRGAN + CUDA
+在8fps下：
+
+逻辑正确。
+
+
+因为当前日志显示：
+
+多数 inference ≈80~98ms，
+
+理论上8fps有125ms周期。
+
+
+先修：
+
+budget
+fallback
+telemetry
+recovery。
+
+
+======================================================================
+45. 真实 RTX3060 验证
+======================================================================
+
+真实运行：
+
+    --gan-fps=8
+    --gan-enhancer=esrgan
+    --gan-require-cuda
+
+
+连续：
+
+至少：
+
+    10分钟
+
+
+不是30秒短测。
+
+
+记录：
+
+    debug JSONL
+    receiver log
+
+
+场景包含：
+
+    静止
+    人移动
+    多人
+    画面变化。
+
+
+======================================================================
+46. 8fps验收目标
+======================================================================
+
+如果真实 inference：
+
+    p95 <125ms
+
+
+目标：
+
+正常运行期间：
+
+    soft fallback <= 极少
+
+且不得周期性：
+
+    fallback/recovered
+
+
+要求：
+
+    HARDSTALL=0
+
+或如果有：
+
+必须获得真实：
+
+    RUN_AGE >500ms
+
+证据。
+
+
+不能再把：
+
+90ms
+
+称为 stall。
+
+
+======================================================================
+47. 与旧版本对比
+======================================================================
+
+Before：
+
+统计：
+
+    fallback entries/min
+    recoveries/min
+    stale_after_infer/min
+    drop%
+    ENH fps
+
+
+After：
+
+同场景。
+
+
+主要验收：
+
+fallback/recover振荡：
+
+    显著减少
+
+优选：
+
+正常8fps下趋近0。
+
+
+======================================================================
+48. 临时命令验证
+======================================================================
+
+完成代码后给出实际命令。
+
+
+例如：
+
+Sender：
+
+    ./rknn_yolov8_seg_cam \
+      --mode=gan \
+      --gan-fps=8 \
+      --gan-inference-fps=4 \
+      --gan-video-bitrate-kbps=75 \
+      ...
+
+
+Receiver：
+
+    python tools/live_h265_hud.py runs/gan/gan.sdp \
+      --gan-enhancer=esrgan \
+      --gan-esrgan-model=model/RealESRGAN_x2_dynamic.onnx \
+      --gan-require-cuda \
+      --gan-output-latency-budget-ms=0 \
+      --gan-output-latency-factor=1.15 \
+      --gan-hard-stall-ms=500 \
+      --gan-recovery-good-frames=3 \
+      --gan-debug-log=runs/gan/esrgan8.jsonl
+
+
+根据实际最终参数名调整。
+
+
+======================================================================
+49. 运行所有现有测试
+======================================================================
+
+至少：
+
+    python -m unittest tools.test_full_frame_enhancer
+    python -m unittest tools.test_live_h265_hud
+
+
+以及仓库已有GAN相关测试。
+
+
+必须报告：
+
+    tests run
+    PASS / FAIL
+
+
+不得只写：
+
+    should pass。
+
+
+======================================================================
+50. py_compile
+======================================================================
+
+执行：
+
+    python -m py_compile \
+      tools/full_frame_enhancer.py \
+      tools/live_h265_hud.py \
+      tools/analyze_gan_run.py
+
+
+必须PASS。
+
+
+======================================================================
+51. git检查
+======================================================================
+
+最后：
+
+    git diff --check
+    git status
+
+
+不得大范围格式化无关代码。
+
+
+======================================================================
+52. Checkpoint A
+======================================================================
+
+先只完成：
+
+    FPS-aware budget
+    age telemetry
+    correct fallback logging
+
+
+然后 fake测试。
+
+
+不要一次加入所有复杂状态。
+
+
+验证：
+
+90ms @8fps：
+
+无 fallback。
+
+
+======================================================================
+53. Checkpoint B
+======================================================================
+
+再加入：
+
+    recovery freshness
+    recovery streak
+
+
+验证：
+
+不再：
+
+fallback/recover/fallback/recover。
+
+
+======================================================================
+54. Checkpoint C
+======================================================================
+
+加入：
+
+    hard stall telemetry
+
+
+fake 700ms测试。
+
+
+确认：
+
+软 overdue
+和
+hard stall
+
+严格区分。
+
+
+======================================================================
+55. Checkpoint D
+======================================================================
+
+真实3060：
+
+8fps运行 >=10min。
+
+
+如果不存在：
+
+    RUN_AGE >=500ms
+
+
+则结论应明确：
+
+此前主要问题：
+
+    fixed 100ms budget
+    +
+    fallback recovery振荡
+
+而不是：
+
+CUDA hang。
+
+
+======================================================================
+56. 条件 Phase 2：
+只有真实出现 HARD STALL 才实施进程隔离
+======================================================================
+
+这是条件任务。
+
+
+如果10分钟真实CUDA测试中出现：
+
+    RUN_AGE >=500ms
+
+尤其：
+
+    >1000ms
+
+
+则证明：
+
+ONNX Runtime/CUDA native call
+确实存在长stall。
+
+
+Python thread 无法安全强制终止：
+
+    session.run()
+
+
+此时才进入 Phase 2。
+
+
+如果没有真实hard stall：
+
+不要为了“未来可能”
+增加 multiprocessing复杂度。
+
+
+======================================================================
+57. Phase 2：GAN worker process isolation
+======================================================================
+
+只有第56节触发才实施。
+
+
+结构：
+
+Main Receiver
+    │
+    ├── UDP / FFmpeg decode
+    │
+    ├── Lanczos live fallback
+    │
+    │
+    └── GAN child process
+            ↓
+         ORT/CUDA Session
+
+
+主进程绝不能把：
+
+CUDA session
+
+放在不可杀的线程里。
+
+
+======================================================================
+58. Process worker仍然latest-only
+======================================================================
+
+IPC：
+
+最大：
+
+    one active
+    one latest pending
+
+
+不要：
+
+multiprocessing.Queue无限增长。
+
+
+256x144输入很小，
+
+可以第一版使用：
+
+bounded Queue/Pipe。
+
+
+若性能实测不足：
+
+再考虑 shared_memory。
+
+
+不要提前过度优化。
+
+
+======================================================================
+59. Process hard restart
+======================================================================
+
+若：
+
+    RUN_AGE > hard_stall_ms
+
+
+主进程：
+
+1.
+
+继续 Lanczos live fallback。
+
+
+2.
+
+terminate GAN child。
+
+
+3.
+
+join with timeout。
+
+
+4.
+
+如仍alive：
+
+kill。
+
+
+5.
+
+创建新 child。
+
+
+6.
+
+新ORT CUDA session。
+
+
+7.
+
+warmup。
+
+
+8.
+
+连续3个fresh output。
+
+
+9.
+
+恢复GAN。
+
+
+整个过程中：
+
+H265 decode不能停止。
+
+
+======================================================================
+60. Process restart telemetry
+======================================================================
+
+增加：
+
+    GAN_RESTARTS
+
+
+日志：
+
+    HARD STALL 1247ms
+    restarting GAN worker process
+
+
+恢复：
+
+    GAN worker restarted
+    warmup=...
+    recovery 3/3
+    back to HEALTHY
+
+
+======================================================================
+61. Process模式测试
+======================================================================
+
+fake child：
+
+故意永久sleep。
+
+
+要求：
+
+主receiver：
+
+不会卡。
+
+
+Lanczos保持更新。
+
+
+child：
+
+在hard timeout后被终止并重建。
+
+
+不得产生：
+
+    orphan python.exe
+    orphan CUDA process。
+
+
+======================================================================
+62. 不允许的伪修复
+======================================================================
+
+禁止：
+
+把100ms简单改成1000ms
+
+关闭 stale drop
+
+增加队列到10/100
+
+一有延迟就显示旧GAN帧
+
+把8fps改6fps作为最终修复
+
+关闭ESRGAN
+
+把fallback threshold调5秒
+
+删除fallback
+
+用旧GAN frame HOLD掩盖卡顿
+
+一次成功立即恢复
+
+把正常90ms inference叫HARDSTALL
+
+不区分decode age / GAN age
+
+只看平均延迟不看p99/max
+
+只统计成功inference。
+
+
+======================================================================
+63. 最终推荐状态机
+======================================================================
+
+最终应接近：
+
+
+          fresh GAN outputs
+                 │
+                 ▼
+        ┌─────────────────┐
+        │     HEALTHY     │
+        └────────┬────────┘
+                 │
+       no fresh GAN output
+       > soft threshold
+                 │
+                 ▼
+        ┌─────────────────┐
+        │  SOFT FALLBACK  │
+        │ latest Lanczos  │
+        └──────┬───────┬──┘
+               │       │
+   3 fresh outputs      │ RUN AGE
+   consecutive          │ >500ms
+               │       │
+               ▼       ▼
+            HEALTHY  HARD STALL
+                         │
+                         │
+                thread mode:
+                telemetry/fallback
+                         │
+                         │ if Phase2
+                         ▼
+                 restart process
+                         │
+                      warmup
+                         │
+                  3 fresh outputs
+                         ▼
+                      HEALTHY
+
+
+======================================================================
+64. 最终报告必须包含
+======================================================================
+
+# Result
+
+
+## 1. Latest-code root cause
+
+必须明确说明：
+
+为什么日志：
+
+    stalled 84ms
+
+实际上并不代表：
+
+84ms触发stall。
+
+
+给出真正：
+
+    GOOD AGE
+    threshold
+    RUN AGE。
+
+
+## 2. Fixed 100ms budget analysis
+
+用真实JSONL数据回答：
+
+8fps时：
+
+有多少：
+
+    stale_after_infer
+
+其实TOTAL只在：
+
+    100~125/145ms。
+
+
+## 3. FPS-aware budget
+
+说明：
+
+8fps
+10fps
+12fps
+
+最终AUTO预算分别是多少。
+
+
+## 4. Drop reasons
+
+Before / After：
+
+    replaced
+    stale_pre
+    stale_post
+    error
+
+
+## 5. Inference latency
+
+必须使用：
+
+所有完成 inference，
+
+不仅成功输出。
+
+
+表：
+
+             BEFORE   AFTER
+p50
+p95
+p99
+max
+
+
+## 6. Fallback
+
+表：
+
+    entries/min
+    recoveries/min
+    fallback %
+    longest fallback
+
+
+## 7. Hard stall
+
+是否真实发现：
+
+    RUN_AGE >=500ms
+
+
+如果没有：
+
+明确：
+
+NO HARD CUDA STALL OBSERVED。
+
+
+如果有：
+
+给出：
+
+    count
+    max
+    corresponding sequence。
+
+
+## 8. Recovery
+
+说明：
+
+freshness gate
+sequence lag
+3-frame hysteresis。
+
+
+## 9. HUD
+
+展示新的：
+
+DEC AGE
+GAN AGE
+RUN AGE
+
+和状态。
+
+
+## 10. 8fps real CUDA result
+
+至少10分钟。
+
+
+包括：
+
+RX
+DEC
+ENH
+DISP
+
+drop%
+
+GPU provider。
+
+
+## 11. Video stability
+
+确认：
+
+不再周期性：
+
+GAN/Lanczos/GAN/Lanczos
+
+造成清晰模糊闪烁。
+
+
+## 12. Phase 2 decision
+
+明确：
+
+是否因为真实hard stall
+实施 process isolation。
+
+
+不得含糊。
+
+
+## 13. Tests
+
+实际命令
+测试数
+PASS/FAIL。
+
+
+## 14. Git
+
+    git status
+    git diff --check
+
+
+明确：
+
+未pull
+未fetch
+未push
+未覆盖用户已有修改。
+
+
+======================================================================
+65. 最终成功标准
+======================================================================
+
+当前8fps Real-ESRGAN：
+
+正常约80~100ms推理时，
+
+不得再因为诊断或固定100ms策略
+频繁触发：
+
+    fallback
+    recovered
+    fallback
+    recovered
+
+
+必须做到：
+
+1.
+
+正常80~100ms inference：
+
+识别为 HEALTHY。
+
+
+2.
+
+超过source时效：
+
+才进入 SOFT FALLBACK。
+
+
+3.
+
+SOFT FALLBACK：
+
+始终显示最新Lanczos，
+保证视频运动不断。
+
+
+4.
+
+恢复：
+
+必须连续多帧fresh GAN结果，
+不能一次成功就来回振荡。
+
+
+5.
+
+只有：
+
+RUN_AGE真正达到数百ms
+
+才能称：
+
+HARD STALL。
+
+
+6.
+
+真实CUDA若发生秒级hang：
+
+必须能够被明确记录；
+
+若证据支持，
+通过独立process实现真正可杀、可恢复的GAN worker。
+
+
+最终目标：
+
+GPU增强失败只能降低画质，
+
+不能再让实时视频卡死，
+
+也不能因为保护机制过敏
+制造新的清晰/模糊周期性闪烁。

@@ -95,6 +95,16 @@ class EnhancementInput:
 
 
 @dataclasses.dataclass(frozen=True)
+class EnhancementDiagnostics:
+    raw_min: Optional[float] = None
+    raw_max: Optional[float] = None
+    postprocess_mode: str = "UNKNOWN"
+    clip_low_count: int = 0
+    clip_high_count: int = 0
+    output_luma_mean: Optional[float] = None
+
+
+@dataclasses.dataclass(frozen=True)
 class EnhancementOutput:
     frame: np.ndarray
     source_sequence: int
@@ -106,12 +116,19 @@ class EnhancementOutput:
     total_pc_ms: float
     enhancer: str
     provider: str
+    diagnostics: Optional[EnhancementDiagnostics] = None
 
 
 class FullFrameEnhancer:
     """Common preprocessing/postprocessing wrapper for none/ESRNet/ESRGAN."""
 
     VALID_BACKENDS = ("none", "esrnet", "esrgan")
+    OUTPUT_MODE_ZERO_TO_ONE = "ZERO_TO_ONE"
+    OUTPUT_MODE_LANCZOS4 = "LANCZOS4"
+    OUTPUT_MODE_BY_BACKEND = {
+        "esrnet": OUTPUT_MODE_ZERO_TO_ONE,
+        "esrgan": OUTPUT_MODE_ZERO_TO_ONE,
+    }
 
     def __init__(
         self,
@@ -303,6 +320,12 @@ class FullFrameEnhancer:
         return tensor / 255.0
 
     def _postprocess_native(self, output: np.ndarray) -> np.ndarray:
+        frame, _ = self._postprocess_native_with_diagnostics(output, collect_diagnostics=False)
+        return frame
+
+    def _postprocess_native_with_diagnostics(
+        self, output: np.ndarray, *, collect_diagnostics: bool
+    ) -> tuple[np.ndarray, EnhancementDiagnostics]:
         array = np.asarray(output)
         if array.ndim != 4 or array.shape[0] != 1 or array.shape[1] != 3:
             raise ValueError(f"enhancer output must be NCHW with batch=1/channels=3, got {array.shape}")
@@ -313,18 +336,33 @@ class FullFrameEnhancer:
                 f"got {array.shape[1]}x{array.shape[0]}"
             )
         array = array.astype(np.float32, copy=False)
-        minimum = float(np.nanmin(array))
-        maximum = float(np.nanmax(array))
-        if not np.isfinite(minimum) or not np.isfinite(maximum):
+        if not np.isfinite(array).all():
             raise ValueError("enhancer output contains NaN/Inf")
-        if minimum < 0.0 and minimum >= -1.1 and maximum <= 1.1:
-            array = (array + 1.0) * 127.5
-        elif maximum <= 1.5:
-            array = array * 255.0
-        elif maximum > 255.0:
-            raise ValueError(f"unsupported enhancer output range [{minimum}, {maximum}]")
-        array = np.clip(array, 0.0, 255.0).astype(np.uint8)
-        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        minimum = maximum = None
+        clip_low_count = clip_high_count = 0
+        mode = (
+            self.OUTPUT_MODE_LANCZOS4 if self.backend == "none" else
+            self.OUTPUT_MODE_BY_BACKEND.get(self.backend, self.OUTPUT_MODE_ZERO_TO_ONE)
+        )
+        if collect_diagnostics:
+            minimum = float(np.min(array))
+            maximum = float(np.max(array))
+            clip_low_count = int(np.count_nonzero(array < 0.0))
+            clip_high_count = int(np.count_nonzero(array > 1.0))
+        # RealESRGAN/ESRNet export RGB tensors in [0, 1].  Convolution
+        # overshoot is valid and must be clipped; it must never select a
+        # different scale for the whole frame based on min/max.
+        array = np.clip(array, 0.0, 1.0)
+        array = (array * 255.0).astype(np.uint8)
+        frame = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        diagnostics = EnhancementDiagnostics(
+            raw_min=minimum,
+            raw_max=maximum,
+            postprocess_mode=mode,
+            clip_low_count=clip_low_count,
+            clip_high_count=clip_high_count,
+        )
+        return frame, diagnostics
 
     def enhance_native(self, frame: np.ndarray) -> np.ndarray:
         if self.backend == "none":
@@ -335,6 +373,29 @@ class FullFrameEnhancer:
         tensor = self._preprocess(frame)
         output = self.session.run([self.output_name], {self.input_name: tensor})[0]
         return self._postprocess_native(output)
+
+    def enhance_with_diagnostics(
+        self, frame: np.ndarray
+    ) -> tuple[np.ndarray, EnhancementDiagnostics]:
+        if self.backend == "none":
+            native = cv2.resize(frame, self.native_size, interpolation=cv2.INTER_LANCZOS4)
+            output = np.ascontiguousarray(native)
+            diagnostics = EnhancementDiagnostics(postprocess_mode=self.OUTPUT_MODE_LANCZOS4)
+        else:
+            if self.session is None or self.input_name is None or self.output_name is None:
+                raise RuntimeError("enhancer ONNX session is not initialized")
+            tensor = self._preprocess(frame)
+            raw_output = self.session.run([self.output_name], {self.input_name: tensor})[0]
+            output, diagnostics = self._postprocess_native_with_diagnostics(
+                raw_output, collect_diagnostics=True
+            )
+        if (output.shape[1], output.shape[0]) != self.output_size:
+            output = cv2.resize(output, self.output_size, interpolation=cv2.INTER_LANCZOS4)
+        luma = cv2.cvtColor(output, cv2.COLOR_BGR2GRAY)
+        diagnostics = dataclasses.replace(
+            diagnostics, output_luma_mean=float(np.mean(luma))
+        )
+        return np.ascontiguousarray(output), diagnostics
 
     def enhance(self, frame: np.ndarray) -> np.ndarray:
         native = self.enhance_native(frame)
@@ -381,7 +442,7 @@ class LatestOnlyEnhancerWorker:
     def __init__(
         self,
         enhancer: Any,
-        max_latency_ms: int = 100,
+        max_latency_ms: float = 100,
         debug_log: Optional[str | Path] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -404,18 +465,36 @@ class LatestOnlyEnhancerWorker:
         self.error: Optional[str] = None
         self.thread = threading.Thread(target=self._run, name="gan-enhancer", daemon=True)
         self.submitted = 0
+        # ``completed`` intentionally remains the count of outputs that were
+        # accepted for presentation.  ``inference_completed`` and the
+        # all-inference samples below include calls that returned too late;
+        # otherwise a stale-after-infer policy would hide the actual model
+        # latency from the HUD and analyzer.
+        self.inference_completed = 0
         self.completed = 0
         self.dropped = 0
         self.replaced_pending = 0
         self.stale_before_infer = 0
         self.stale_after_infer = 0
+        self.inference_errors = 0
         self.output_replaced = 0
         self.latencies: Deque[float] = collections.deque(maxlen=2000)
+        self.all_total_latencies: Deque[float] = collections.deque(maxlen=2000)
         self.queue_waits: Deque[float] = collections.deque(maxlen=2000)
         self.infer_latencies: Deque[float] = collections.deque(maxlen=2000)
         self.completion_times: Deque[float] = collections.deque()
         self.last_output: Optional[EnhancementOutput] = None
+        self.last_finished_infer_ms = 0.0
+        self.last_finished_total_ms = 0.0
+        self.last_finished_sequence: Optional[int] = None
+        self.last_finished_accepted = False
+        self.last_finished_drop_reason = ""
+        self.last_finished_at: Optional[float] = None
+        self.last_input_fps = 0.0
+        self.event_counter = 0
+        self.last_event: Optional[dict] = None
         self.debug_handle = None
+        self.debug_lock = threading.Lock()
         if debug_log is not None:
             path = Path(debug_log).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -424,24 +503,80 @@ class LatestOnlyEnhancerWorker:
 
     def _debug(self, item: EnhancementInput, *, queue_wait_ms: float = 0.0,
                infer_ms: float = 0.0, total_pc_ms: float = 0.0,
-               dropped: bool = False, drop_reason: str = "") -> None:
+               infer_start: Optional[float] = None,
+               infer_end: Optional[float] = None,
+               infer_returned: bool = False,
+               dropped: bool = False, drop_reason: str = "",
+               output_ready: Optional[bool] = None,
+               diagnostics: Optional[EnhancementDiagnostics] = None) -> None:
         if self.debug_handle is None:
             return
+        frame_period_ms = (
+            1000.0 / item.input_fps if item.input_fps > 0.0 else None
+        )
         record = {
+            "TYPE": "GAN_WORKER",
             "SEQ": item.source_sequence,
             "PTS": item.rtp_timestamp,
             "ARRIVAL": item.arrived_at,
             "INPUT_FPS": item.input_fps,
+            "FRAME_PERIOD_MS": frame_period_ms,
+            "EFFECTIVE_BUDGET_MS": self.max_latency_ms,
             "ENHANCER": self.backend,
             "PROVIDER": self.provider,
             "QUEUE_WAIT": queue_wait_ms,
             "INFER_MS": infer_ms,
             "TOTAL_PC_MS": total_pc_ms,
+            "OUTPUT_AGE_MS": total_pc_ms if infer_returned else None,
+            "INFER_START": infer_start,
+            "INFER_END": infer_end,
+            "INFER_RETURNED": bool(infer_returned),
             "DROPPED": bool(dropped),
             "DROP_REASON": drop_reason,
-            "OUTPUT_READY": not dropped,
+            "OUTPUT_READY": (not dropped if output_ready is None else bool(output_ready)),
+            "RAW_MIN": None if diagnostics is None else diagnostics.raw_min,
+            "RAW_MAX": None if diagnostics is None else diagnostics.raw_max,
+            "POSTPROCESS_MODE": (
+                "UNKNOWN" if diagnostics is None else diagnostics.postprocess_mode
+            ),
+            "CLIP_LOW_COUNT": 0 if diagnostics is None else diagnostics.clip_low_count,
+            "CLIP_HIGH_COUNT": 0 if diagnostics is None else diagnostics.clip_high_count,
+            "OUTPUT_LUMA_MEAN": (
+                None if diagnostics is None else diagnostics.output_luma_mean
+            ),
         }
-        self.debug_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._write_debug(record)
+
+    def _write_debug(self, record: dict) -> None:
+        if self.debug_handle is None:
+            return
+        with self.debug_lock:
+            if self.debug_handle is not None:
+                self.debug_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def debug_event(self, record: dict) -> None:
+        """Append a controller/state event to the worker JSONL stream."""
+        self._write_debug(dict(record))
+
+    def _mark_drop_locked(self, reason: str, sequence: Optional[int] = None) -> None:
+        self.dropped += 1
+        if reason == "replaced_pending":
+            self.replaced_pending += 1
+        elif reason == "stale_before_infer":
+            self.stale_before_infer += 1
+        elif reason == "stale_after_infer":
+            self.stale_after_infer += 1
+        elif reason == "inference_error":
+            self.inference_errors += 1
+        elif reason == "output_replaced":
+            self.output_replaced += 1
+        self.event_counter += 1
+        self.last_event = {
+            "kind": "drop",
+            "reason": reason,
+            "sequence": sequence,
+            "event_id": self.event_counter,
+        }
 
     def submit(
         self,
@@ -467,10 +602,12 @@ class LatestOnlyEnhancerWorker:
             if self.stopping:
                 return False
             self.submitted += 1
+            if item.input_fps > 0.0:
+                self.last_input_fps = item.input_fps
             if self.pending is not None:
-                self.replaced_pending += 1
-                self.dropped += 1
-                self._debug(self.pending, dropped=True, drop_reason="replaced_pending")
+                replaced = self.pending
+                self._mark_drop_locked("replaced_pending", replaced.source_sequence)
+                self._debug(replaced, dropped=True, drop_reason="replaced_pending")
             self.pending = item
             self.condition.notify()
             return True
@@ -482,15 +619,18 @@ class LatestOnlyEnhancerWorker:
             return output
 
     def _drop(self, item: EnhancementInput, reason: str, queue_wait_ms: float = 0.0,
-              infer_ms: float = 0.0, total_pc_ms: float = 0.0) -> None:
+              infer_ms: float = 0.0, total_pc_ms: float = 0.0,
+              infer_start: Optional[float] = None,
+              infer_end: Optional[float] = None,
+              infer_returned: bool = False,
+              diagnostics: Optional[EnhancementDiagnostics] = None) -> None:
         with self.lock:
-            self.dropped += 1
-            if reason == "stale_before_infer":
-                self.stale_before_infer += 1
-            elif reason == "stale_after_infer":
-                self.stale_after_infer += 1
+            self._mark_drop_locked(reason, item.source_sequence)
         self._debug(item, queue_wait_ms=queue_wait_ms, infer_ms=infer_ms,
-                    total_pc_ms=total_pc_ms, dropped=True, drop_reason=reason)
+                    total_pc_ms=total_pc_ms, infer_start=infer_start,
+                    infer_end=infer_end, infer_returned=infer_returned,
+                    dropped=True, drop_reason=reason, output_ready=False,
+                    diagnostics=diagnostics)
 
     def _run(self) -> None:
         while True:
@@ -517,14 +657,34 @@ class LatestOnlyEnhancerWorker:
                     self.condition.notify_all()
                 continue
             infer_started = time.perf_counter()
+            infer_start = time.monotonic()
+            diagnostics = None
             try:
-                enhanced = self.enhancer.enhance(item.frame)
+                diagnostic_enhance = getattr(self.enhancer, "enhance_with_diagnostics", None)
+                if self.debug_handle is not None and callable(diagnostic_enhance):
+                    enhanced, diagnostics = diagnostic_enhance(item.frame)
+                else:
+                    enhanced = self.enhancer.enhance(item.frame)
                 infer_ms = (time.perf_counter() - infer_started) * 1000.0
-                completed_at = time.monotonic()
+                infer_end = time.monotonic()
+                completed_at = infer_end
                 total_pc_ms = (completed_at - item.arrived_at) * 1000.0
+                with self.condition:
+                    self.inference_completed += 1
+                    self.infer_latencies.append(infer_ms)
+                    self.all_total_latencies.append(total_pc_ms)
+                    self.last_finished_infer_ms = infer_ms
+                    self.last_finished_total_ms = total_pc_ms
+                    self.last_finished_sequence = item.source_sequence
+                    self.last_finished_accepted = False
+                    self.last_finished_drop_reason = ""
+                    self.last_finished_at = completed_at
                 if total_pc_ms > self.max_latency_ms:
                     self._drop(item, "stale_after_infer", queue_wait_ms,
-                               infer_ms, total_pc_ms)
+                               infer_ms, total_pc_ms, infer_start, infer_end, True,
+                               diagnostics)
+                    with self.condition:
+                        self.last_finished_drop_reason = "stale_after_infer"
                 else:
                     output = EnhancementOutput(
                         frame=np.ascontiguousarray(enhanced),
@@ -537,26 +697,43 @@ class LatestOnlyEnhancerWorker:
                         total_pc_ms=total_pc_ms,
                         enhancer=self.backend,
                         provider=self.provider,
+                        diagnostics=diagnostics,
                     )
                     with self.condition:
                         if self.output is not None:
-                            self.output_replaced += 1
-                            self.dropped += 1
+                            old_output = self.output
+                            self._mark_drop_locked(
+                                "output_replaced", old_output.source_sequence)
+                            self._write_debug({
+                                "TYPE": "GAN_WORKER_DROP",
+                                "DROP_REASON": "output_replaced",
+                                "SEQ": old_output.source_sequence,
+                                "REPLACED_BY_SEQ": output.source_sequence,
+                                "AT": completed_at,
+                                "EFFECTIVE_BUDGET_MS": self.max_latency_ms,
+                            })
                         self.output = output
                         self.last_output = output
                         self.completed += 1
                         self.latencies.append(total_pc_ms)
                         self.queue_waits.append(queue_wait_ms)
-                        self.infer_latencies.append(infer_ms)
                         self.completion_times.append(completed_at)
+                        self.last_finished_accepted = True
+                        self.last_finished_drop_reason = ""
                     self._debug(item, queue_wait_ms=queue_wait_ms, infer_ms=infer_ms,
-                                total_pc_ms=total_pc_ms)
+                                total_pc_ms=total_pc_ms, infer_start=infer_start,
+                                infer_end=infer_end, infer_returned=True,
+                                output_ready=True, diagnostics=diagnostics)
             except Exception as error:  # keep the RTP/decoder process alive for diagnostics
                 message = f"{type(error).__name__}: {error}"
                 with self.lock:
                     self.error = message
                 self.logger(f"GAN enhancer worker error: {message}")
-                self._drop(item, "inference_error", queue_wait_ms)
+                infer_end = time.monotonic()
+                infer_ms = max(0.0, (time.perf_counter() - infer_started) * 1000.0)
+                total_pc_ms = max(0.0, (infer_end - item.arrived_at) * 1000.0)
+                self._drop(item, "inference_error", queue_wait_ms, infer_ms,
+                           total_pc_ms, infer_start, infer_end, False)
             finally:
                 with self.condition:
                     self.running = False
@@ -577,10 +754,18 @@ class LatestOnlyEnhancerWorker:
                              for timestamp in self.completion_times)
             running_age_ms = (0.0 if self.running_started_at is None else
                               max(0.0, (now - self.running_started_at) * 1000.0))
+            drop_reason_counts = {
+                "replaced_pending": self.replaced_pending,
+                "stale_before_infer": self.stale_before_infer,
+                "stale_after_infer": self.stale_after_infer,
+                "inference_error": self.inference_errors,
+                "output_replaced": self.output_replaced,
+            }
             return {
                 "backend": self.backend,
                 "provider": self.provider,
                 "submitted": self.submitted,
+                "inference_completed": self.inference_completed,
                 "completed": self.completed,
                 "dropped": self.dropped,
                 "drop_percent": (self.dropped * 100.0 / self.submitted
@@ -588,13 +773,45 @@ class LatestOnlyEnhancerWorker:
                 "replaced_pending": self.replaced_pending,
                 "stale_before_infer": self.stale_before_infer,
                 "stale_after_infer": self.stale_after_infer,
+                "inference_errors": self.inference_errors,
                 "output_replaced": self.output_replaced,
+                "drop_reason_counts": drop_reason_counts,
                 "p50_ms": _percentile(self.latencies, 50),
                 "p95_ms": _percentile(self.latencies, 95),
                 "p99_ms": _percentile(self.latencies, 99),
-                "last_infer_ms": (self.last_output.infer_ms if self.last_output else 0.0),
-                "last_total_pc_ms": (self.last_output.total_pc_ms if self.last_output else 0.0),
-                "last_queue_wait_ms": (self.last_output.queue_wait_ms if self.last_output else 0.0),
+                "good_total_p50_ms": _percentile(self.latencies, 50),
+                "good_total_p95_ms": _percentile(self.latencies, 95),
+                "good_total_p99_ms": _percentile(self.latencies, 99),
+                "good_total_max_ms": max(self.latencies, default=0.0),
+                "infer_all_p50_ms": _percentile(self.infer_latencies, 50),
+                "infer_all_p95_ms": _percentile(self.infer_latencies, 95),
+                "infer_all_p99_ms": _percentile(self.infer_latencies, 99),
+                "infer_all_max_ms": max(self.infer_latencies, default=0.0),
+                "all_total_p50_ms": _percentile(self.all_total_latencies, 50),
+                "all_total_p95_ms": _percentile(self.all_total_latencies, 95),
+                "all_total_p99_ms": _percentile(self.all_total_latencies, 99),
+                "all_total_max_ms": max(self.all_total_latencies, default=0.0),
+                # Legacy aliases are retained for scripts that consumed the
+                # previous HUD, but new code uses the explicit fields above.
+                "last_infer_ms": self.last_finished_infer_ms,
+                "last_total_pc_ms": self.last_finished_total_ms,
+                "last_queue_wait_ms": (
+                    self.last_output.queue_wait_ms if self.last_output else 0.0
+                ),
+                "last_finished_infer_ms": self.last_finished_infer_ms,
+                "last_finished_total_ms": self.last_finished_total_ms,
+                "last_finished_sequence": self.last_finished_sequence,
+                "last_finished_accepted": self.last_finished_accepted,
+                "last_finished_drop_reason": self.last_finished_drop_reason,
+                "last_good_infer_ms": (
+                    self.last_output.infer_ms if self.last_output else 0.0
+                ),
+                "last_good_total_ms": (
+                    self.last_output.total_pc_ms if self.last_output else 0.0
+                ),
+                "last_good_sequence": (
+                    self.last_output.source_sequence if self.last_output else None
+                ),
                 "rolling_1s_fps": float(rolling_1s),
                 "rolling_5s_fps": rolling_5s / 5.0,
                 "rolling_10s_fps": len(self.completion_times) / 10.0,
@@ -604,6 +821,11 @@ class LatestOnlyEnhancerWorker:
                 "pending": self.pending is not None,
                 "output_ready": self.output is not None,
                 "max_latency_ms": self.max_latency_ms,
+                "frame_period_ms": (
+                    1000.0 / self.last_input_fps if self.last_input_fps > 0.0 else None
+                ),
+                "worker_event_id": self.event_counter,
+                "last_event": None if self.last_event is None else dict(self.last_event),
                 "error": self.error,
                 "closed": self.closed,
             }
@@ -619,8 +841,9 @@ class LatestOnlyEnhancerWorker:
                 thread = self.thread
         if thread.is_alive():
             thread.join(timeout=max(2.0, self.max_latency_ms / 1000.0 + 2.0))
-        if self.debug_handle is not None:
-            self.debug_handle.close()
-            self.debug_handle = None
+        with self.debug_lock:
+            if self.debug_handle is not None:
+                self.debug_handle.close()
+                self.debug_handle = None
 
     close = stop

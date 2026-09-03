@@ -1,0 +1,561 @@
+/goal
+
+# VideoCompressV2 GAN 接收端白色闪烁确定性修复
+
+
+======================================================================
+0. 目标
+======================================================================
+
+基于当前本地最新代码，修复 Windows GAN 接收端在
+
+    RealESRGAN_x2_dynamic.onnx
+    CUDAExecutionProvider
+
+下偶发整帧发白、随后恢复正常的问题。
+
+本任务不是继续猜测网络、解码或摄像头曝光，而是修复已经复现的
+RealESRGAN 输出范围误判，并完成单元测试、真实模型测试、真实视频验证、
+JSONL 遥测和文档更新。
+
+必须实际完成：
+
+    检查当前代码
+    -> 修改
+    -> 自动化测试
+    -> 同一 ONNX/CUDA 模型验证
+    -> 板 101 实时视频验证
+    -> 最终报告
+
+不得只给方案或只说“应当修复”。
+
+
+======================================================================
+1. 已确认的根因和证据
+======================================================================
+
+当前问题位于：
+
+    tools/full_frame_enhancer.py
+    FullFrameEnhancer._postprocess_native()
+
+当前逻辑根据每一帧的全局 min/max 动态猜测模型输出范围：
+
+    if minimum < 0 and maximum <= 1.1:
+        (array + 1) * 127.5
+    elif maximum <= 1.5:
+        array * 255
+
+RealESRGAN 的输出语义是以 [0,1] 为基准，但卷积输出可能轻微越界，
+例如出现少量负值或大于 1 的像素。
+
+因此相邻帧可能发生：
+
+    frame A: min=-0.035, max=1.056
+             被误判为 [-1,1]
+
+    frame B: min=-0.036, max=1.101
+             被判为 [0,1]
+
+错误分支相当于：
+
+    bad = 0.5 * correct + 127.5
+
+它会把黑色抬到约 128，并把对比度压缩一半，形成整帧发白。
+
+已对用户提供的白闪/正常截图做过静态区域拟合：
+
+    white = 0.476 * normal + 129.1
+
+与错误公式高度吻合。
+
+使用仓库中的同一模型实测：
+
+    model/RealESRGAN_x2_dynamic.onnx
+
+正常截图亮度 x0.90 时：
+
+    RAW_MIN=-0.0351
+    RAW_MAX=1.0566
+    当前错误输出均值=174.2
+    按 [0,1] 正确输出均值=93.4
+
+这已经是修改依据。不要重新把主要原因归为：
+
+    RTP 丢包
+    H.265 解码错误
+    fallback
+    output slot replacement
+    摄像头自动曝光
+
+上述路径可以检查，但不得绕开已复现的数值转换缺陷。
+
+
+======================================================================
+2. 工作区安全
+======================================================================
+
+开始先执行：
+
+    git status --short
+    git diff -- tools/full_frame_enhancer.py tools/live_h265_hud.py
+    git log -5 --oneline
+
+当前工作区已有用户未提交修改，必须保留并在其基础上增量修改。
+
+禁止：
+
+    git pull
+    git fetch
+    git push
+    git reset --hard
+    git clean -fd
+    git checkout -- .
+    git restore .
+
+不得大范围格式化无关文件。
+
+
+======================================================================
+3. 必须修复：ESRGAN 输出范围改为固定契约
+======================================================================
+
+对 backend=esrgan：
+
+    固定按 [0,1] 输出处理
+    允许模型轻微 overshoot
+    先 clip 到 [0,1]
+    再乘 255
+    转 uint8
+    RGB -> BGR
+
+等价核心逻辑：
+
+    array = np.clip(array, 0.0, 1.0)
+    array = (array * 255.0).astype(np.uint8)
+
+严禁继续根据单帧的：
+
+    minimum < 0
+    maximum <= 1.1
+
+动态切换 [0,1] / [-1,1]。
+
+要求范围模式由模型/backend 契约决定，而不是由画面内容决定。
+
+推荐内部使用明确名称，例如：
+
+    ZERO_TO_ONE
+    MINUS_ONE_TO_ONE
+    ZERO_TO_255
+
+但不要为本项目已知的 ESRGAN 暴露一个容易误配的 CLI 参数。
+
+
+======================================================================
+4. 不得破坏其他 backend
+======================================================================
+
+必须检查：
+
+    none
+    esrnet
+    esrgan
+
+要求：
+
+1. none 的 Lanczos4 路径保持不变。
+
+2. esrgan 明确固定为 ZERO_TO_ONE。
+
+3. esrnet 若有不同输出契约，必须通过 backend/model 配置明确指定；
+   不得继续使用逐帧 min/max 猜测。
+
+4. 如果仓库没有可验证的 ESRNet 模型，不得凭空改变其数值语义；
+   在代码和最终报告中明确说明保留策略。
+
+5. NaN/Inf 仍必须抛出错误并计入 inference_error，不能静默生成图像。
+
+
+======================================================================
+5. 增加与单次推理绑定的像素范围遥测
+======================================================================
+
+当前 runs/gan/esrgan8.jsonl 只记录时延，无法直接证明哪一帧发生了
+错误范围映射。
+
+在开启 --gan-debug-log 时，每条成功返回的 GAN_WORKER 记录至少增加：
+
+    RAW_MIN
+    RAW_MAX
+    POSTPROCESS_MODE
+    CLIP_LOW_COUNT
+    CLIP_HIGH_COUNT
+
+推荐同时增加：
+
+    OUTPUT_LUMA_MEAN
+
+要求：
+
+1. POSTPROCESS_MODE 对当前模型始终是固定的 ZERO_TO_ONE。
+
+2. RAW_MIN/RAW_MAX 只用于诊断和统计，不得再决定该帧的缩放公式。
+
+3. 遥测必须与同一次 inference/SEQ 绑定，不能读取一个可能已经被
+   下一次推理覆盖的全局 mutable last_stats。
+
+4. 未开启 debug log 时不要引入明显的额外拷贝或逐像素多次扫描。
+
+5. worker/fallback/latest-only 时序行为保持不变。
+
+
+======================================================================
+6. analyzer 必须支持新字段
+======================================================================
+
+更新：
+
+    tools/analyze_gan_run.py
+    tools/test_analyze_gan_run.py
+
+输出至少增加：
+
+    postprocess_mode_counts
+    raw_output_range.min
+    raw_output_range.max
+    clipped_low_total
+    clipped_high_total
+
+若记录了 OUTPUT_LUMA_MEAN，再输出：
+
+    output_luma.p50
+    output_luma.p95
+    output_luma.max
+
+兼容旧 JSONL：
+
+    缺少新字段时不得崩溃
+    对应统计返回 null、0 或明确的 unavailable
+
+不要把 runs/gan/esrgan8.jsonl 三段追加运行直接当成一个单次实验结论；
+新的验证日志必须使用全新文件名，禁止追加到旧文件。
+
+
+======================================================================
+7. 单元测试：必须覆盖本次闪白公式
+======================================================================
+
+更新：
+
+    tools/test_full_frame_enhancer.py
+
+至少增加以下测试：
+
+A. ESRGAN [0,1] 基本转换
+
+    0.0 -> 0
+    0.25 -> 63/64
+    1.0 -> 255
+    RGB -> BGR 正确
+
+B. 轻微负 overshoot
+
+构造绝大多数值约 0.2，并放入：
+
+    min=-0.01
+    max=1.05
+
+要求：
+
+    负值被 clip 到 0
+    0.2 仍约为 51
+    黑色不能变成约 127
+    整帧不能执行 (x+1)*127.5
+
+C. 1.1 边界连续性
+
+构造两帧仅有 RAW_MAX 差异：
+
+    1.0999
+    1.1001
+
+要求两帧使用相同 POSTPROCESS_MODE，普通像素输出完全相同，
+不得出现约 +127.5 的亮度跳变。
+
+D. 正 overshoot
+
+    1.05 / 1.2 -> clip 到 255
+
+不得因为 max 超过 1.1 改变其他像素的缩放公式。
+
+E. NaN/Inf
+
+继续抛出 ValueError。
+
+F. 黑帧
+
+对真实模型可能产生少量负 overshoot 的黑色输入，后处理输出均值应接近 0，
+绝不能接近 127。
+
+如果现有测试通过 FullFrameEnhancer("none") 调用模型后处理，必须重构测试，
+让测试明确指定模型输出契约；不能继续让 none backend 假扮 ESRGAN。
+
+
+======================================================================
+8. 真实 ONNX/CUDA 回归
+======================================================================
+
+使用：
+
+    D:\Env\Python\Python314\python.exe
+    model\RealESRGAN_x2_dynamic.onnx
+    CUDAExecutionProvider
+
+输入至少包含：
+
+    black
+    gray64
+    gray128
+    gradient
+    model\bus.jpg
+    同一图像亮度 x0.80 ~ x1.20，步长不大于 0.05
+
+每帧记录：
+
+    RAW_MIN
+    RAW_MAX
+    POSTPROCESS_MODE
+    OUTPUT_MEAN/LUMA
+
+验收：
+
+1. 实际 provider 必须是 CUDAExecutionProvider；否则记为 NOT RUN，不能冒充通过。
+
+2. 所有 ESRGAN 帧的 POSTPROCESS_MODE 都必须是 ZERO_TO_ONE。
+
+3. black 输出均值应接近 0，不能约为 127。
+
+4. gradient 输出均值应约为正常中灰，不能从约 129 跳到约 192。
+
+5. 亮度扫描相邻输入不得发生约 60~128 灰度级的整帧跳变。
+
+6. RAW_MIN 为负或 RAW_MAX 大于 1 时允许正常 clip，不得切换缩放公式。
+
+实际输出保存到新的 runs/gan 结果文件，便于复核。
+
+
+======================================================================
+9. 真实视频验证
+======================================================================
+
+使用开发板 101 的 GAN 8 fps 视频流和 PC RTX3060/CUDA 接收端。
+
+PC 接收命令以当前启动.md中的真实参数为准，日志必须使用新文件：
+
+    Set-Location D:\workspace\videoCompressV2
+    & D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
+      --gan-enhancer=esrgan `
+      --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
+      --gan-require-cuda `
+      --gan-output-latency-budget-ms=0 `
+      --gan-output-latency-factor=1.15 `
+      --gan-hard-stall-ms=500 `
+      --gan-recovery-good-frames=3 `
+      --gan-recovery-max-sequence-lag=1 `
+      --gan-debug-log=.\runs\gan\esrgan8_range_fixed.jsonl
+
+先进行有窗口观察，场景至少包含：
+
+    静止画面
+    人移动
+    明暗区域变化
+    白墙/黑桌等高反差区域
+
+持续至少 10 分钟。
+
+再根据需要使用：
+
+    --headless --duration=600
+
+获得完整统计。
+
+验收：
+
+    RX/DEC/ENH/DISP 正常
+    provider=CUDAExecutionProvider
+    LOSS=0 或给出实际网络丢包证据
+    inference_error=0
+    POSTPROCESS_MODE 只有 ZERO_TO_ONE
+    不再出现整帧 white = 0.5*normal+127.5 的闪烁
+
+如果仍看到白闪，必须保存同一时刻的：
+
+    截图
+    SEQ
+    RAW_MIN/RAW_MAX
+    POSTPROCESS_MODE
+    OUTPUT_LUMA_MEAN
+    LOSS/ERR/STATE
+
+再区分摄像头真实曝光变化与其他问题，不能重新使用无像素证据的猜测。
+
+
+======================================================================
+10. 不得改坏现有实时性修复
+======================================================================
+
+以下现有行为必须保持：
+
+    FPS-aware latency budget
+    one-running + one-latest-pending
+    stale-before/stale-after 统计
+    SOFT_FALLBACK 与 HARD_STALL 分离
+    3-frame fresh recovery hysteresis
+    recovery sequence freshness gate
+    Lanczos4 实时 fallback
+    AGE DEC/GAN/RUN/OUT HUD
+
+本任务只解决像素范围和对应诊断能力。
+
+不得通过以下方式掩盖问题：
+
+    降低 GAN fps
+    关闭 ESRGAN
+    改用 none
+    提高 fallback 阈值
+    增大队列
+    对输出做逐帧自动归一化
+    按每帧 min/max 拉伸对比度
+    简单增加或降低整体亮度
+
+
+======================================================================
+11. 文档更新
+======================================================================
+
+更新：
+
+    启动.md
+    README.md
+
+至少说明：
+
+1. 当前 RealESRGAN 输出固定按 [0,1] 处理并 clip。
+
+2. RAW_MIN/RAW_MAX 的轻微越界是模型 overshoot，不代表 [-1,1]。
+
+3. debug JSONL 新字段含义。
+
+4. 白闪诊断时如何运行 analyzer。
+
+5. 使用新的日志文件名，避免多次运行追加后误读。
+
+
+======================================================================
+12. 必须执行的自动化检查
+======================================================================
+
+至少执行：
+
+    & D:\Env\Python\Python314\python.exe -m py_compile `
+      .\tools\full_frame_enhancer.py `
+      .\tools\live_h265_hud.py `
+      .\tools\analyze_gan_run.py
+
+    & D:\Env\Python\Python314\python.exe -m unittest `
+      tools.test_full_frame_enhancer `
+      tools.test_live_h265_hud `
+      tools.test_analyze_gan_run
+
+并运行仓库中其他现有 GAN 相关测试。
+
+最后执行：
+
+    git diff --check
+    git status --short
+
+必须报告实际测试数量和 PASS/FAIL，不能写“应该通过”。
+
+
+======================================================================
+13. 最终报告必须包含
+======================================================================
+
+# Result
+
+## Root cause
+
+说明为什么少量负 overshoot 会触发错误的 [-1,1] 分支，以及错误公式如何
+把黑色抬到 127。
+
+## Code changes
+
+逐文件列出修改内容。
+
+## Deterministic tests
+
+列出：
+
+    negative overshoot
+    1.1 boundary
+    black
+    gradient
+    NaN/Inf
+
+的实际结果。
+
+## Real CUDA model
+
+报告：
+
+    provider
+    test inputs
+    RAW_MIN/RAW_MAX
+    mode counts
+    output mean/luma continuity
+
+## Live video
+
+报告至少 10 分钟运行的：
+
+    RX/DEC/ENH/DISP
+    LOSS/ERR
+    inference errors
+    postprocess mode counts
+    是否再现白闪
+
+## Tests
+
+实际命令、测试数量、PASS/FAIL。
+
+## Git safety
+
+确认未 pull/fetch/push，未覆盖用户已有未提交修改。
+
+
+======================================================================
+14. 最终成功标准
+======================================================================
+
+必须同时满足：
+
+1. ESRGAN 缩放公式不再由单帧 min/max 决定。
+
+2. RAW_MIN<0 或 RAW_MAX 在 1.1 附近变化时，普通像素输出保持连续。
+
+3. 黑色输入不再被映射为约 127 灰色。
+
+4. 原有网络、解码、latest-only、fallback 和 HUD 功能不回归。
+
+5. 单元测试、py_compile、git diff --check 全部通过。
+
+6. 同一 RealESRGAN ONNX 在 CUDAExecutionProvider 上通过真实范围扫描。
+
+7. 板 101 的 8 fps 实时视频连续运行至少 10 分钟，不再出现已知公式特征的
+   整帧白色闪烁。
+
+最终目标：
+
+    模型轻微数值越界只能被稳定 clip，
+    不能再让相邻帧切换色阶映射并产生白色闪烁。

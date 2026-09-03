@@ -2,8 +2,10 @@
 
 import importlib.util
 import io
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 MODULE_PATH = Path(__file__).with_name("live_h265_hud.py")
@@ -33,6 +35,48 @@ def rtp_profile_packet(sequence: int, profile: int, width: int, height: int,
     extension.extend(height.to_bytes(2, "big"))
     extension.extend((fps, generation))
     return bytes(packet[:12] + extension + packet[12:])
+
+
+class FixedDelayEnhancer:
+    backend = "fake"
+    provider = "CUDAExecutionProvider"
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+
+    def enhance(self, frame):
+        time.sleep(self.delay)
+        return HUD.np.zeros((360, 640, 3), dtype=HUD.np.uint8)
+
+
+def wait_for(predicate, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def gan_candidate(sequence: int, completed_at: float, total_pc_ms: float = 90.0):
+    return SimpleNamespace(
+        source_sequence=sequence,
+        completed_at=completed_at,
+        total_pc_ms=total_pc_ms,
+    )
+
+
+def idle_worker_snapshot(**overrides):
+    values = {
+        "running": False,
+        "running_age_ms": 0.0,
+        "running_sequence": None,
+        "last_finished_sequence": None,
+        "last_finished_infer_ms": 0.0,
+        "drop_reason_counts": {},
+    }
+    values.update(overrides)
+    return values
 
 
 class HudTests(unittest.TestCase):
@@ -178,6 +222,129 @@ class HudTests(unittest.TestCase):
         self.assertTrue(HUD.should_use_gan_fallback(
             frame, 2, 1, 10.01, True, 10.02, 10.0, 100.0))
         self.assertEqual(HUD.gan_lanczos_fallback(frame, "none").shape, (360, 640, 3))
+
+    def test_gan_auto_budget_is_fps_aware(self):
+        self.assertAlmostEqual(HUD.gan_effective_output_budget_ms(8), 143.75)
+        self.assertAlmostEqual(HUD.gan_effective_output_budget_ms(10), 115.0)
+        self.assertAlmostEqual(
+            HUD.gan_effective_output_budget_ms(12), 1.15 * 1000.0 / 12.0
+        )
+        self.assertEqual(
+            HUD.gan_effective_output_budget_ms(8, legacy_budget_ms=100), 100.0
+        )
+
+    def test_eight_fps_ninety_ms_stays_healthy_for_twenty_frames(self):
+        budget = HUD.gan_effective_output_budget_ms(8.0)
+        worker = HUD.LatestOnlyEnhancerWorker(
+            FixedDelayEnhancer(0.09), max_latency_ms=budget
+        )
+        controller = HUD.GanFallbackController(budget)
+        frame = HUD.np.zeros((144, 256, 3), dtype=HUD.np.uint8)
+        try:
+            for sequence in range(1, 21):
+                arrival = time.monotonic()
+                self.assertTrue(worker.submit(
+                    frame, sequence, arrived_at=arrival, input_fps=8.0
+                ))
+                deadline = arrival + 0.125
+                while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    candidate = worker.poll_output()
+                    decision = controller.update(
+                        now, 8.0, sequence, worker.snapshot(), candidate
+                    )
+                    self.assertEqual(decision.state, HUD.GanFallbackController.HEALTHY)
+                    time.sleep(0.003)
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] >= 19))
+            self.assertEqual(controller.soft_fallback_entries, 0)
+            self.assertEqual(controller.hard_stall_count, 0)
+            self.assertEqual(controller.state, HUD.GanFallbackController.HEALTHY)
+        finally:
+            worker.stop()
+
+    def test_soft_overdue_reports_good_age_not_run_age(self):
+        controller = HUD.GanFallbackController(143.75)
+        controller.update(
+            0.0, 8.0, 1, idle_worker_snapshot(), gan_candidate(1, 0.0)
+        )
+        decision = controller.update(
+            0.251, 8.0, 2,
+            idle_worker_snapshot(running=True, running_age_ms=80.0, running_sequence=2),
+        )
+        self.assertEqual(decision.state, HUD.GanFallbackController.SOFT_FALLBACK)
+        self.assertEqual(decision.action, HUD.GanAction.USE_LANCZOS)
+        event = next(item for item in decision.events if item["TYPE"] == "GAN_STATE")
+        self.assertGreaterEqual(event["GOOD_AGE_MS"], 250.0)
+        self.assertEqual(event["RUN_AGE_MS"], 80.0)
+        self.assertEqual(controller.hard_stall_count, 0)
+
+    def test_hard_stall_is_reported_once_and_return_is_not_immediate_recovery(self):
+        controller = HUD.GanFallbackController(143.75, hard_stall_ms=500)
+        controller.update(
+            0.0, 8.0, 1, idle_worker_snapshot(), gan_candidate(1, 0.0)
+        )
+        first = controller.update(
+            0.5, 8.0, 2,
+            idle_worker_snapshot(running=True, running_age_ms=520.0, running_sequence=2),
+        )
+        self.assertEqual(first.state, HUD.GanFallbackController.HARD_STALLED)
+        self.assertEqual(controller.hard_stall_count, 1)
+        second = controller.update(
+            0.7, 8.0, 2,
+            idle_worker_snapshot(running=True, running_age_ms=700.0, running_sequence=2),
+        )
+        self.assertEqual(controller.hard_stall_count, 1)
+        returned = controller.update(
+            0.8, 8.0, 2,
+            idle_worker_snapshot(
+                last_finished_sequence=2, last_finished_infer_ms=700.0
+            ),
+            gan_candidate(2, 0.7, total_pc_ms=700.0),
+        )
+        self.assertEqual(returned.action, HUD.GanAction.DISCARD_STALE_GAN)
+        self.assertEqual(returned.state, HUD.GanFallbackController.HARD_STALLED)
+        self.assertTrue(any(item["TYPE"] == "GAN_HARD_STALL_RETURNED"
+                            for item in returned.events))
+
+    def test_recovery_requires_three_fresh_outputs_and_rejects_stale_sequence(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(
+            0.0, 8.0, 1, idle_worker_snapshot(), gan_candidate(1, 0.0)
+        )
+        controller.update(0.251, 8.0, 2, idle_worker_snapshot())
+        controller.note_lanczos_display(2)
+        stale = controller.update(
+            0.3, 8.0, 100, idle_worker_snapshot(),
+            gan_candidate(95, 0.29),
+        )
+        self.assertEqual(stale.action, HUD.GanAction.DISCARD_STALE_GAN)
+        self.assertEqual(controller.recovery_streak, 0)
+        one = controller.update(
+            0.4, 8.0, 3, idle_worker_snapshot(), gan_candidate(3, 0.39)
+        )
+        two = controller.update(
+            0.5, 8.0, 4, idle_worker_snapshot(), gan_candidate(4, 0.49)
+        )
+        three = controller.update(
+            0.6, 8.0, 5, idle_worker_snapshot(), gan_candidate(5, 0.59)
+        )
+        self.assertEqual(one.action, HUD.GanAction.KEEP_GAN)
+        self.assertEqual(two.action, HUD.GanAction.KEEP_GAN)
+        self.assertEqual(three.action, HUD.GanAction.ACCEPT_GAN)
+        self.assertEqual(three.state, HUD.GanFallbackController.HEALTHY)
+        self.assertEqual(controller.recoveries, 1)
+
+    def test_same_source_frame_shown_by_lanczos_cannot_be_replaced_by_gan(self):
+        controller = HUD.GanFallbackController(143.75)
+        controller.note_lanczos_display(100)
+        old = controller.update(
+            1.0, 8.0, 100, idle_worker_snapshot(), gan_candidate(100, 0.9)
+        )
+        self.assertEqual(old.action, HUD.GanAction.DISCARD_STALE_GAN)
+        new = controller.update(
+            1.1, 8.0, 101, idle_worker_snapshot(), gan_candidate(101, 1.0)
+        )
+        self.assertEqual(new.action, HUD.GanAction.ACCEPT_GAN)
 
     def test_window_dimensions_follow_rotation(self):
         self.assertEqual(HUD.display_dimensions(320, 180, "ccw90", 3), (540, 960))
