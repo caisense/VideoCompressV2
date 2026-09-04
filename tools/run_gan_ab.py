@@ -4,6 +4,8 @@
 The matrix is intentionally declarative.  It does not pretend to have run a
 60-second board capture; use ``--run`` only after the board/capture setup is
 known to be ready, or consume the generated commands from an operator shell.
+Video reception is SDP-free because the HUD consumes the fixed RFC 7798
+payload type directly and only needs the configured UDP port.
 """
 
 from __future__ import annotations
@@ -40,13 +42,12 @@ def main() -> int:
             name = f"fps{fps}_{enhancer}"
             directory = output_root / name
             directory.mkdir(parents=True, exist_ok=True)
-            sdp_remote = f"/tmp/gan_{fps}_{enhancer}.sdp"
             remote_sender = (
                 f"cd {args.board_dir} && env LD_LIBRARY_PATH=\"$PWD/lib\" "
                 f"./rknn_yolov8_seg_cam --mode=gan --gan-fps={fps} "
                 f"--gan-video-bitrate-kbps={args.bitrate_kbps} --audio=off --preview=off "
                 f"--udp-host={args.pc_host} --udp-port={args.video_port} "
-                f"--rtp-sdp-path={sdp_remote} --profile-control="
+                f"--profile-control="
             )
             sender = f"ssh {shlex.quote(args.board_host)} {shlex.quote(remote_sender)}"
             receiver_model = ""
@@ -55,7 +56,7 @@ def main() -> int:
             elif enhancer == "esrgan":
                 receiver_model = f" --gan-esrgan-model={shlex.quote(args.esrgan_model)}"
             receiver = (
-                f"python tools/live_h265_hud.py pc_sdp/{name}.sdp --headless "
+                f"python tools/live_h265_hud.py --udp-port={args.video_port} --headless "
                 f"--duration={args.duration} --gan-enhancer={enhancer} "
                 f"{'--gan-require-cuda' if enhancer != 'none' else ''}{receiver_model} "
                 f"--gan-debug-log={shlex.quote(str(directory / 'enhancer.jsonl'))}"
@@ -67,7 +68,6 @@ def main() -> int:
                 "duration_s": args.duration,
                 "video_bitrate_kbps": args.bitrate_kbps,
                 "sender_command": sender,
-                "sdp_copy_command": f"scp {shlex.quote(args.board_host)}:{sdp_remote} pc_sdp/{name}.sdp",
                 "receiver_command": receiver,
                 "output_directory": str(directory),
                 "scenes": ["empty", "person1", "person2", "person3_or_more"],

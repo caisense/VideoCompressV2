@@ -40,7 +40,7 @@ Examples:
 ./rknn_yolov8_seg_cam --mode=gan --gan-fps=8 --gan-inference-fps=4 \
   --gan-video-bitrate-kbps=75 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --rtp-sdp-path=/tmp/gan.sdp --audio=off --preview=off --profile-control=""
+  --audio=off --preview=off --profile-control=""
 ```
 
 ## `gan`：H.265-only full-frame enhancement
@@ -93,40 +93,39 @@ env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
   --mode=gan --gan-fps=8 --gan-inference-fps=4 --gan-video-bitrate-kbps=75 \
   --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5004 --audio=off --preview=off \
-  --rtp-sdp-path=/tmp/gan.sdp --profile-control=""
+  --profile-control=""
 ```
 
 `--profile-control=""` is an explicit empty value that disables the runtime
 profile FIFO; it does not wait for console input. The live sender runs in the
 foreground, so the shell prompt does not return until `Ctrl+C` is pressed. For
 a short board-side startup check, append `--max-frames=2` and then run
-`echo "RC=$?"`; success includes `Wrote H.265 RTP SDP:` and `RC=0`.
+`echo "RC=$?"`; success includes transmitted IDR/P frames and `RC=0`. Add
+`--rtp-sdp-path=/tmp/gan.sdp` only when a stock SDP-based receiver is required.
 
-After the board logs `Wrote H.265 RTP SDP: /tmp/gan.sdp`, copy that real SDP
-file to the PC and start the receiver window. Do not add `--headless` when a
-video window is required:
+The project HUD does not need an SDP file: it receives RTP itself and only
+needs the UDP port. Start the receiver window directly; do not add `--headless`
+when a video window is required:
 
 ```powershell
 Set-Location D:\workspace\videoCompressV2
 New-Item -ItemType Directory -Force .\runs\gan | Out-Null
-scp root@192.168.0.101:/tmp/gan.sdp .\runs\gan\gan.sdp
-& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
   --gan-enhancer=none --rotate=none `
   --gan-debug-log=.\runs\gan\none.jsonl
 ```
 
-Do not type `<SDP>` literally: it is only a placeholder and PowerShell parses
-`<` as redirection. If a previously copied SDP is available, start the PC
-receiver first with `.\runs\gan\board-smoke.sdp`, then start the board sender.
-Use `--headless` only for a no-window metrics run. When the receiver starts
-after the sender, it waits for the next complete IDR before displaying video.
+Port `5004` is the default, so `--udp-port=5004` may also be omitted. Existing
+commands that pass `.\runs\gan\gan.sdp` remain compatible. Use `--headless`
+only for a no-window metrics run. When the receiver starts after the sender,
+it waits for the next complete IDR before displaying video.
 
 For ESRGAN, pass the real model explicitly and require CUDA when the host is
 configured for it:
 
 ```powershell
 Set-Location D:\workspace\videoCompressV2
-& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py .\runs\gan\gan.sdp `
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
   --gan-enhancer=esrgan `
   --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
   --gan-require-cuda `
@@ -144,6 +143,39 @@ model and must be exported from its actual checkpoint with
 model. The benchmark uses at least 10 warmup and 200 measured frames. If CUDA is
 requested but ONNX Runtime does not activate `CUDAExecutionProvider`, the result
 is `NOT RUN` rather than a CPU result labelled as CUDA.
+
+On a second Windows receiver with an RTX 4060 at `192.168.0.99`, change the
+board's `--udp-host` to `192.168.0.99` and run the receiver from the conda
+environment named `videocompress`. `conda run` avoids accidentally using a
+different system Python:
+
+```powershell
+conda run -n videocompress --no-capture-output python -c 'import cv2, numpy, onnxruntime as ort; print("python=ok cv2=" + cv2.__version__ + " numpy=" + numpy.__version__ + " ort=" + ort.__version__); print("providers=" + str(ort.get_available_providers())); raise SystemExit(0 if "CUDAExecutionProvider" in ort.get_available_providers() else 2)'
+conda run -n videocompress --no-capture-output ffmpeg -version
+conda run -n videocompress --no-capture-output python tools\live_h265_hud.py --udp-port=5004 `
+  --rotate=ccw90 --gan-enhancer=esrgan `
+  --gan-esrgan-model=model\RealESRGAN_x2_dynamic.onnx --gan-require-cuda `
+  --gan-output-latency-budget-ms=0 --gan-output-latency-factor=1.15 `
+  --gan-debug-log=runs\gan\f8_i4_b75_4060.jsonl
+```
+
+If `onnxruntime` lists CUDA but session creation reports `LoadLibrary failed
+with error 126`, install the matching runtime DLLs into this environment:
+
+```powershell
+conda install -n videocompress -c conda-forge numpy opencv ffmpeg
+conda run -n videocompress --no-capture-output python -m pip install "onnxruntime-gpu[cuda,cudnn]"
+```
+
+The receiver probes the selected FFmpeg before launching its decoder and uses
+`-fps_mode passthrough` on newer builds, `-vsync 0` on older builds, or no
+optional pacing flag when neither is available.
+
+The sender scenario knobs are `--gan-fps=8|10|12`,
+`--gan-inference-fps=0..30` (zero means every source frame), and
+`--gan-video-bitrate-kbps=1..85`. Keep `--mode=gan`, `256x144`, and
+`--profile-control=""`; do not mix generic `--fps`, `--gop`, or encoder-size
+overrides into the atomic GAN profile.
 
 The full-frame ESRGAN/ESRNet postprocessor uses the model contract `ZERO_TO_ONE`:
 outputs are clipped to `[0,1]` and then multiplied by 255. Small negative or above-1
@@ -368,11 +400,11 @@ python -c "import onnxruntime as ort; ort.preload_dlls(directory=''); print(ort.
 预期列表包含 `CUDAExecutionProvider`。若 PC 没有 NVIDIA CUDA GPU，改用
 `requirements-rebuild-pc.txt`，并忽略 `preload_dlls` 调用。
 
-模型固定放在 `model\RealESRGAN_x2_dynamic.onnx`。`--rebuild-port=0`（默认）会使用 SDP
-视频端口加 5，即 `5004 -> 5009`；下面显式写出端口和模型，便于检查配置：
+模型固定放在 `model\RealESRGAN_x2_dynamic.onnx`。`--rebuild-port=0`（默认）会使用视频
+UDP 端口加 5，即 `5004 -> 5009`；下面显式写出端口和模型，便于检查配置：
 
 ```powershell
-python tools\live_h265_hud.py runs\live.sdp `
+python tools\live_h265_hud.py --udp-port=5004 `
   --rebuild-port=5009 `
   --esrgan=auto `
   --esrgan-model=model\RealESRGAN_x2_dynamic.onnx `
@@ -948,16 +980,21 @@ ffplay -protocol_whitelist file,udp,rtp \
   -analyzeduration 1000000 -probesize 1000000 -i runs/live.sdp
 ```
 
-The HUD receiver uses the SDP only to obtain UDP port 5004; profile changes are
-carried in every RTP packet and VPS/SPS/PPS are consumed in-band, so the SDP
-does not need to be recopied after a switch. For the monitored native-PC
-preview, use the supplied receiver. It shows received and decoded FPS, RTP and
-estimated Ethernet-wire kbps, packet loss/reordering, decoder errors, display
-age, and last-IDR age directly on the video:
+Stock `ffplay` still needs SDP to map dynamic RTP payload type 96 to H.265. The
+project HUD does not: it binds the selected UDP port, depacketizes RFC 7798 and
+consumes VPS/SPS/PPS in-band. Profile changes therefore require neither SDP
+generation nor a receiver restart. For the monitored native-PC preview, use
+the supplied receiver. It shows received and decoded FPS, RTP and estimated
+Ethernet-wire kbps, packet loss/reordering, decoder errors, display age, and
+last-IDR age directly on the video:
 
 ```powershell
-python tools/live_h265_hud.py runs/live.sdp
+python tools/live_h265_hud.py --udp-port=5004
 ```
+
+Port `5004` is the default, so the shortest equivalent command is
+`python tools/live_h265_hud.py`. Passing an existing SDP as the positional
+argument remains supported for compatibility.
 
 In `rebuild`, boxes are intentionally off. Add `--rebuild-boxes=on` only for a
 short diagnostic run; production display should keep the default `BOX OFF`.
@@ -997,19 +1034,16 @@ metadata, or a custom decoder.
 
 ### Two-board concurrent video test
 
-Use separate destination ports and SDP files for the two physical boards. Do
-not launch two sender processes on one board: they would contend for its camera.
+Use separate destination ports for the two physical boards. Do not launch two
+sender processes on one board: they would contend for its camera.
 
 | Stream item | Board A (`192.168.0.101`) | Board B (`192.168.0.102`) |
 | --- | --- | --- |
 | PC H.265 UDP port | `5004` | `5005` |
-| Board SDP path | `/tmp/roi-live-101.sdp` | `/tmp/roi-live-102.sdp` |
-| PC SDP path | `runs\live-101.sdp` | `runs\live-102.sdp` |
 | Optional Codec2 UDP port | `5006` | `5007` |
 
 For a video-only concurrency check, start one command in a terminal on each
-board.  The first run writes its SDP after an IDR; later runs can reuse the same
-SDP as long as the assigned port does not change.
+board. The HUDs can be started before the senders and wait for a complete IDR.
 
 ```bash
 # Board A terminal
@@ -1018,7 +1052,7 @@ LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
   --rate-profile=low --mode=segmentation --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5004 \
-  --rtp-sdp-path=/tmp/roi-live-101.sdp --audio=off --preview=off
+  --audio=off --preview=off
 ```
 
 ```bash
@@ -1028,24 +1062,18 @@ LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
   --rate-profile=low --mode=segmentation --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5005 \
-  --rtp-sdp-path=/tmp/roi-live-102.sdp --audio=off --preview=off
+  --audio=off --preview=off
 ```
 
-After the first IDR on both boards, copy both SDPs and launch the two HUDs in
-two separate Windows terminals:
-
-```powershell
-cd D:\workspace\atk_yolov8_seg_cam_v4
-scp root@192.168.0.101:/tmp/roi-live-101.sdp runs\live-101.sdp
-scp root@192.168.0.102:/tmp/roi-live-102.sdp runs\live-102.sdp
-```
+No video SDP copy is required. Launch both HUDs with their assigned UDP ports
+in separate Windows terminals:
 
 ```powershell
 # Windows terminal 1: Board A / UDP 5004
-python tools\live_h265_hud.py runs\live-101.sdp
+python tools\live_h265_hud.py --udp-port=5004
 
 # Windows terminal 2: Board B / UDP 5005
-python tools\live_h265_hud.py runs\live-102.sdp
+python tools\live_h265_hud.py --udp-port=5005
 ```
 
 For subsequent tests, start both HUDs first and wait for their `WAITING FOR

@@ -26,6 +26,9 @@ from full_frame_enhancer import FullFrameEnhancer, LatestOnlyEnhancerWorker
 from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
+DEFAULT_VIDEO_PORT = 5004
+
+
 class RtpStats:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -312,6 +315,57 @@ def parse_sdp(path: Path) -> Tuple[str, int]:
     if not match:
         raise ValueError(f"SDP has no H.265 RTP/AVP 96 video port: {path}")
     return text, int(match.group(1))
+
+
+def resolve_video_port(sdp: Optional[Path], requested_port: Optional[int]) -> int:
+    """Resolve the UDP listen port without requiring an SDP file.
+
+    The HUD receives and depacketizes RFC 7798 itself, so it only used the
+    legacy SDP for its ``m=video`` port.  Keep that input compatible while
+    allowing the common fixed-port path to start directly.
+    """
+    if requested_port is not None and not 1 <= requested_port <= 65535:
+        raise ValueError("--udp-port must be a valid UDP port (1..65535)")
+    if sdp is None:
+        return DEFAULT_VIDEO_PORT if requested_port is None else requested_port
+    _, sdp_port = parse_sdp(sdp)
+    if requested_port is not None and requested_port != sdp_port:
+        raise ValueError(
+            f"--udp-port {requested_port} does not match SDP video port {sdp_port}"
+        )
+    return sdp_port
+
+
+def ffmpeg_frame_rate_args_from_help(help_text: str) -> Tuple[str, ...]:
+    """Return a supported output frame-pacing option for this FFmpeg build.
+
+    FFmpeg 4.x commonly exposes the legacy ``-vsync`` option while newer
+    builds expose ``-fps_mode``. Passing either option to a build that does
+    not know it aborts the decoder before the first packet is received, so
+    select from the actual help text instead of assuming a version.
+    """
+    if re.search(r"(?m)^\s*-fps_mode(?:\s|:|\[|$)", help_text):
+        return ("-fps_mode", "passthrough")
+    if re.search(r"(?m)^\s*-vsync(?:\s|:|$)", help_text):
+        return ("-vsync", "0")
+    return ()
+
+
+def ffmpeg_frame_rate_args(ffmpeg: str) -> Tuple[str, ...]:
+    """Probe FFmpeg and return a compatible frame-pacing argument pair."""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-h", "full"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return ffmpeg_frame_rate_args_from_help(result.stdout or "")
 
 
 class LatestFrame:
@@ -919,7 +973,14 @@ def display_dimensions(width: int, height: int, rotation: str, scale: int) -> Tu
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("sdp", type=Path)
+    parser.add_argument(
+        "sdp", nargs="?", type=Path,
+        help="optional legacy H.265 SDP; the HUD only reads its UDP video port",
+    )
+    parser.add_argument(
+        "--video-port", "--udp-port", dest="video_port", type=int, default=None,
+        help=f"H.265 RTP UDP listen port; default {DEFAULT_VIDEO_PORT} when SDP is omitted",
+    )
     parser.add_argument("--width", type=int, default=320,
                         help="startup canvas width before the first decoded frame")
     parser.add_argument("--height", type=int, default=180,
@@ -1004,7 +1065,15 @@ def main() -> int:
             args.gan_display_fps < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
 
-    _, listen_port = parse_sdp(args.sdp)
+    try:
+        listen_port = resolve_video_port(args.sdp, args.video_port)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    input_source = f"SDP {args.sdp}" if args.sdp is not None else "SDP-free"
+    print(
+        f"H.265 RTP input: UDP {listen_port}, payload type 96, clock 90000 ({input_source})",
+        flush=True,
+    )
     stats = RtpStats()
     switch_gate = ProfileSwitchGate()
     depacketizer = HevcRtpDepacketizer()
@@ -1061,12 +1130,17 @@ def main() -> int:
     receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     receiver.bind(("0.0.0.0", listen_port))
     receiver.settimeout(0.2)
+    frame_rate_args = ffmpeg_frame_rate_args(args.ffmpeg)
+    if frame_rate_args:
+        print(f"FFmpeg frame pacing: {' '.join(frame_rate_args)}", flush=True)
+    else:
+        print("FFmpeg frame pacing: default (no compatible passthrough option)", flush=True)
     command = [
         args.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning",
         "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "1024",
         "-f", "hevc",
         "-i", "pipe:0", "-an", "-sn", "-dn",
-        "-fps_mode", "passthrough", "-pix_fmt", "bgr24",
+        *frame_rate_args, "-pix_fmt", "bgr24",
         "-f", "image2pipe", "-vcodec", "bmp", "pipe:1",
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0

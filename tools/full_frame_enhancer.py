@@ -15,6 +15,7 @@ import json
 import os
 import site
 import statistics
+import sys
 import threading
 import time
 from pathlib import Path
@@ -44,6 +45,9 @@ def _prepare_cuda_runtime_paths() -> None:
         "cuda_runtime", "cuda_nvrtc", "cublas", "cudnn", "cufft", "curand", "nvjitlink"
     )
     directories = []
+    conda_bin = Path(sys.prefix) / "Library" / "bin"
+    if conda_bin.is_dir():
+        directories.append(conda_bin)
     for root in roots:
         for library in libraries:
             directory = Path(root) / "nvidia" / library / "bin"

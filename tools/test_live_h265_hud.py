@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -80,6 +81,45 @@ def idle_worker_snapshot(**overrides):
 
 
 class HudTests(unittest.TestCase):
+    def test_video_port_defaults_without_sdp(self):
+        self.assertEqual(HUD.resolve_video_port(None, None), 5004)
+        self.assertEqual(HUD.resolve_video_port(None, 5012), 5012)
+
+    def test_video_port_keeps_legacy_sdp_compatibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video.sdp"
+            path.write_text(
+                "v=0\n"
+                "m=video 5007 RTP/AVP 96\n"
+                "a=rtpmap:96 H265/90000\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(HUD.resolve_video_port(path, None), 5007)
+            self.assertEqual(HUD.resolve_video_port(path, 5007), 5007)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                HUD.resolve_video_port(path, 5008)
+
+    def test_video_port_rejects_invalid_explicit_port(self):
+        for port in (0, 65536):
+            with self.subTest(port=port):
+                with self.assertRaisesRegex(ValueError, "valid UDP port"):
+                    HUD.resolve_video_port(None, port)
+
+    def test_ffmpeg_frame_rate_args_selects_supported_option(self):
+        self.assertEqual(
+            HUD.ffmpeg_frame_rate_args_from_help(
+                "  -fps_mode[:<stream_spec>]  set framerate mode\n"
+            ),
+            ("-fps_mode", "passthrough"),
+        )
+        self.assertEqual(
+            HUD.ffmpeg_frame_rate_args_from_help(
+                "  -vsync                  video sync method\n"
+            ),
+            ("-vsync", "0"),
+        )
+        self.assertEqual(HUD.ffmpeg_frame_rate_args_from_help(""), ())
+
     def test_rtp_metrics_detect_loss_marker_and_idr(self):
         stats = HUD.RtpStats()
         stats.on_packet(rtp_packet(10, nal_type=19))
