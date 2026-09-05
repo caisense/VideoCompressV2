@@ -15,9 +15,13 @@ struct RtpStreamProfile {
     uint16_t height;
     uint8_t fps;
     uint8_t generation;
+    // Present only for GAN. Zero preserves the original eight-byte RO record
+    // used by all other profiles.
+    uint16_t target_bitrate_kbps;
 
     RtpStreamProfile()
-        : valid(false), profile(0), width(0), height(0), fps(0), generation(0) {}
+        : valid(false), profile(0), width(0), height(0), fps(0), generation(0),
+          target_bitrate_kbps(0) {}
 };
 
 class H265RtpPacketizer {

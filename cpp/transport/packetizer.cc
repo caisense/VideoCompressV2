@@ -6,6 +6,11 @@
 namespace roi_h265 {
 namespace {
 
+const size_t kRtpHeaderBytes = 12U;
+const size_t kRtpExtensionHeaderBytes = 4U;
+const size_t kProfileRecordBytes = 8U;
+const size_t kProfileTargetTailBytes = 4U;
+
 size_t startCodeLength(const uint8_t *data, size_t length, size_t offset) {
     if (offset + 3 <= length && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1) return 3;
     if (offset + 4 <= length && data[offset] == 0 && data[offset + 1] == 0 &&
@@ -13,16 +18,22 @@ size_t startCodeLength(const uint8_t *data, size_t length, size_t offset) {
     return 0;
 }
 
+size_t headerBytes(const RtpStreamProfile *profile) {
+    if (!profile || !profile->valid) return kRtpHeaderBytes;
+    return kRtpHeaderBytes + kRtpExtensionHeaderBytes + kProfileRecordBytes +
+           (profile->target_bitrate_kbps != 0 ? kProfileTargetTailBytes : 0U);
+}
+
 }  // namespace
 
 H265RtpPacketizer::H265RtpPacketizer(uint16_t sequence_number, uint32_t ssrc, int mtu)
-    // 12-byte RTP header + 3-byte H.265 FU header leaves at least one byte of
-    // fragment payload. Honour larger caller-provided MTUs exactly.
-    : sequence_number_(sequence_number), ssrc_(ssrc), mtu_(std::max(28, mtu)) {}
+    // A GAN profile can use a 28-byte RTP header (including its RO extension).
+    // Keep room for the 3-byte H.265 FU header and one fragment byte.
+    : sequence_number_(sequence_number), ssrc_(ssrc), mtu_(std::max(32, mtu)) {}
 
 std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timestamp,
                                                    const RtpStreamProfile *profile) {
-    std::vector<uint8_t> header(12, 0);
+    std::vector<uint8_t> header(kRtpHeaderBytes, 0);
     const bool include_profile = profile && profile->valid;
     header[0] = static_cast<uint8_t>(0x80 | (include_profile ? 0x10 : 0x00));
     header[1] = static_cast<uint8_t>((marker ? 0x80 : 0x00) | 96);  // dynamic H.265 payload type
@@ -38,13 +49,17 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
     header[11] = static_cast<uint8_t>(ssrc_);
     if (include_profile) {
         // RFC 3550 header extension. 0x524f ("RO") identifies this project's
-        // eight-byte profile record. It is repeated on every packet so the
-        // receiver can restart its decoder before forwarding the first VPS of
-        // a new profile; standard RTP/H.265 receivers simply skip it.
+        // version-1 eight-byte profile record. It is repeated on every packet
+        // so the receiver can restart its decoder before forwarding the first
+        // VPS of a new profile; standard RTP/H.265 receivers simply skip it.
+        // GAN appends a four-byte aligned target-bit-rate tail while preserving
+        // the record version and every non-GAN packet's original layout.
+        const bool include_target = profile->target_bitrate_kbps != 0;
+        header.reserve(headerBytes(profile));
         header.push_back(0x52);
         header.push_back(0x4f);
         header.push_back(0x00);
-        header.push_back(0x02);
+        header.push_back(include_target ? 0x03 : 0x02);
         header.push_back(0x01);  // metadata version
         header.push_back(profile->profile);
         header.push_back(static_cast<uint8_t>(profile->width >> 8));
@@ -53,6 +68,12 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
         header.push_back(static_cast<uint8_t>(profile->height));
         header.push_back(profile->fps);
         header.push_back(profile->generation);
+        if (include_target) {
+            header.push_back(static_cast<uint8_t>(profile->target_bitrate_kbps >> 8));
+            header.push_back(static_cast<uint8_t>(profile->target_bitrate_kbps));
+            header.push_back(0x00);  // reserved for a future RO v1 tail field
+            header.push_back(0x00);
+        }
     }
     return header;
 }
@@ -61,7 +82,7 @@ void H265RtpPacketizer::appendNal(const uint8_t *nal, size_t length, uint32_t ti
                                   bool marker, const RtpStreamProfile *profile,
                                   std::vector<std::vector<uint8_t> > *packets) {
     if (length < 2) return;
-    const size_t header_bytes = profile && profile->valid ? 24 : 12;
+    const size_t header_bytes = headerBytes(profile);
     const size_t max_payload = static_cast<size_t>(mtu_) - header_bytes;
     if (length <= max_payload) {
         std::vector<uint8_t> packet = makeHeader(marker, timestamp, profile);

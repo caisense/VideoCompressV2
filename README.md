@@ -252,12 +252,15 @@ returns with VPS/SPS/PPS plus an IDR. The process, camera and RKNN model remain
 running throughout.
 
 Every RTP packet carries an RFC 3550 header extension identified by `0x524f`
-(`RO`) with metadata version, profile, width, height, FPS and generation. It
-does not change the RFC 7798 H.265 payload and ordinary receivers ignore it.
-`tools/live_h265_hud.py` reads it, buffers the first complete random-access
-unit of each generation, converts RFC 7798 packets directly to Annex-B, and
-restarts only its internal FFmpeg pipe decoder. It follows the new SPS
-dimensions and resizes the window; the receiver application does not restart.
+(`RO`) with metadata version, profile, width, height, FPS and generation. GAN
+packets additionally append the configured `gan_video_bitrate_kbps` as a
+network-order 16-bit `TARGET` field (plus two reserved alignment bytes); non-GAN
+packets retain the original eight-byte profile record. It does not change the
+RFC 7798 H.265 payload and ordinary receivers ignore it. `tools/live_h265_hud.py`
+also accepts the original record with no `TARGET`, buffers the first complete
+random-access unit of each generation, converts RFC 7798 packets directly to
+Annex-B, and restarts only its internal FFmpeg pipe decoder. It follows the new
+SPS dimensions and resizes the window; the receiver application does not restart.
 
 With only one serial console, start the sender in the background and write the
 same FIFO from that shell; a second serial terminal is not required:
@@ -601,6 +604,7 @@ AI 超分，`ESRGAN/CUDA` 或 `ESRNET/...` 才表示实际使用的增强后端�
 | HUD 字段 | 含义 |
 | --- | --- |
 | `RX/DEC/ENH/DISP` | RTP 访问单元接收率、FFmpeg 解码率、GAN 成功输出率、实际呈现率。 |
+| `TARGET 75 RTP 30.2 WIRE 36.5 CAP 100 kbps` | `TARGET` 是 `--gan-video-bitrate-kbps` 的 H.265 编码器目标码率；`RTP` 是最近 1 秒实际收到的 RTP/UDP payload 码率；`WIRE` 是保持原公式估算的 Ethernet 物理线速；`CAP` 是配置的 physical/link pacing 上限。实际 `RTP` 可以低于 `TARGET`，`WIRE` 通常高于 `RTP`。旧发送端没有目标 metadata 时显示 `TARGET --`。 |
 | `INFER ALL L/P50/P95/P99/MAX` | 所有已经返回的推理调用延迟，包含 `stale_after_infer`，不只统计被接受的输出。 |
 | `GOOD PC P50/P95/P99/MAX` | 输出策略接受的 source-to-output 总时延；`BUDGET` 是当前 FPS 对应的输出年龄预算。 |
 | `AGE DEC … GAN … RUN … OUT …` | 最新解码帧年龄、最近有效 GAN 输出年龄、当前运行中调用年龄、最近完成调用的输出年龄。它们不是同一个指标。 |

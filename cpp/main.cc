@@ -744,6 +744,13 @@ int main(int argc, char **argv) {
             transport_unit.stream_profile.fps = static_cast<uint8_t>(live.encoder.fps);
             transport_unit.stream_profile.generation =
                 static_cast<uint8_t>(profile_generation.load() & 0xffU);
+            // The GAN encoder target is configuration, not an observed rate.
+            // Carry it in the existing RO RTP profile extension only for GAN;
+            // zero keeps every other profile on its original metadata layout.
+            transport_unit.stream_profile.target_bitrate_kbps =
+                live.rate_profile == RATE_PROFILE_GAN
+                    ? static_cast<uint16_t>(live.gan.video_bitrate_kbps)
+                    : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {
                 std::fprintf(stderr, "UDP transport enqueue error: %s\n", encoder_error.c_str());
                 running.store(false);

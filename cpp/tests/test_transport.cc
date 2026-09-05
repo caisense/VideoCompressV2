@@ -123,23 +123,55 @@ void testProfileMetadataUsesRtpHeaderExtension() {
     const uint8_t access_unit[] = {0, 0, 0, 1, 0x26, 0x01, 0xaa};
     roi_h265::RtpStreamProfile profile;
     profile.valid = true;
-    profile.profile = 1;
-    profile.width = 480;
-    profile.height = 270;
-    profile.fps = 15;
+    profile.profile = 4;
+    profile.width = 256;
+    profile.height = 144;
+    profile.fps = 10;
     profile.generation = 7;
+    profile.target_bitrate_kbps = 75;
     roi_h265::H265RtpPacketizer packetizer(1, 2, 1200);
     const std::vector<std::vector<uint8_t> > packets = packetizer.packetize(
         access_unit, sizeof(access_unit), 1234, &profile);
     CHECK(packets.size() == 1);
     CHECK((packets[0][0] & 0x10) != 0);
     CHECK(packets[0][12] == 0x52 && packets[0][13] == 0x4f);
-    CHECK(packets[0][14] == 0 && packets[0][15] == 2);
-    CHECK(packets[0][16] == 1 && packets[0][17] == 1);
-    CHECK((static_cast<int>(packets[0][18]) << 8 | packets[0][19]) == 480);
-    CHECK((static_cast<int>(packets[0][20]) << 8 | packets[0][21]) == 270);
-    CHECK(packets[0][22] == 15 && packets[0][23] == 7);
-    CHECK(((packets[0][24] >> 1) & 0x3f) == 19);
+    CHECK(packets[0][14] == 0 && packets[0][15] == 3);
+    CHECK(packets[0][16] == 1 && packets[0][17] == 4);
+    CHECK((static_cast<int>(packets[0][18]) << 8 | packets[0][19]) == 256);
+    CHECK((static_cast<int>(packets[0][20]) << 8 | packets[0][21]) == 144);
+    CHECK(packets[0][22] == 10 && packets[0][23] == 7);
+    CHECK((static_cast<int>(packets[0][24]) << 8 | packets[0][25]) == 75);
+    CHECK(packets[0][26] == 0 && packets[0][27] == 0);
+    CHECK(((packets[0][28] >> 1) & 0x3f) == 19);
+
+    // The optional tail must reduce the H.265 payload budget by the same four
+    // bytes, rather than let a fragmented RTP datagram exceed the caller MTU.
+    std::vector<uint8_t> large_access_unit = {0, 0, 0, 1, 0x26, 0x01};
+    for (int i = 0; i < 48; ++i) large_access_unit.push_back(static_cast<uint8_t>(i));
+    roi_h265::H265RtpPacketizer constrained_packetizer(1, 2, 40);
+    const std::vector<std::vector<uint8_t> > constrained_packets =
+        constrained_packetizer.packetize(large_access_unit.data(), large_access_unit.size(),
+                                         1234, &profile);
+    CHECK(constrained_packets.size() > 1);
+    for (size_t i = 0; i < constrained_packets.size(); ++i) {
+        CHECK(constrained_packets[i].size() <= 40U);
+        CHECK(((constrained_packets[i][28] >> 1) & 0x3f) == 49);
+    }
+
+    // Zero means no GAN target. Keep legacy profiles byte-for-byte compatible
+    // with the original two-word RO extension.
+    profile.profile = 1;
+    profile.width = 480;
+    profile.height = 270;
+    profile.fps = 15;
+    profile.target_bitrate_kbps = 0;
+    roi_h265::H265RtpPacketizer legacy_packetizer(1, 2, 1200);
+    const std::vector<std::vector<uint8_t> > legacy_packets = legacy_packetizer.packetize(
+        access_unit, sizeof(access_unit), 1234, &profile);
+    CHECK(legacy_packets.size() == 1);
+    CHECK(legacy_packets[0][14] == 0 && legacy_packets[0][15] == 2);
+    CHECK(legacy_packets[0][16] == 1 && legacy_packets[0][17] == 1);
+    CHECK(((legacy_packets[0][24] >> 1) & 0x3f) == 19);
 }
 
 }  // namespace

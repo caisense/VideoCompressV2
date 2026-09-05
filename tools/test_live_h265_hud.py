@@ -27,14 +27,19 @@ def rtp_packet(sequence: int, marker: bool = False, nal_type: int = 1) -> bytes:
 
 
 def rtp_profile_packet(sequence: int, profile: int, width: int, height: int,
-                       fps: int, generation: int, nal_type: int = 19) -> bytes:
+                       fps: int, generation: int, nal_type: int = 19,
+                       target_bitrate_kbps=None) -> bytes:
     packet = bytearray(rtp_packet(sequence, marker=True, nal_type=nal_type))
     packet[0] |= 0x10
-    extension = bytearray(b"RO\x00\x02")
+    extension = bytearray(b"RO\x00\x03" if target_bitrate_kbps is not None else
+                          b"RO\x00\x02")
     extension.extend((1, profile))
     extension.extend(width.to_bytes(2, "big"))
     extension.extend(height.to_bytes(2, "big"))
     extension.extend((fps, generation))
+    if target_bitrate_kbps is not None:
+        extension.extend(int(target_bitrate_kbps).to_bytes(2, "big"))
+        extension.extend(b"\x00\x00")
     return bytes(packet[:12] + extension + packet[12:])
 
 
@@ -149,7 +154,7 @@ class HudTests(unittest.TestCase):
         values = stats.snapshot()
         self.assertEqual(values["profile"], {
             "name": "medium", "width": 480, "height": 270,
-            "fps": 15, "generation": 3,
+            "fps": 15, "generation": 3, "target_bitrate_kbps": None,
         })
         self.assertEqual(values["i_frames"], 1)
         self.assertTrue(stats.on_packet(rtp_profile_packet(31, 0, 320, 180, 10, 4)))
@@ -167,14 +172,32 @@ class HudTests(unittest.TestCase):
         self.assertEqual(presentation.snapshot()["held_percent"], 50.0)
         self.assertEqual(HUD.display_dimensions(640, 360, "ccw90", 1), (360, 640))
 
-    def test_gan_profile_extension_is_distinct_from_rebuild(self):
+    def test_gan_profile_extension_carries_optional_encoder_target(self):
         stats = HUD.RtpStats()
-        stats.on_packet(rtp_profile_packet(33, 4, 256, 144, 8, 6))
+        packet = rtp_profile_packet(33, 4, 256, 144, 8, 6,
+                                    target_bitrate_kbps=75)
+        stats.on_packet(packet)
         profile = stats.snapshot()["profile"]
         self.assertEqual(profile["name"], "gan")
         self.assertEqual(profile["width"], 256)
         self.assertEqual(profile["height"], 144)
         self.assertEqual(profile["fps"], 8)
+        self.assertEqual(profile["target_bitrate_kbps"], 75)
+        self.assertEqual(HUD.RtpStats._payload_offset(packet), 28)
+        self.assertEqual(
+            HUD.gan_bitrate_hud_line(profile, {"rtp_kbps": 30.2, "wire_kbps": 36.5}),
+            "TARGET 75  RTP 30.2  WIRE 36.5  CAP 100 kbps",
+        )
+
+    def test_legacy_gan_metadata_shows_unknown_target(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(34, 4, 256, 144, 8, 7))
+        profile = stats.snapshot()["profile"]
+        self.assertIsNone(profile["target_bitrate_kbps"])
+        self.assertEqual(
+            HUD.gan_bitrate_hud_line(profile, {"rtp_kbps": 30.2, "wire_kbps": 36.5}),
+            "TARGET --  RTP 30.2  WIRE 36.5  CAP 100 kbps",
+        )
 
     def test_decoded_pts_handoff_preserves_fifo_order_with_bounded_backlog(self):
         queue = HUD.DecodedPtsQueue()

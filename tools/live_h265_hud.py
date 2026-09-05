@@ -27,6 +27,21 @@ from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
 DEFAULT_VIDEO_PORT = 5004
+GAN_LINK_CAP_KBPS = 100
+
+
+def gan_target_kbps_text(profile: Optional[dict]) -> str:
+    """Format optional GAN target metadata without rejecting legacy senders."""
+    target = None if profile is None else profile.get("target_bitrate_kbps")
+    return "--" if target is None else str(int(target))
+
+
+def gan_bitrate_hud_line(profile: Optional[dict], values: dict) -> str:
+    """Keep configured target and observed receive rates visibly distinct."""
+    return (
+        f"TARGET {gan_target_kbps_text(profile)}  RTP {values['rtp_kbps']:.1f}  "
+        f"WIRE {values['wire_kbps']:.1f}  CAP {GAN_LINK_CAP_KBPS} kbps"
+    )
 
 
 class RtpStats:
@@ -69,12 +84,22 @@ class RtpStats:
         if len(packet) < 16 or not packet[0] & 0x10:
             return None
         offset = 12 + 4 * (packet[0] & 0x0F)
-        if offset + 12 > len(packet) or packet[offset:offset + 2] != b"RO":
+        if offset + 4 > len(packet) or packet[offset:offset + 2] != b"RO":
             return None
         words = int.from_bytes(packet[offset + 2:offset + 4], "big")
-        payload = packet[offset + 4:offset + 4 + words * 4]
+        payload_end = offset + 4 + words * 4
+        if payload_end > len(packet):
+            return None
+        payload = packet[offset + 4:payload_end]
         if len(payload) < 8 or payload[0] != 1:
             return None
+        target_bitrate_kbps = None
+        # New GAN senders append a uint16 target plus two reserved bytes to
+        # the v1 record. Old senders still stop at byte 7.
+        if len(payload) >= 10:
+            advertised_target = int.from_bytes(payload[8:10], "big")
+            if advertised_target > 0:
+                target_bitrate_kbps = advertised_target
         names = {0: "low", 1: "medium", 2: "high", 3: "rebuild", 4: "gan"}
         return {
             "name": names.get(payload[1], "unknown"),
@@ -82,6 +107,7 @@ class RtpStats:
             "height": int.from_bytes(payload[4:6], "big"),
             "fps": payload[6],
             "generation": payload[7],
+            "target_bitrate_kbps": target_bitrate_kbps,
         }
 
     @staticmethod
@@ -1623,6 +1649,7 @@ def main() -> int:
                         drop_counts = gan_values["drop_reason_counts"]
                         gan_text = (
                             f" source_fps={profile['fps']}"
+                            f" target_kbps={gan_target_kbps_text(profile)}"
                             f" enhanced_fps={gan_values['rolling_1s_fps']:.1f}"
                             f" display_fps={presentation_values['fps']:.1f}"
                             f" enhancer={gan_values['backend']}"
@@ -1659,7 +1686,7 @@ def main() -> int:
                             f" hard_stalls={gan_controller_values.get('hard_stall_count', 0)}"
                             f" rtp_kbps={values['rtp_kbps']:.1f}"
                             f" wire_kbps={values['wire_kbps']:.1f}"
-                            f" link_cap_kbps=100"
+                            f" link_cap_kbps={GAN_LINK_CAP_KBPS}"
                         )
                         rebuild_text = gan_text
                     print(
@@ -1767,7 +1794,7 @@ def main() -> int:
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
                     "INPUT 256x144 NATIVE 512x288",
                     f"OUTPUT 640x360  {output_backend}",
-                    f"H265 {values['rtp_kbps']:.1f} WIRE {values['wire_kbps']:.1f} LINK CAP 100",
+                    gan_bitrate_hud_line(profile, values),
                     f"INFER ALL L/P50/P95/P99/MAX "
                     f"{gan_values['last_finished_infer_ms']:.0f}/"
                     f"{gan_values['infer_all_p50_ms']:.0f}/"
