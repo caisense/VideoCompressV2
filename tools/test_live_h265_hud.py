@@ -482,23 +482,133 @@ class HudTests(unittest.TestCase):
         three = controller.update(
             0.6, 8.0, 5, idle_worker_snapshot(), gan_candidate(5, 0.59)
         )
-        self.assertEqual(one.action, HUD.GanAction.KEEP_GAN)
-        self.assertEqual(two.action, HUD.GanAction.KEEP_GAN)
+        self.assertEqual(one.action, HUD.GanAction.ACCEPT_GAN)
+        self.assertEqual(two.action, HUD.GanAction.ACCEPT_GAN)
         self.assertEqual(three.action, HUD.GanAction.ACCEPT_GAN)
         self.assertEqual(three.state, HUD.GanFallbackController.HEALTHY)
         self.assertEqual(controller.recoveries, 1)
+        self.assertEqual(controller.recovery_streak, 0)
+        recovered = next(item for item in three.events
+                         if item["TYPE"] == "GAN_STATE" and item["STATE"] == "RECOVERED")
+        self.assertEqual(recovered["RECOVERY_STREAK"], 3)
+        self.assertFalse(recovered["FALLBACK_ACTIVE"])
 
-    def test_same_source_frame_shown_by_lanczos_cannot_be_replaced_by_gan(self):
-        controller = HUD.GanFallbackController(143.75)
+    def test_same_source_lanczos_frame_can_start_recovery_and_be_upgraded(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(0.0, 8.0, 99, idle_worker_snapshot(), gan_candidate(99, 0.0))
+        entered = controller.update(0.251, 8.0, 100, idle_worker_snapshot())
+        self.assertEqual(entered.state, HUD.GanFallbackController.SOFT_FALLBACK)
         controller.note_lanczos_display(100)
-        old = controller.update(
-            1.0, 8.0, 100, idle_worker_snapshot(), gan_candidate(100, 0.9)
+
+        same = controller.update(
+            0.300, 8.0, 100, idle_worker_snapshot(), gan_candidate(100, 0.290)
         )
-        self.assertEqual(old.action, HUD.GanAction.DISCARD_STALE_GAN)
+        self.assertEqual(same.action, HUD.GanAction.ACCEPT_GAN)
+        self.assertEqual(same.state, HUD.GanFallbackController.SOFT_FALLBACK)
+        self.assertEqual(controller.recovery_streak, 1)
+        self.assertFalse(any(item.get("REASON") == "RECOVERY_NOT_FRESH"
+                             for item in same.events))
+
+    def test_fresh_lag_one_result_is_recovery_evidence_but_cannot_cover_lanczos(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(0.0, 8.0, 99, idle_worker_snapshot(), gan_candidate(99, 0.0))
+        controller.update(0.251, 8.0, 100, idle_worker_snapshot())
+        controller.note_lanczos_display(100)
+
+        old = controller.update(
+            0.300, 8.0, 100, idle_worker_snapshot(), gan_candidate(99, 0.290)
+        )
+        self.assertEqual(old.action, HUD.GanAction.KEEP_GAN)
+        self.assertEqual(controller.recovery_streak, 1)
+        presentation_drop = next(item for item in old.events
+                                 if item["TYPE"] == "GAN_PRESENTATION_DROP")
+        self.assertEqual(presentation_drop["REASON"], "PRESENTATION_SEQUENCE_OLD")
+        self.assertTrue(presentation_drop["FRESH_FOR_RECOVERY"])
+        self.assertFalse(presentation_drop["SAFE_TO_PRESENT"])
+
+    def test_newer_fresh_result_is_safe_to_present_during_recovery(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(0.0, 8.0, 99, idle_worker_snapshot(), gan_candidate(99, 0.0))
+        controller.update(0.251, 8.0, 100, idle_worker_snapshot())
+        controller.note_lanczos_display(100)
+
         new = controller.update(
-            1.1, 8.0, 101, idle_worker_snapshot(), gan_candidate(101, 1.0)
+            0.300, 8.0, 101, idle_worker_snapshot(), gan_candidate(101, 0.290)
         )
         self.assertEqual(new.action, HUD.GanAction.ACCEPT_GAN)
+        self.assertEqual(controller.recovery_streak, 1)
+
+    def test_recovery_streak_resets_only_for_actually_stale_output(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(0.0, 8.0, 99, idle_worker_snapshot(), gan_candidate(99, 0.0))
+        controller.update(0.251, 8.0, 100, idle_worker_snapshot())
+        controller.note_lanczos_display(100)
+        controller.update(0.300, 8.0, 100, idle_worker_snapshot(), gan_candidate(100, 0.290))
+        controller.update(0.400, 8.0, 101, idle_worker_snapshot(), gan_candidate(101, 0.390))
+        self.assertEqual(controller.recovery_streak, 2)
+
+        stale = controller.update(
+            0.700, 8.0, 102, idle_worker_snapshot(),
+            gan_candidate(102, 0.500, total_pc_ms=200.0)
+        )
+        self.assertEqual(stale.action, HUD.GanAction.DISCARD_STALE_GAN)
+        self.assertEqual(controller.recovery_streak, 0)
+        drop = next(item for item in stale.events if item["TYPE"] == "GAN_PRESENTATION_DROP")
+        self.assertEqual(drop["REASON"], "RECOVERY_TOO_OLD")
+
+    def test_predicted_skip_does_not_reset_fresh_recovery_evidence(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        controller.update(0.0, 8.0, 99, idle_worker_snapshot(), gan_candidate(99, 0.0))
+        controller.update(0.251, 8.0, 100, idle_worker_snapshot())
+        controller.note_lanczos_display(100)
+        controller.update(0.300, 8.0, 100, idle_worker_snapshot(),
+                          gan_candidate(100, 0.290))
+        self.assertEqual(controller.recovery_streak, 1)
+
+        # Predictive admission did not produce a stale GAN result, so it is
+        # not allowed to erase the valid recovery evidence above.
+        skipped = controller.update(
+            0.350, 8.0, 101,
+            idle_worker_snapshot(drop_reason_counts={"stale_before_predicted": 1}),
+        )
+        self.assertEqual(controller.recovery_streak, 1)
+        self.assertFalse(any(item["TYPE"] == "GAN_RECOVERY_RESET"
+                             for item in skipped.events))
+
+    def test_esrgan8_spike_replay_recovers_after_soft_fallback(self):
+        controller = HUD.GanFallbackController(143.75, recovery_good_frames=3)
+        events = []
+        controller.update(0.000, 8.0, 1, idle_worker_snapshot(), gan_candidate(1, 0.000))
+        entered = controller.update(0.251, 8.0, 2, idle_worker_snapshot())
+        events.extend(entered.events)
+        self.assertEqual(entered.state, HUD.GanFallbackController.SOFT_FALLBACK)
+        controller.note_lanczos_display(2)
+
+        # Replay a 170 ms inference that returned stale, then normal 85-95 ms
+        # outputs.  The stale worker result breaks the old recovery streak but
+        # must not prevent the following fresh outputs from recovering.
+        after_spike = controller.update(
+            0.270, 8.0, 3,
+            idle_worker_snapshot(drop_reason_counts={"stale_after_infer": 1}),
+        )
+        events.extend(after_spike.events)
+        controller.note_lanczos_display(3)
+        for sequence, now, completed_at in ((3, 0.380, 0.290), (4, 0.500, 0.410),
+                                             (5, 0.620, 0.530)):
+            controller.note_lanczos_display(sequence)
+            decision = controller.update(
+                now, 8.0, sequence,
+                idle_worker_snapshot(drop_reason_counts={"stale_after_infer": 1}),
+                gan_candidate(sequence, completed_at),
+            )
+            events.extend(decision.events)
+
+        self.assertEqual(controller.soft_fallback_entries, 1)
+        self.assertEqual(controller.hard_stall_count, 0)
+        self.assertEqual(controller.recoveries, 1)
+        self.assertEqual(controller.state, HUD.GanFallbackController.HEALTHY)
+        self.assertFalse(any(item.get("REASON") == "RECOVERY_NOT_FRESH" for item in events))
+        self.assertTrue(any(item.get("STATE") == "RECOVERED" for item in events))
 
     def test_window_dimensions_follow_rotation(self):
         self.assertEqual(HUD.display_dimensions(320, 180, "ccw90", 3), (540, 960))

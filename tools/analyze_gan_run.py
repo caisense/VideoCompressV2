@@ -98,11 +98,17 @@ def normalized_drop_reason(record: dict[str, Any]) -> str | None:
     return {
         "replaced_pending": "replaced_pending",
         "stale_before_infer": "stale_before",
+        "stale_before_predicted": "stale_before_predicted",
         "stale_after_infer": "stale_after",
         "inference_error": "inference_error",
         "output_replaced": "output_replaced",
         "OUTPUT_TOO_OLD": "presentation_old",
+        "PRESENTATION_SEQUENCE_OLD": "presentation_sequence_old",
         "RECOVERY_NOT_FRESH": "recovery_not_fresh",
+        "RECOVERY_TOO_OLD": "recovery_too_old",
+        "RECOVERY_SEQUENCE_OLD": "recovery_sequence_old",
+        "RECOVERY_SEQUENCE_FUTURE": "recovery_sequence_future",
+        "RECOVERY_SEQUENCE_UNKNOWN": "recovery_sequence_unknown",
     }.get(reason)
 
 
@@ -136,7 +142,9 @@ def main() -> int:
         item for item in worker_records
         if item.get("INFER_RETURNED") or (
             float(item.get("INFER_MS", 0.0) or 0.0) > 0.0 and
-            item.get("DROP_REASON") != "stale_before_infer"
+            item.get("DROP_REASON") not in (
+                "stale_before_infer", "stale_before_predicted",
+            )
         )
     ]
     latencies = [float(item["TOTAL_PC_MS"]) for item in ready
@@ -157,6 +165,14 @@ def main() -> int:
     ]
     queue_wait = [float(item["QUEUE_WAIT"]) for item in worker_records
                   if item.get("QUEUE_WAIT") is not None]
+    predicted_infer = [
+        float(item["PREDICTED_INFER_MS"]) for item in worker_records
+        if float(item.get("PREDICTED_INFER_MS", 0.0) or 0.0) > 0.0
+    ]
+    predicted_total = [
+        float(item["PREDICTED_TOTAL_MS"]) for item in worker_records
+        if float(item.get("PREDICTED_TOTAL_MS", 0.0) or 0.0) > 0.0
+    ]
     raw_min_values = numeric_field(worker_records, "RAW_MIN")
     raw_max_values = numeric_field(worker_records, "RAW_MAX")
     output_luma_values = numeric_field(worker_records, "OUTPUT_LUMA_MEAN")
@@ -201,11 +217,17 @@ def main() -> int:
     drop_reason_counts = {
         "replaced_pending": 0,
         "stale_before": 0,
+        "stale_before_predicted": 0,
         "stale_after": 0,
         "inference_error": 0,
         "output_replaced": 0,
         "presentation_old": 0,
+        "presentation_sequence_old": 0,
         "recovery_not_fresh": 0,
+        "recovery_too_old": 0,
+        "recovery_sequence_old": 0,
+        "recovery_sequence_future": 0,
+        "recovery_sequence_unknown": 0,
     }
     for item in dropped:
         reason = normalized_drop_reason(item)
@@ -247,6 +269,13 @@ def main() -> int:
     stale_recovery_rejects = sum(
         1 for item in presentation_events if item.get("REASON") == "RECOVERY_NOT_FRESH"
     )
+    recovery_rejection_reasons = dict(collections.Counter(
+        str(item.get("REASON")) for item in presentation_events
+        if str(item.get("REASON", "")).startswith("RECOVERY_")
+    ))
+    recovery_reset_events = [
+        item for item in records if item.get("TYPE") == "GAN_RECOVERY_RESET"
+    ]
     hard_run_ages = [
         float(item["RUN_AGE_MS"]) for item in hard_stall_events
         if item.get("RUN_AGE_MS") is not None
@@ -296,6 +325,11 @@ def main() -> int:
             "p95": percentile(queue_wait, 95),
             "max": max(queue_wait) if queue_wait else None,
         },
+        "prediction": {
+            "stale_before_predicted": drop_reason_counts["stale_before_predicted"],
+            "predicted_infer_ms": summary(predicted_infer),
+            "predicted_total_ms": summary(predicted_total),
+        },
         "fallback": {
             "soft_fallback_entries": len(soft_events),
             "fallback_total_duration_ms": fallback_total_duration_ms,
@@ -316,6 +350,8 @@ def main() -> int:
         "hard_stall_count": len(hard_stall_events),
         "hard_stall_max_run_age_ms": max(hard_run_ages) if hard_run_ages else 0.0,
         "recovery_stale_rejects": stale_recovery_rejects,
+        "recovery_rejection_reasons": recovery_rejection_reasons,
+        "recovery_worker_resets": len(recovery_reset_events),
     }
     if args.receiver_log is not None:
         result["transport"] = read_receiver_metrics(args.receiver_log)

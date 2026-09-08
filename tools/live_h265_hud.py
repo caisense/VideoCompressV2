@@ -101,6 +101,7 @@ def gan_waiting_worker_snapshot() -> dict:
             "replaced_pending": 0,
             "output_replaced": 0,
             "stale_before_infer": 0,
+            "stale_before_predicted": 0,
             "stale_after_infer": 0,
             "inference_error": 0,
         },
@@ -693,6 +694,8 @@ class GanAction:
 
     KEEP_GAN = "KEEP_GAN"
     USE_LANCZOS = "USE_LANCZOS"
+    # The candidate is safe to paint.  During recovery this can happen before
+    # the controller has collected all recovery-good samples.
     ACCEPT_GAN = "ACCEPT_GAN"
     DISCARD_STALE_GAN = "DISCARD_STALE_GAN"
 
@@ -820,14 +823,25 @@ class GanFallbackController:
                 sequence > self.fallback_displayed_sequence):
             self.fallback_displayed_sequence = sequence
 
-    def _reset_recovery_on_worker_drops(self, worker_snapshot: dict) -> None:
+    def _reset_recovery_on_worker_drops(self, worker_snapshot: dict) -> Tuple[str, ...]:
         counts = worker_snapshot.get("drop_reason_counts", {}) or {}
-        for reason in ("stale_before_infer", "stale_after_infer", "inference_error"):
+        resets = []
+        for reason in (
+            "stale_before_infer",
+            "stale_after_infer",
+            "inference_error",
+        ):
             current = int(counts.get(reason, 0))
             if current > int(self._last_drop_counts.get(reason, 0)):
                 self.recovery_streak = 0
+                resets.append(reason)
+        # ``stale_before_predicted`` has no GAN result at all: it deliberately
+        # avoided a provider call.  It must not erase already observed fresh
+        # recovery outputs, or the predictive latest-only policy could make
+        # the three-good-output recovery target impossible to reach.
         for key, value in counts.items():
             self._last_drop_counts[key] = int(value)
+        return tuple(resets)
 
     def _hard_return_event(self, now: float, worker_snapshot: dict) -> Optional[dict]:
         sequence = worker_snapshot.get("last_finished_sequence")
@@ -846,6 +860,29 @@ class GanFallbackController:
             "HARD_STALL_MS": self.hard_stall_ms,
         }
 
+    def _recovery_freshness(
+        self,
+        sequence: int,
+        latest_sequence: Optional[int],
+        output_age_ms: float,
+    ) -> Tuple[bool, Optional[int], Optional[str]]:
+        """Separate recovery evidence from whether an output can be painted.
+
+        A one-frame lag may be safe evidence that CUDA has recovered, even if
+        a newer live Lanczos frame has already reached the display.  The
+        presentation rule is deliberately evaluated separately below.
+        """
+        lag = None if latest_sequence is None else int(latest_sequence) - sequence
+        if output_age_ms > self.output_budget_ms:
+            return False, lag, "RECOVERY_TOO_OLD"
+        if lag is None:
+            return False, lag, "RECOVERY_SEQUENCE_UNKNOWN"
+        if lag < 0:
+            return False, lag, "RECOVERY_SEQUENCE_FUTURE"
+        if lag > self.recovery_max_sequence_lag:
+            return False, lag, "RECOVERY_SEQUENCE_OLD"
+        return True, lag, None
+
     def update(
         self,
         now: float,
@@ -862,8 +899,14 @@ class GanFallbackController:
         running_age_ms = max(0.0, float(worker_snapshot.get("running_age_ms", 0.0)))
         self.current_run_age_ms = running_age_ms
         self.max_run_age_ms = max(self.max_run_age_ms, running_age_ms)
-        self._reset_recovery_on_worker_drops(worker_snapshot)
+        worker_drop_resets = self._reset_recovery_on_worker_drops(worker_snapshot)
         events = []
+        if worker_drop_resets and self.fallback_active:
+            events.append({
+                "TYPE": "GAN_RECOVERY_RESET",
+                "REASON": "WORKER_" + "+".join(worker_drop_resets).upper(),
+                "AT": now,
+            })
 
         return_event = self._hard_return_event(now, worker_snapshot)
         if return_event is not None:
@@ -906,22 +949,23 @@ class GanFallbackController:
                 output_age_ms = max(0.0, float(getattr(candidate, "total_pc_ms", 0.0)))
             self.last_output_age_ms = output_age_ms
             sequence = int(getattr(candidate, "source_sequence", -1))
-            lag = None if latest_sequence is None else int(latest_sequence) - sequence
-            too_old = (
-                lag is None or lag < 0 or
-                lag > self.recovery_max_sequence_lag or
-                output_age_ms > self.output_budget_ms
+            fresh_for_recovery, lag, freshness_reason = self._recovery_freshness(
+                sequence, latest_sequence, output_age_ms)
+            # Do not mistake a same-source GAN result for an old frame.  It
+            # may upgrade the currently displayed Lanczos version of exactly
+            # that source.  A strictly older source still cannot overwrite a
+            # newer fallback frame, but can remain recovery evidence if its
+            # lag is within the configured recovery allowance.
+            safe_to_present = (
+                self.fallback_displayed_sequence is None or
+                sequence >= self.fallback_displayed_sequence
             )
-            same_source_as_lanczos = (
-                self.fallback_displayed_sequence is not None and
-                sequence <= self.fallback_displayed_sequence
-            )
-            if too_old or same_source_as_lanczos:
+            if not fresh_for_recovery:
                 self.presentation_stale_drops += 1
                 if self.fallback_active:
                     self.recovery_stale_drops += 1
                     self.recovery_streak = 0
-                    reason = "RECOVERY_NOT_FRESH"
+                    reason = str(freshness_reason or "RECOVERY_NOT_FRESH")
                 else:
                     reason = "OUTPUT_TOO_OLD"
                 events.append({
@@ -933,6 +977,8 @@ class GanFallbackController:
                     "OUTPUT_AGE_MS": output_age_ms,
                     "EFFECTIVE_BUDGET_MS": self.output_budget_ms,
                     "MAX_SEQUENCE_LAG": self.recovery_max_sequence_lag,
+                    "FRESH_FOR_RECOVERY": False,
+                    "SAFE_TO_PRESENT": safe_to_present,
                 })
                 return GanControllerDecision(
                     GanAction.DISCARD_STALE_GAN, self.state, good_age_ms, running_age_ms,
@@ -945,6 +991,23 @@ class GanFallbackController:
             good_age_ms = max(0.0, (now - self.last_good_completed_at) * 1000.0)
             if self.fallback_active:
                 self.recovery_streak += 1
+                if not safe_to_present:
+                    # This result is still valid evidence that the provider
+                    # caught up (for example lag=1), but a newer Lanczos source
+                    # is already visible and must remain immutable.
+                    self.presentation_stale_drops += 1
+                    events.append({
+                        "TYPE": "GAN_PRESENTATION_DROP",
+                        "REASON": "PRESENTATION_SEQUENCE_OLD",
+                        "SEQ": sequence,
+                        "AT": now,
+                        "SEQUENCE_LAG": lag,
+                        "OUTPUT_AGE_MS": output_age_ms,
+                        "EFFECTIVE_BUDGET_MS": self.output_budget_ms,
+                        "MAX_SEQUENCE_LAG": self.recovery_max_sequence_lag,
+                        "FRESH_FOR_RECOVERY": True,
+                        "SAFE_TO_PRESENT": False,
+                    })
                 if self.recovery_streak >= self.recovery_good_frames:
                     previous = self.state
                     fallback_duration_ms = (
@@ -955,22 +1018,27 @@ class GanFallbackController:
                     self.state = self.HEALTHY
                     self.fallback_started_at = None
                     self.fallback_displayed_sequence = None
+                    completed_recovery_streak = self.recovery_streak
+                    self.recovery_streak = 0
                     events.append({
                         "TYPE": "GAN_STATE",
                         "STATE": "RECOVERED",
                         "PREVIOUS_STATE": previous,
                         "AT": now,
-                        "RECOVERY_STREAK": self.recovery_streak,
+                        "RECOVERY_STREAK": completed_recovery_streak,
                         "GOOD_AGE_MS": good_age_ms,
                         "FALLBACK_DURATION_MS": fallback_duration_ms,
+                        "FALLBACK_ACTIVE": False,
                     })
                     return GanControllerDecision(
-                        GanAction.ACCEPT_GAN, self.state, good_age_ms,
+                        (GanAction.ACCEPT_GAN if safe_to_present else GanAction.KEEP_GAN),
+                        self.state, good_age_ms,
                         running_age_ms, soft_threshold_ms, output_age_ms,
                         self.recovery_streak, tuple(events),
                     )
                 return GanControllerDecision(
-                    GanAction.KEEP_GAN, self.state, good_age_ms, running_age_ms,
+                    (GanAction.ACCEPT_GAN if safe_to_present else GanAction.KEEP_GAN),
+                    self.state, good_age_ms, running_age_ms,
                     soft_threshold_ms, output_age_ms, self.recovery_streak,
                     tuple(events),
                 )
@@ -1635,6 +1703,14 @@ def main() -> int:
                     worker_snapshot=worker_values,
                     candidate=newest_output,
                 )
+                fallback_entered_this_tick = any(
+                    event.get("TYPE") == "GAN_STATE" and
+                    event.get("STATE") in (
+                        GanFallbackController.SOFT_FALLBACK,
+                        GanFallbackController.HARD_STALLED,
+                    )
+                    for event in decision.events
+                )
                 for event in decision.events:
                     worker.debug_event(event)
                     event_type = event.get("TYPE")
@@ -1681,12 +1757,14 @@ def main() -> int:
                     gan_display_fallback = False
 
                 # Once fallback is active, every newly decoded source frame is
-                # painted through the live Lanczos path.  It never waits for
-                # the provider call and never reuses an old GAN canvas.
+                # painted through the live Lanczos path.  A fresh, safe GAN
+                # result may upgrade the same source frame while recovery is
+                # still collecting its required consecutive samples; retain it
+                # until a newer decoded source needs the live fallback.
                 if gan_controller.fallback_active and frame is not None and source_sequence is not None:
-                    if (current_source_sequence is None or
+                    if (current_canvas is None or
                             source_sequence != current_source_sequence or
-                            not gan_display_fallback):
+                            fallback_entered_this_tick):
                         current_canvas = gan_lanczos_fallback(frame, args.rotate)
                         current_updated = updated
                         current_source_sequence = source_sequence
@@ -1978,6 +2056,7 @@ def main() -> int:
                     f"QUEUE RUN{int(gan_values['running'])} PEND{int(gan_values['pending'])}",
                     f"DROP REPL {drop_counts['replaced_pending']} OUT {drop_counts['output_replaced']} "
                     f"PRE {drop_counts['stale_before_infer']} "
+                    f"PRED {drop_counts['stale_before_predicted']} "
                     f"POST {drop_counts['stale_after_infer']} ERR {drop_counts['inference_error']}",
                     f"PRESENT OLD {gan_controller_values.get('presentation_stale_drops', 0)}",
                     f"P/I {values['p_fps']:.1f}/{values['i_fps']:.1f}  "

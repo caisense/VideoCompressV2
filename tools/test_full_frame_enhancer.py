@@ -35,6 +35,23 @@ class SlowFakeEnhancer:
         return np.zeros((360, 640, 3), dtype=np.uint8)
 
 
+class CountingFakeEnhancer(SlowFakeEnhancer):
+    def __init__(self, delay: float = 0.02) -> None:
+        super().__init__(delay)
+        self._calls = 0
+        self._calls_lock = threading.Lock()
+
+    @property
+    def calls(self) -> int:
+        with self._calls_lock:
+            return self._calls
+
+    def enhance(self, frame: np.ndarray) -> np.ndarray:
+        with self._calls_lock:
+            self._calls += 1
+        return super().enhance(frame)
+
+
 class DiagnosticFakeEnhancer(SlowFakeEnhancer):
     def enhance_with_diagnostics(self, frame: np.ndarray):
         self.started.set()
@@ -168,6 +185,29 @@ class FullFrameEnhancerTests(unittest.TestCase):
         self.assertEqual(records[0]["POSTPROCESS_MODE"], "ZERO_TO_ONE")
         self.assertEqual(records[0]["RAW_MIN"], -0.01)
         self.assertEqual(records[0]["CLIP_HIGH_COUNT"], 3)
+
+    def test_stale_after_infer_debug_keeps_diagnostics_serializable(self) -> None:
+        """A diagnostic stale result remains a stale result, not worker error."""
+        frame = np.zeros((144, 256, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "gan.jsonl"
+            worker = LatestOnlyEnhancerWorker(
+                DiagnosticFakeEnhancer(0.03), max_latency_ms=5, debug_log=log
+            )
+            try:
+                self.assertTrue(worker.submit(frame, 124, input_fps=8.0))
+                self.assertTrue(wait_for(
+                    lambda: worker.snapshot()["stale_after_infer"] >= 1))
+                values = worker.snapshot()
+            finally:
+                worker.stop()
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(values["inference_errors"], 0)
+        self.assertEqual(values["stale_after_infer"], 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["DROP_REASON"], "stale_after_infer")
+        self.assertEqual(records[0]["POSTPROCESS_MODE"], "ZERO_TO_ONE")
+        self.assertEqual(records[0]["PREDICTED_INFER_MS"], 0.0)
 
     def test_latest_only_keeps_one_running_plus_latest_pending(self) -> None:
         fake = SlowFakeEnhancer(0.04)
@@ -314,6 +354,83 @@ class FullFrameEnhancerTests(unittest.TestCase):
             self.assertGreater(values["all_total_max_ms"], 0.0)
             self.assertGreater(values["last_finished_total_ms"], 0.0)
             self.assertFalse(values["last_finished_accepted"])
+        finally:
+            worker.stop()
+
+    def test_predicted_stale_before_skips_provider_and_worker_catches_up(self) -> None:
+        """Use recent provider p95 to skip a doomed queued frame, not the latest one."""
+        fake = CountingFakeEnhancer(0.09)
+        budget = 143.75
+        worker = LatestOnlyEnhancerWorker(fake, max_latency_ms=budget)
+        frame = np.zeros((144, 256, 3), dtype=np.uint8)
+        try:
+            # Establish the bounded provider-only history.  Prediction remains
+            # disabled before this warmup, avoiding startup false positives.
+            for sequence in range(1, 9):
+                self.assertTrue(worker.submit(frame, sequence, input_fps=8.0))
+                self.assertTrue(wait_for(
+                    lambda sequence=sequence: worker.snapshot()["completed"] >= sequence))
+                self.assertIsNotNone(worker.poll_output())
+            warmed = worker.snapshot()
+            self.assertEqual(warmed["recent_infer_samples"], 8)
+            self.assertGreater(warmed["recent_infer_p95_ms"], 70.0)
+            self.assertLess(warmed["recent_infer_p95_ms"], 120.0)
+
+            calls_before = fake.calls
+            # queue_wait ~= 10 ms + p95 ~= 90 ms stays within 143.75 ms.
+            self.assertTrue(worker.submit(
+                frame, 10, arrived_at=time.monotonic() - 0.010, input_fps=8.0))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] >= 9))
+            self.assertEqual(fake.calls, calls_before + 1)
+            self.assertIsNotNone(worker.poll_output())
+
+            calls_before_predicted_drop = fake.calls
+            # queue_wait ~= 70 ms + p95 ~= 90 ms cannot meet the budget.  The
+            # worker must skip session/enhance and immediately remain usable.
+            self.assertTrue(worker.submit(
+                frame, 11, arrived_at=time.monotonic() - 0.070, input_fps=8.0))
+            self.assertTrue(wait_for(
+                lambda: worker.snapshot()["stale_before_predicted"] >= 1))
+            self.assertEqual(fake.calls, calls_before_predicted_drop)
+            dropped = worker.snapshot()
+            self.assertEqual(dropped["drop_reason_counts"]["stale_before_predicted"], 1)
+            self.assertLessEqual(int(dropped["running"]) + int(dropped["pending"]), 2)
+
+            # A current frame still runs after the skipped item; prediction
+            # cannot deadlock the latest-only worker.
+            self.assertTrue(worker.submit(frame, 12, input_fps=8.0))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] >= 10))
+            self.assertEqual(fake.calls, calls_before_predicted_drop + 1)
+        finally:
+            worker.stop()
+
+    def test_prediction_probe_prevents_high_p95_from_self_locking(self) -> None:
+        """A high p95 can skip queued work but cannot freeze sampling."""
+        fake = CountingFakeEnhancer(0.001)
+        worker = LatestOnlyEnhancerWorker(fake, max_latency_ms=100)
+        frame = np.zeros((144, 256, 3), dtype=np.uint8)
+        try:
+            with worker.condition:
+                worker.recent_infer_latencies.extend([150.0] * 8)
+                # Mimic a just-completed slow call.  The immediate queued
+                # candidate is skipped before a refresh probe is allowed.
+                worker.last_prediction_probe_at = time.monotonic()
+            self.assertTrue(worker.submit(
+                frame, 31, arrived_at=time.monotonic() - 0.010, input_fps=8.0))
+            self.assertTrue(wait_for(
+                lambda: worker.snapshot()["stale_before_predicted"] == 1))
+            self.assertEqual(fake.calls, 0)
+
+            # A current frame after the 250 ms probe interval runs despite
+            # the old p95, so the bounded history can eventually age it out.
+            with worker.condition:
+                worker.last_prediction_probe_at = time.monotonic() - 0.251
+            self.assertTrue(worker.submit(frame, 32, input_fps=8.0))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] == 1))
+            values = worker.snapshot()
+            self.assertEqual(fake.calls, 1)
+            self.assertEqual(values["prediction_probe_runs"], 1)
+            self.assertEqual(values["recent_infer_samples"], 9)
         finally:
             worker.stop()
 

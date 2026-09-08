@@ -1,0 +1,543 @@
+/goal
+
+修复 VideoCompressV2 PC 端 GAN fallback 恢复死锁，并优化 GAN 超时后的 latest-only 追帧策略。
+
+本目标基于 esrgan8.jsonl 实测：
+- 8fps
+- frame period = 125ms
+- effective budget = 143.75ms
+- soft fallback threshold = 250ms
+- 正常 ESRGAN CUDA inference 约 80~95ms
+- 偶发 150~170ms spike 会触发 stale_after_infer
+- fallback 后 GPU 很快恢复到正常 80~100ms
+- 但当前 recovery 仍持续输出 RECOVERY_NOT_FRESH
+- 多次测试均出现 SOFT_FALLBACK 后 RECOVERIES=0
+- HARD_STALLS=0
+
+不要通过单纯增大 latency budget 掩盖问题。
+
+==================================================
+1. 修复 SOFT_FALLBACK recovery deadlock
+==================================================
+
+检查 tools/live_h265_hud.py 中 GanFallbackController 的恢复判断。
+
+当前逻辑存在类似：
+
+same_source_as_lanczos =
+    fallback_displayed_sequence is not None
+    and sequence <= fallback_displayed_sequence
+
+该逻辑会导致：
+
+1. fallback 状态下 decoded frame N 立即显示 Lanczos
+2. fallback_displayed_sequence = N
+3. GAN(N) 约 80~100ms 后完成
+4. sequence == fallback_displayed_sequence
+5. 被判定 RECOVERY_NOT_FRESH
+6. recovery_streak 清零
+7. 下一帧重复同样过程
+8. 永远无法满足连续 fresh outputs 的恢复条件
+
+修复要求：
+
+A. 不得把“同一 source frame 的 GAN 结果”当作旧帧。
+
+最小修复原则：
+
+sequence < fallback_displayed_sequence
+    => 旧于当前 Lanczos，不能显示
+
+sequence == fallback_displayed_sequence
+    => 同一 source frame，可作为有效 recovery sample，
+       并允许 GAN 替换该帧的 Lanczos
+
+sequence > fallback_displayed_sequence
+    => 正常新鲜 GAN frame
+
+不要继续使用：
+
+sequence <= fallback_displayed_sequence
+
+作为统一拒绝条件。
+
+==================================================
+2. 分离 recovery freshness 和 presentation safety
+==================================================
+
+不要再用一个条件同时决定：
+
+- GAN 是否证明 worker 已恢复
+- GAN 是否允许覆盖当前显示画面
+
+拆成两个概念：
+
+fresh_for_recovery：
+
+- output_age_ms <= effective_budget_ms
+- 0 <= sequence_lag <= recovery_max_sequence_lag
+- worker 未发生 inference_error
+- 结果未 stale_before/stale_after
+
+safe_to_present：
+
+- GAN sequence >= 当前已显示的 Lanczos source sequence
+
+示意：
+
+fresh_for_recovery = (
+    output_age_ms <= budget
+    and 0 <= sequence_lag <= max_lag
+)
+
+safe_to_present = (
+    fallback_displayed_sequence is None
+    or sequence >= fallback_displayed_sequence
+)
+
+行为：
+
+if fresh_for_recovery:
+    recovery_streak += 1
+else:
+    recovery_streak = 0
+
+只有 safe_to_present 时才允许 GAN 实际覆盖画面。
+
+这样：
+
+- lag=1 的 GAN 可以作为“GPU 已恢复”的证据
+- 但不能用旧帧覆盖更新的 Lanczos
+- sequence 相同的 GAN 可以把该帧从 Lanczos 升级为 GAN
+
+==================================================
+3. 保持现有 recovery-good-frames 机制
+==================================================
+
+保留当前连续 fresh output 才恢复的设计。
+
+例如默认仍要求：
+
+recovery_good_frames = 3
+
+当连续达到条件：
+
+fresh output #1
+fresh output #2
+fresh output #3
+
+则：
+
+SOFT_FALLBACK
+    ->
+HEALTHY
+
+并记录：
+
+GAN_STATE = RECOVERED
+
+恢复时必须：
+
+- FALLBACK_ACTIVE=false
+- recovery_streak 清零
+- 不重建整个 HUD
+- 不重启 decoder
+- 不重建 ORT session，除非现有代码本来要求
+
+==================================================
+4. 修复 RECOVERY_NOT_FRESH 日志语义
+==================================================
+
+当前日志中大量：
+
+REASON=RECOVERY_NOT_FRESH
+
+但实际：
+
+- sequence_lag = 0
+- output_age 约 90~100ms
+- budget = 143.75ms
+
+这些结果本身是 fresh 的。
+
+修改后：
+
+只有真正满足以下情况才记录 RECOVERY_NOT_FRESH：
+
+- output_age > budget
+或
+- sequence_lag > allowed lag
+或
+- sequence 已严格旧于当前 presentation frame
+或
+- generation/profile 不匹配
+
+不要因为：
+
+sequence == fallback_displayed_sequence
+
+记录 RECOVERY_NOT_FRESH。
+
+建议把不同原因进一步拆分，例如：
+
+RECOVERY_TOO_OLD
+RECOVERY_SEQUENCE_OLD
+RECOVERY_GENERATION_MISMATCH
+
+便于以后诊断。
+
+==================================================
+5. 保持 latest-only worker，不建立 FIFO backlog
+==================================================
+
+继续保持当前：
+
+1 running
++
+1 replaceable pending
++
+1 unconsumed output
+
+禁止改成长 FIFO queue。
+
+新 decoded frame 到来时：
+
+- GPU busy
+- 如果已有 pending
+- 新 frame 替换旧 pending
+- 旧 pending 记录 replaced_pending
+
+目标是始终追最新 source frame，而不是保证每帧都增强。
+
+==================================================
+6. 增加预测性 stale-before 丢帧
+==================================================
+
+当前只有：
+
+queue_wait_ms > max_latency_ms
+
+才 stale_before_infer。
+
+这会导致某些实际上已经注定超时的帧仍进入 GPU。
+
+日志例：
+
+queue_wait ≈ 70.9ms
+正常 inference ≈ 88~95ms
+budget = 143.75ms
+
+即：
+
+70.9 + 90 ≈ 161ms > 143.75ms
+
+该帧实际最终：
+TOTAL ≈158.9ms
+stale_after_infer
+
+属于浪费 GPU 时间。
+
+增加预测性判断：
+
+predicted_total_ms =
+    queue_wait_ms + recent_infer_estimate_ms
+
+如果：
+
+predicted_total_ms > effective_budget_ms
+
+则：
+
+- 不进入 GPU
+- 直接 drop
+- reason = stale_before_predicted
+- 立即继续处理最新 pending
+
+==================================================
+7. inference 预测值设计
+==================================================
+
+不要使用固定 90ms。
+
+维护最近一段成功 inference 的滑动统计。
+
+建议：
+
+recent_infer_p50
+recent_infer_p95
+
+默认使用：
+
+recent_infer_p95
+
+作为预测值。
+
+样本不足时：
+
+- 不启用 predicted drop
+或
+- 使用保守的 recent average
+
+避免启动阶段误杀。
+
+不要让单次 170ms spike 长时间污染预测。
+
+建议：
+- 有界 deque
+- 例如最近 30~60 个成功样本
+- 统计只使用正常返回的 inference
+- 不把 queue wait 算进 INFER estimate
+
+==================================================
+8. 不要“一次超时就清空所有帧”
+==================================================
+
+当前没有长 FIFO 队列，因此不要实现：
+
+timeout
+-> clear entire queue
+-> pause GAN
+
+正确行为：
+
+running frame：
+- 已进入 GPU，不能简单取消
+- 完成后若 stale，则丢弃结果
+
+pending：
+- 始终只留最新
+- 必要时允许 predicted stale-before 直接跳过
+
+fallback 状态下：
+- 仍持续向 GAN worker 提交最新 decoded frame
+- 否则没有 fresh GAN output 可用于 recovery
+
+==================================================
+9. spike 后快速 catch-up
+==================================================
+
+目标行为：
+
+正常：
+
+frame N
+INFER ≈90ms
+-> 输出
+
+偶发 spike：
+
+frame N
+INFER=170ms
+-> stale_after_infer
+
+下一帧如果预计：
+
+queue_wait + infer_p95 > budget
+
+则：
+
+-> stale_before_predicted
+-> 不浪费一次完整 GAN inference
+-> 尽快跳到最新 frame
+
+最终应在数帧内重新获得：
+
+queue≈0
+INFER≈正常
+TOTAL<budget
+
+并进入 recovery streak。
+
+==================================================
+10. 不修改这些部分
+==================================================
+
+本目标禁止修改：
+
+- RealESRGAN 模型
+- ONNX Runtime provider
+- CUDA provider
+- GAN input/output resolution
+- H.265 编码
+- RTP
+- CAP/物理限速
+- YOLO/ROI
+- RatePacer
+- decoder
+- source fps
+- effective budget 默认计算公式
+- soft fallback threshold 默认公式
+- hard stall threshold
+
+先修状态机 bug，不用放宽阈值规避问题。
+
+==================================================
+11. 自动测试
+==================================================
+
+补充 recovery state-machine 单元测试。
+
+Case A：同一 source frame 可以恢复
+
+fallback_displayed_sequence = 100
+
+GAN result：
+sequence = 100
+lag = 0
+age < budget
+
+期望：
+
+- 不得 RECOVERY_NOT_FRESH
+- recovery_streak +1
+- safe_to_present=true
+
+Case B：真正旧帧禁止覆盖
+
+fallback_displayed_sequence = 100
+
+GAN：
+sequence = 99
+
+期望：
+
+- 不允许 presentation
+- 不得覆盖 frame100 的 Lanczos
+
+Case C：新帧正常
+
+fallback_displayed_sequence = 100
+GAN sequence=101
+age<budget
+
+期望：
+
+- recovery_streak +1
+- 可 presentation
+
+Case D：连续3个 fresh result
+
+期望：
+
+SOFT_FALLBACK -> HEALTHY
+RECOVERIES += 1
+
+Case E：中途 stale
+
+fresh
+fresh
+stale
+fresh
+
+期望：
+
+stale 时 recovery_streak 清零。
+
+==================================================
+12. predicted drop 测试
+==================================================
+
+budget=143.75ms
+recent infer p95=90ms
+
+Case：
+
+queue_wait=10
+10+90 <143.75
+-> 允许 inference
+
+queue_wait=70
+70+90 >143.75
+-> stale_before_predicted
+-> 不执行 session.run
+
+确认：
+
+- GPU inference call count 不增加
+- pending 仍可以被最新帧替换
+- worker 不死锁
+
+==================================================
+13. 使用 esrgan8.jsonl 场景回归
+==================================================
+
+构造/重放类似实测序列：
+
+正常阶段：
+INFER 80~95ms
+
+突然：
+INFER 170ms
+
+后续：
+queue 48ms + infer147ms
+queue 70ms + infer88ms
+
+然后恢复：
+INFER 85~95ms
+queue≈0
+
+期望：
+
+- 可以进入一次 SOFT_FALLBACK
+- 不应进入 HARD_STALL
+- GPU恢复正常后应出现 RECOVERED
+- 不再持续几十秒 RECOVERY_NOT_FRESH
+- RECOVERIES >= 1
+- fallback duration 应明显缩短
+- 正常 fresh GAN output 恢复显示
+
+==================================================
+14. 实机验收
+==================================================
+
+使用与问题复现一致配置：
+
+CAP=60
+FPS=8
+CUDAExecutionProvider
+AUTO budget=143.75ms
+
+连续运行至少10分钟。
+
+记录：
+
+- INFER p50/p95/p99/max
+- TOTAL_PC p50/p95/p99
+- queue wait
+- replaced_pending
+- stale_before
+- stale_before_predicted
+- stale_after
+- RECOVERY_NOT_FRESH
+- SOFT_FALLBACK entries
+- RECOVERIES
+- HARD_STALLS
+- fallback duration
+
+验收重点：
+
+1. 偶发 inference spike 可以触发 fallback，这是允许的。
+2. GPU恢复到约80~100ms后，必须可以自动恢复GAN。
+3. 不允许再出现：
+   大量正常 lag=0、age<budget 的结果持续
+   RECOVERY_NOT_FRESH。
+4. SOFT_FALLBACK 后不能永久锁死。
+5. 不产生无界队列。
+6. 不因 predicted drop 导致 GAN 永久无结果。
+7. 正常运行性能不能明显下降。
+
+==================================================
+15. 输出
+==================================================
+
+完成后给出：
+
+- 根因说明
+- 修改文件列表
+- recovery state-machine 修改点
+- predicted stale-before 修改点
+- 新增测试
+- 测试结果
+- 10分钟实机结果
+- 修复前后 RECOVERIES / fallback duration 对比

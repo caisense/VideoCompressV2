@@ -442,11 +442,22 @@ class FullFrameEnhancer:
 class LatestOnlyEnhancerWorker:
     """One running item plus one replaceable pending item.
 
-    A frame that is too old before or after inference is dropped.  The worker
-    never queues an unbounded backlog and stores at most one unconsumed output,
-    so display latency remains bounded even when the model is slower than the
-    encoded source cadence.
+    A frame that is too old before or after inference is dropped.  Once enough
+    successful provider calls have been observed, a pending frame that is
+    predicted to miss its latency budget is also dropped before it enters the
+    provider.  The worker never queues an unbounded backlog and stores at most
+    one unconsumed output, so display latency remains bounded even when the
+    model is slower than the encoded source cadence.
     """
+
+    # A one-off CUDA/ORT spike must age out quickly, while the window is still
+    # large enough for the p95 estimate to represent normal model latency.
+    RECENT_INFER_SAMPLE_LIMIT = 60
+    PREDICTION_MIN_SAMPLES = 8
+    PREDICTION_PERCENTILE = 95.0
+    # A transient high p95 must not make prediction suppress all future
+    # samples; one rate-limited call lets the bounded estimate refresh.
+    PREDICTION_PROBE_INTERVAL_MS = 250.0
 
     def __init__(
         self,
@@ -484,6 +495,9 @@ class LatestOnlyEnhancerWorker:
         self.dropped = 0
         self.replaced_pending = 0
         self.stale_before_infer = 0
+        self.stale_before_predicted = 0
+        self.prediction_probe_runs = 0
+        self.last_prediction_probe_at = 0.0
         self.stale_after_infer = 0
         self.inference_errors = 0
         self.output_replaced = 0
@@ -491,6 +505,10 @@ class LatestOnlyEnhancerWorker:
         self.all_total_latencies: Deque[float] = collections.deque(maxlen=2000)
         self.queue_waits: Deque[float] = collections.deque(maxlen=2000)
         self.infer_latencies: Deque[float] = collections.deque(maxlen=2000)
+        # Provider-only samples: queue time is deliberately excluded so this
+        # remains a predictor of the next session.run/enhance call.
+        self.recent_infer_latencies: Deque[float] = collections.deque(
+            maxlen=self.RECENT_INFER_SAMPLE_LIMIT)
         self.completion_times: Deque[float] = collections.deque()
         self.last_output: Optional[EnhancementOutput] = None
         self.last_finished_infer_ms = 0.0
@@ -516,6 +534,8 @@ class LatestOnlyEnhancerWorker:
                infer_end: Optional[float] = None,
                infer_returned: bool = False,
                dropped: bool = False, drop_reason: str = "",
+               predicted_infer_ms: float = 0.0,
+               predicted_total_ms: float = 0.0,
                output_ready: Optional[bool] = None,
                diagnostics: Optional[EnhancementDiagnostics] = None) -> None:
         if self.debug_handle is None:
@@ -537,6 +557,8 @@ class LatestOnlyEnhancerWorker:
             "QUEUE_WAIT": queue_wait_ms,
             "INFER_MS": infer_ms,
             "TOTAL_PC_MS": total_pc_ms,
+            "PREDICTED_INFER_MS": predicted_infer_ms,
+            "PREDICTED_TOTAL_MS": predicted_total_ms,
             "OUTPUT_AGE_MS": total_pc_ms if infer_returned else None,
             "INFER_START": infer_start,
             "INFER_END": infer_end,
@@ -574,6 +596,8 @@ class LatestOnlyEnhancerWorker:
             self.replaced_pending += 1
         elif reason == "stale_before_infer":
             self.stale_before_infer += 1
+        elif reason == "stale_before_predicted":
+            self.stale_before_predicted += 1
         elif reason == "stale_after_infer":
             self.stale_after_infer += 1
         elif reason == "inference_error":
@@ -635,14 +659,24 @@ class LatestOnlyEnhancerWorker:
               infer_start: Optional[float] = None,
               infer_end: Optional[float] = None,
               infer_returned: bool = False,
+              predicted_infer_ms: float = 0.0,
+              predicted_total_ms: float = 0.0,
               diagnostics: Optional[EnhancementDiagnostics] = None) -> None:
         with self.lock:
             self._mark_drop_locked(reason, item.source_sequence)
         self._debug(item, queue_wait_ms=queue_wait_ms, infer_ms=infer_ms,
                     total_pc_ms=total_pc_ms, infer_start=infer_start,
                     infer_end=infer_end, infer_returned=infer_returned,
+                    predicted_infer_ms=predicted_infer_ms,
+                    predicted_total_ms=predicted_total_ms,
                     dropped=True, drop_reason=reason, output_ready=False,
                     diagnostics=diagnostics)
+
+    def _recent_infer_p95_locked(self) -> Optional[float]:
+        """Return a bounded provider-only estimate, or defer during warmup."""
+        if len(self.recent_infer_latencies) < self.PREDICTION_MIN_SAMPLES:
+            return None
+        return _percentile(self.recent_infer_latencies, self.PREDICTION_PERCENTILE)
 
     def _run(self) -> None:
         while True:
@@ -659,6 +693,7 @@ class LatestOnlyEnhancerWorker:
                 self.running = True
                 self.running_started_at = started
                 self.running_sequence = item.source_sequence
+                predicted_infer_ms = self._recent_infer_p95_locked()
             queue_wait_ms = (started - item.arrived_at) * 1000.0
             if queue_wait_ms > self.max_latency_ms:
                 self._drop(item, "stale_before_infer", queue_wait_ms=queue_wait_ms)
@@ -668,6 +703,35 @@ class LatestOnlyEnhancerWorker:
                     self.running_sequence = None
                     self.condition.notify_all()
                 continue
+            predicted_total_ms = (
+                0.0 if predicted_infer_ms is None else
+                queue_wait_ms + predicted_infer_ms
+            )
+            if (predicted_infer_ms is not None and
+                    predicted_total_ms > self.max_latency_ms):
+                with self.condition:
+                    probe_due = (
+                        started - self.last_prediction_probe_at >=
+                        self.PREDICTION_PROBE_INTERVAL_MS / 1000.0
+                    )
+                    if probe_due:
+                        # Otherwise a p95 above the budget could cause every
+                        # later frame to be dropped, so its finite history
+                        # would never receive a newer provider sample.
+                        self.prediction_probe_runs += 1
+                        self.last_prediction_probe_at = started
+                if not probe_due:
+                    self._drop(
+                        item, "stale_before_predicted", queue_wait_ms=queue_wait_ms,
+                        predicted_infer_ms=predicted_infer_ms,
+                        predicted_total_ms=predicted_total_ms,
+                    )
+                    with self.condition:
+                        self.running = False
+                        self.running_started_at = None
+                        self.running_sequence = None
+                        self.condition.notify_all()
+                    continue
             infer_started = time.perf_counter()
             infer_start = time.monotonic()
             diagnostics = None
@@ -684,6 +748,8 @@ class LatestOnlyEnhancerWorker:
                 with self.condition:
                     self.inference_completed += 1
                     self.infer_latencies.append(infer_ms)
+                    self.recent_infer_latencies.append(infer_ms)
+                    self.last_prediction_probe_at = completed_at
                     self.all_total_latencies.append(total_pc_ms)
                     self.last_finished_infer_ms = infer_ms
                     self.last_finished_total_ms = total_pc_ms
@@ -692,9 +758,15 @@ class LatestOnlyEnhancerWorker:
                     self.last_finished_drop_reason = ""
                     self.last_finished_at = completed_at
                 if total_pc_ms > self.max_latency_ms:
-                    self._drop(item, "stale_after_infer", queue_wait_ms,
-                               infer_ms, total_pc_ms, infer_start, infer_end, True,
-                               diagnostics)
+                    # Keep diagnostics named: prediction fields were added
+                    # before it in _drop(), and passing this positionally would
+                    # otherwise try to JSON-encode the diagnostics object as a
+                    # predicted latency value.
+                    self._drop(
+                        item, "stale_after_infer", queue_wait_ms, infer_ms,
+                        total_pc_ms, infer_start, infer_end, True,
+                        diagnostics=diagnostics,
+                    )
                     with self.condition:
                         self.last_finished_drop_reason = "stale_after_infer"
                 else:
@@ -770,6 +842,7 @@ class LatestOnlyEnhancerWorker:
             drop_reason_counts = {
                 "replaced_pending": self.replaced_pending,
                 "stale_before_infer": self.stale_before_infer,
+                "stale_before_predicted": self.stale_before_predicted,
                 "stale_after_infer": self.stale_after_infer,
                 "inference_error": self.inference_errors,
                 "output_replaced": self.output_replaced,
@@ -785,6 +858,8 @@ class LatestOnlyEnhancerWorker:
                                   if self.submitted else 0.0),
                 "replaced_pending": self.replaced_pending,
                 "stale_before_infer": self.stale_before_infer,
+                "stale_before_predicted": self.stale_before_predicted,
+                "prediction_probe_runs": self.prediction_probe_runs,
                 "stale_after_infer": self.stale_after_infer,
                 "inference_errors": self.inference_errors,
                 "output_replaced": self.output_replaced,
@@ -800,6 +875,12 @@ class LatestOnlyEnhancerWorker:
                 "infer_all_p95_ms": _percentile(self.infer_latencies, 95),
                 "infer_all_p99_ms": _percentile(self.infer_latencies, 99),
                 "infer_all_max_ms": max(self.infer_latencies, default=0.0),
+                "recent_infer_samples": len(self.recent_infer_latencies),
+                "recent_infer_p50_ms": _percentile(self.recent_infer_latencies, 50),
+                "recent_infer_p95_ms": _percentile(
+                    self.recent_infer_latencies, self.PREDICTION_PERCENTILE),
+                "prediction_infer_ms": (
+                    self._recent_infer_p95_locked() or 0.0),
                 "all_total_p50_ms": _percentile(self.all_total_latencies, 50),
                 "all_total_p95_ms": _percentile(self.all_total_latencies, 95),
                 "all_total_p99_ms": _percentile(self.all_total_latencies, 99),

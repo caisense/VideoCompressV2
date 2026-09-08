@@ -95,12 +95,16 @@ CAP 120/150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 out
 `tools/full_frame_enhancer.py` owns the three full-frame backends. Its worker has
 one running item and one replaceable pending item, copies decoded input before
 background processing, drops stale results, and records queue/inference/total
-latency, completed/dropped counts, and provider. HUD/worker telemetry exposes
-rolling 1/5/10-second rates, while the optional JSONL debug log records the
-per-source-frame fields needed to reproduce those rates. The source H.265 frame is never modified. The
-`--gan-inference-fps` value may be lower than the source fps; the latest ROI/QP
-map is reused on the board, while the PC enhancer still receives the live full
-frame cadence.
+latency, completed/dropped counts, and provider. After eight successful
+provider calls it also uses a bounded recent-inference p95 (60 samples) to skip
+a pending frame predicted to miss its budget. If a transient high p95 would
+otherwise suppress every future call, one refresh probe is allowed at most once
+per 250 ms so the bounded history can recover; it never adds a FIFO backlog.
+HUD/worker telemetry exposes rolling 1/5/10-second rates, while the optional
+JSONL debug log records the per-source-frame fields needed to reproduce those
+rates. The source H.265 frame is never modified. The `--gan-inference-fps`
+value may be lower than the source fps; the latest ROI/QP map is reused on the
+board, while the PC enhancer still receives the live full frame cadence.
 
 A CUDA/ONNX call cannot be safely cancelled from the Python worker thread. The
 receiver therefore uses an FPS-aware output-age budget by default:
@@ -113,9 +117,11 @@ The HUD distinguishes `DEC AGE`, last accepted GAN `GOOD AGE`, current
 in-flight `RUN AGE`, and completed `OUTPUT AGE`. A missing fresh GAN result
 enters `SOFT-FALLBACK` and displays the newest decoded frame through Lanczos4;
 only `RUN AGE >= --gan-hard-stall-ms` (default 500 ms) is a hard stall. Recovery
-requires three fresh outputs by default and applies a one-frame sequence-lag
-gate, so an old GAN result cannot replace a source frame already displayed by
-the fallback. Decode and fallback stay live while the provider call runs.
+requires three fresh outputs by default. A GAN result from the same source frame
+may upgrade that frame's Lanczos display; a strictly older result never replaces
+a newer fallback frame, although a permitted one-frame lag can still prove that
+the worker recovered. Decode and fallback stay live while the provider call
+runs.
 
 Start the board and receiver as separate processes. Run the sender in the
 Linux shell on board `root@192.168.0.101`, and run the receiver in a separate
