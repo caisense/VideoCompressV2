@@ -1,0 +1,391 @@
+/goal
+
+基于当前 VideoCompressV2 main 最新代码，实现 GAN 模式 100/120/150 kbps 三档物理链路预算，并在 120/150 kbps 档提升发送端 H.265 分辨率到 320x180，使 Real-ESRGAN x2 原生输出 640x360。
+
+不要重复实现已经存在的 TARGET/RTP/WIRE/CAP HUD 语义修改。
+
+====================
+一、目标配置
+====================
+
+保持现有 100 kbps GAN 档完全兼容，同时新增 120/150 kbps GAN 档。
+
+建议默认映射：
+
+GAN 100:
+- source = 256x144
+- default fps = 10
+- H.265 target = 75 kbps
+- physical A/V cap = 100 kbps
+- max video target = 85 kbps
+- ESRGAN x2 native = 512x288
+- presentation = 640x360
+
+GAN 120:
+- source = 320x180
+- default fps = 8
+- H.265 target = 90 kbps
+- physical A/V cap = 120 kbps
+- max video target = 100 kbps
+- ESRGAN x2 native = 640x360
+- presentation = 640x360
+
+GAN 150:
+- source = 320x180
+- default fps = 10
+- H.265 target = 110 kbps
+- physical A/V cap = 150 kbps
+- max video target = 125 kbps
+- ESRGAN x2 native = 640x360
+- presentation = 640x360
+
+150 kbps 档作为推荐高质量档。
+
+====================
+二、发送端配置
+====================
+
+新增 GAN 专用参数：
+
+--gan-link-cap-kbps=100|120|150
+
+不要使用通用 --pacing-bitrate 绕过 GAN atomic profile。
+
+根据 gan-link-cap 自动设置 GAN source size：
+
+100 -> 256x144
+120 -> 320x180
+150 -> 320x180
+
+保留：
+
+--gan-fps=8|10|12
+--gan-video-bitrate-kbps=N
+
+用户显式指定 gan-video-bitrate-kbps 时允许覆盖默认 target，但必须按所选 CAP 校验：
+
+100 cap -> target <= 85
+120 cap -> target <= 100
+150 cap -> target <= 125
+
+默认 target：
+100 -> 75
+120 -> 90
+150 -> 110
+
+删除/重构目前 GAN 中这些硬编码：
+- width=256
+- height=144
+- pacing_bitrate_bps=100000
+- gan bitrate <=85
+- bitrate*1000 + 15000 <=100000
+
+改为由 GAN bandwidth preset 统一产生：
+width / height / default fps / target bitrate / max target / physical cap。
+
+不要改变 low/medium/high/rebuild 档。
+
+====================
+三、共享物理限速
+====================
+
+继续使用现有 RatePacer 和 Ethernet wire accounting。
+
+gan-link-cap 表示：
+视频 + 可选 Codec2 音频的共享物理 wire ceiling。
+
+不得把 120/150 kbps 当成单独的视频 payload 上限。
+
+继续沿用现有：
+physical cap
+ -> audio reserved wire budget
+ -> remaining video child budget
+
+不要修改：
+- RatePacer token bucket 原理
+- Ethernet wire bytes 计算公式
+- 音频 reserve 算法
+- async sender stale-frame/drop 恢复机制
+
+如果 audio=on，确保最终 A/V 仍受所选 100/120/150 kbps 总 cap 约束。
+
+====================
+四、RTP profile metadata
+====================
+
+当前 GAN RTP metadata 已包含：
+profile
+width
+height
+fps
+generation
+TARGET
+reserved 2 bytes
+
+将 TARGET 后现有的 2 个 reserved bytes 复用为：
+
+uint16 network-order link_cap_kbps
+
+不要扩大当前 GAN metadata 长度。
+
+兼容规则：
+
+- 新发送端：
+  TARGET + CAP 均发送
+- 当前/旧发送端：
+  reserved CAP=0 时，新接收端根据 GAN 旧协议 fallback 为 CAP=100
+- 更老的无 TARGET metadata：
+  TARGET 显示 --
+  CAP fallback 100
+
+非 GAN RTP profile record 保持原格式不变。
+
+====================
+五、PC HUD
+====================
+
+移除 GAN 接收端对固定：
+
+GAN_LINK_CAP_KBPS = 100
+
+的依赖。
+
+HUD 从 RTP metadata 获取真实 CAP。
+
+显示继续保持：
+
+TARGET 110  RTP xx.x  WIRE xx.x  CAP 150 kbps
+
+含义保持：
+TARGET = MPP H.265 target
+RTP    = 最近1秒 RTP/UDP payload
+WIRE   = Ethernet physical wire estimate
+CAP    = sender configured shared physical cap
+
+100/120/150 三档切换后 HUD 必须同步显示正确 CAP。
+
+====================
+六、GAN 尺寸动态化
+====================
+
+当前 PC GAN 路径不能再假设输入永远是 256x144。
+
+FullFrameEnhancer 根据 RTP profile 的 width/height 创建：
+
+input_size = (w, h)
+native_size = (w*2, h*2)
+output_size = (640, 360)
+
+因此：
+
+256x144
+ -> ESRGAN x2
+ -> 512x288
+ -> Lanczos4
+ -> 640x360
+
+320x180
+ -> ESRGAN x2
+ -> 640x360
+ -> 直接输出
+
+对于 320x180：
+禁止再执行一次无意义的 640x360 -> 640x360 resize。
+
+继续使用现有：
+RealESRGAN_x2_dynamic.onnx
+
+不要重新训练/替换 GAN 模型。
+
+验证模型确实接受：
+256x144
+320x180
+
+两个动态输入尺寸。
+
+====================
+七、profile generation / 切换
+====================
+
+如果运行时 GAN 档发生：
+256x144 <-> 320x180
+
+必须正确处理 generation change：
+
+1. 等待新 generation 的完整 IDR
+2. FFmpeg decoder 按新 SPS 尺寸重建
+3. 清空旧尺寸 decoded/GAN pending/output
+4. 关闭或重建旧 FullFrameEnhancer worker
+5. 按新 input/native size 初始化 enhancer
+6. 禁止旧 256x144 GAN result 覆盖新的 320x180 source frame
+7. 不重启整个 HUD 进程
+
+保持现有 latest-only/backpressure/sequence freshness 机制。
+
+====================
+八、性能保护
+====================
+
+320x180 的 GAN 推理量约为当前 256x144 的 1.56 倍。
+
+不得因为提高输入尺寸重新引入：
+- decoder blocking
+- GAN queue accumulation
+- stale result 覆盖新帧
+- HEALTHY/SOFT-FALLBACK 高频振荡
+
+继续保持：
+one running + one replaceable pending
+FPS-aware output latency budget
+hard stall
+recovery-good-frames
+sequence-lag gate
+
+120 kbps 默认使用 320x180 @8 fps。
+150 kbps 默认使用 320x180 @10 fps。
+
+12 fps 只作为实验配置保留，不将其设为 320x180 默认值。
+
+====================
+九、测试
+====================
+
+补充/修改自动测试：
+
+1. Config
+- cap100 -> 256x144 / target75
+- cap120 -> 320x180 / target90
+- cap150 -> 320x180 / target110
+- 非法 cap 被拒绝
+- target 超过对应 max 被拒绝
+
+2. RTP metadata
+- legacy 8-byte profile
+- 当前 TARGET metadata / CAP=0
+- 新 TARGET+CAP metadata
+- network byte order 正确
+- 非 GAN 兼容
+
+3. HUD
+- CAP=100/120/150 显示正确
+- CAP metadata 缺失时 fallback=100
+- TARGET 缺失不崩溃
+
+4. FullFrameEnhancer
+- 256x144 -> native 512x288 -> output640x360
+- 320x180 -> native640x360 -> output640x360
+- 320x180 路径不执行额外 presentation resize
+
+5. generation switch
+- 256x144 -> 320x180
+- 320x180 -> 256x144
+- 不出现 shape error / stale GAN output
+
+====================
+十、板端 + PC 实机验收
+====================
+
+至少完成：
+
+A.
+CAP100
+256x144
+10fps
+TARGET75
+
+B.
+CAP120
+320x180
+8fps
+TARGET90
+
+C.
+CAP150
+320x180
+10fps
+TARGET110
+
+每组至少运行60秒。
+
+记录：
+- TARGET
+- RTP average/peak
+- WIRE average/peak
+- CAP
+- RX/DEC/ENH/DISP fps
+- GAN inference p50/p95/p99/max
+- GOOD PC latency
+- DROP PRE/POST/REPL
+- HARDSTALL
+- RTP loss/reorder/decode error
+
+重点比较 B/C 相对于 A 的：
+- 人脸/人物细节
+- PSNR/SSIM（如测试链路已有）
+- GAN稳定输出率
+- fallback比例
+- PC延迟
+- wire占用
+
+150 kbps / 320x180 / 10fps / TARGET110
+作为优先推荐候选。
+
+如果该档出现明显 GAN stale/fallback，
+优先降低 source fps 或 gan-inference-fps，
+不要首先把输入尺寸退回256x144。
+
+====================
+十一、禁止修改
+====================
+
+本目标不修改：
+- YOLOv8-Seg模型和推理
+- ROI/QP等级算法
+- MPP编码器核心RC实现
+- H.265 RTP payload格式
+- RatePacer wire计算
+- Codec2算法
+- ESRGAN权重
+- rebuild模式
+- low/medium/high模式
+- 最终显示目标640x360
+
+====================
+十二、文档
+====================
+
+更新 README 的 GAN profile 表、启动命令、HUD说明。
+
+增加示例：
+
+100 kbps:
+--mode=gan --gan-link-cap-kbps=100 --gan-fps=10
+
+120 kbps:
+--mode=gan --gan-link-cap-kbps=120 --gan-fps=8
+
+150 kbps:
+--mode=gan --gan-link-cap-kbps=150 --gan-fps=10
+
+README 明确说明：
+
+100:
+256x144 -> ESRGAN x2 512x288 -> 640x360
+
+120/150:
+320x180 -> ESRGAN x2 native 640x360
+
+====================
+完成标准
+====================
+
+- 旧 GAN 100 kbps 行为保持兼容。
+- 120/150 kbps 可通过单一 GAN 参数选择。
+- 150档实际发送320x180。
+- PC自动识别320x180并正确执行x2 GAN。
+- 320x180 ESRGAN native output正好640x360。
+- HUD TARGET/RTP/WIRE/CAP全部与发送端一致。
+- 不突破RatePacer配置的共享物理cap。
+- 不产生新的持续队列积压或旧GAN帧覆盖。
+- 所有相关C++/Python测试通过。
+- 给出修改文件列表、测试命令和实机验收结果。

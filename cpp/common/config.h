@@ -139,12 +139,28 @@ struct EncoderConfig {
     EncoderConfig();
 };
 
+// One atomic GAN bandwidth preset controls the encoder geometry, its default
+// H.265 target, and the shared physical A/V pacing ceiling.  A caller may
+// override FPS or target within the preset's validation limits, but may not
+// replace the source geometry or physical cap through generic encoder options.
+struct GanBandwidthPreset {
+    int link_cap_kbps;
+    int source_width;
+    int source_height;
+    int default_fps;
+    int default_video_bitrate_kbps;
+    int max_video_bitrate_kbps;
+};
+
 struct GanConfig {
     // The board source/encoder cadence is one of the three acceptance rates.
     int fps;
     // Zero means run YOLO at the source cadence; a positive value enables
     // latest-map reuse between less frequent inference passes.
     int inference_fps;
+    // Shared video + optional Codec2 physical-wire cap selected by
+    // --gan-link-cap-kbps=60|100|120|150.
+    int link_cap_kbps;
     int video_bitrate_kbps;
     int max_inference_latency_ms;
 
@@ -277,6 +293,7 @@ const char *pipelineModeName(PipelineMode mode);
 const char *rateProfileName(RateProfile profile);
 bool parseRateProfile(const std::string &name, RateProfile *profile);
 void applyRateProfile(RateProfile profile, AppConfig *config);
+bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset);
 const char *transportModeName(TransportMode mode);
 bool parseTransportMode(const std::string &name, TransportMode *mode);
 

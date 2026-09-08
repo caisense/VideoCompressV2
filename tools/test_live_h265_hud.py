@@ -28,18 +28,19 @@ def rtp_packet(sequence: int, marker: bool = False, nal_type: int = 1) -> bytes:
 
 def rtp_profile_packet(sequence: int, profile: int, width: int, height: int,
                        fps: int, generation: int, nal_type: int = 19,
-                       target_bitrate_kbps=None) -> bytes:
+                       target_bitrate_kbps=None, link_cap_kbps=None) -> bytes:
     packet = bytearray(rtp_packet(sequence, marker=True, nal_type=nal_type))
     packet[0] |= 0x10
-    extension = bytearray(b"RO\x00\x03" if target_bitrate_kbps is not None else
+    has_gan_tail = target_bitrate_kbps is not None or link_cap_kbps is not None
+    extension = bytearray(b"RO\x00\x03" if has_gan_tail else
                           b"RO\x00\x02")
     extension.extend((1, profile))
     extension.extend(width.to_bytes(2, "big"))
     extension.extend(height.to_bytes(2, "big"))
     extension.extend((fps, generation))
-    if target_bitrate_kbps is not None:
-        extension.extend(int(target_bitrate_kbps).to_bytes(2, "big"))
-        extension.extend(b"\x00\x00")
+    if has_gan_tail:
+        extension.extend(int(target_bitrate_kbps or 0).to_bytes(2, "big"))
+        extension.extend(int(link_cap_kbps or 0).to_bytes(2, "big"))
     return bytes(packet[:12] + extension + packet[12:])
 
 
@@ -155,6 +156,7 @@ class HudTests(unittest.TestCase):
         self.assertEqual(values["profile"], {
             "name": "medium", "width": 480, "height": 270,
             "fps": 15, "generation": 3, "target_bitrate_kbps": None,
+            "link_cap_kbps": None,
         })
         self.assertEqual(values["i_frames"], 1)
         self.assertTrue(stats.on_packet(rtp_profile_packet(31, 0, 320, 180, 10, 4)))
@@ -172,28 +174,70 @@ class HudTests(unittest.TestCase):
         self.assertEqual(presentation.snapshot()["held_percent"], 50.0)
         self.assertEqual(HUD.display_dimensions(640, 360, "ccw90", 1), (360, 640))
 
-    def test_gan_profile_extension_carries_optional_encoder_target(self):
+    def test_gan_profile_extension_carries_target_and_link_cap(self):
         stats = HUD.RtpStats()
-        packet = rtp_profile_packet(33, 4, 256, 144, 8, 6,
-                                    target_bitrate_kbps=75)
+        packet = rtp_profile_packet(33, 4, 320, 180, 10, 6,
+                                    target_bitrate_kbps=110, link_cap_kbps=150)
         stats.on_packet(packet)
+        profile = stats.snapshot()["profile"]
+        self.assertEqual(profile["name"], "gan")
+        self.assertEqual(profile["width"], 320)
+        self.assertEqual(profile["height"], 180)
+        self.assertEqual(profile["fps"], 10)
+        self.assertEqual(profile["target_bitrate_kbps"], 110)
+        self.assertEqual(profile["link_cap_kbps"], 150)
+        self.assertEqual(HUD.RtpStats._payload_offset(packet), 28)
+        self.assertEqual(
+            HUD.gan_bitrate_hud_line(profile, {"rtp_kbps": 30.2, "wire_kbps": 36.5}),
+            "TARGET 110  RTP 30.2  WIRE 36.5  CAP 150 kbps",
+        )
+
+    def test_gan_hud_displays_all_new_link_cap_presets(self):
+        values = {"rtp_kbps": 30.2, "wire_kbps": 36.5}
+        for cap, target, width, height in (
+                (60, 45, 256, 144), (100, 75, 256, 144),
+                (120, 90, 320, 180), (150, 110, 320, 180)):
+            with self.subTest(cap=cap):
+                profile = {
+                    "name": "gan", "width": width, "height": height,
+                    "fps": 10, "generation": cap,
+                    "target_bitrate_kbps": target, "link_cap_kbps": cap,
+                }
+                self.assertEqual(
+                    HUD.gan_bitrate_hud_line(profile, values),
+                    f"TARGET {target}  RTP 30.2  WIRE 36.5  CAP {cap} kbps",
+                )
+
+    def test_gan_cap_60_profile_carries_stable_geometry_and_metadata(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(
+            35, 4, 256, 144, 8, 6,
+            target_bitrate_kbps=45, link_cap_kbps=60))
         profile = stats.snapshot()["profile"]
         self.assertEqual(profile["name"], "gan")
         self.assertEqual(profile["width"], 256)
         self.assertEqual(profile["height"], 144)
         self.assertEqual(profile["fps"], 8)
+        self.assertEqual(profile["target_bitrate_kbps"], 45)
+        self.assertEqual(profile["link_cap_kbps"], 60)
+        self.assertEqual(HUD.gan_profile_sizes(profile),
+                         ((256, 144), (512, 288), (640, 360)))
+
+    def test_current_gan_target_tail_with_zero_cap_falls_back_to_100(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(34, 4, 256, 144, 8, 7,
+                                           target_bitrate_kbps=75, link_cap_kbps=0))
+        profile = stats.snapshot()["profile"]
         self.assertEqual(profile["target_bitrate_kbps"], 75)
-        self.assertEqual(HUD.RtpStats._payload_offset(packet), 28)
-        self.assertEqual(
-            HUD.gan_bitrate_hud_line(profile, {"rtp_kbps": 30.2, "wire_kbps": 36.5}),
-            "TARGET 75  RTP 30.2  WIRE 36.5  CAP 100 kbps",
-        )
+        self.assertIsNone(profile["link_cap_kbps"])
+        self.assertEqual(HUD.gan_link_cap_kbps(profile), 100)
 
     def test_legacy_gan_metadata_shows_unknown_target(self):
         stats = HUD.RtpStats()
         stats.on_packet(rtp_profile_packet(34, 4, 256, 144, 8, 7))
         profile = stats.snapshot()["profile"]
         self.assertIsNone(profile["target_bitrate_kbps"])
+        self.assertIsNone(profile["link_cap_kbps"])
         self.assertEqual(
             HUD.gan_bitrate_hud_line(profile, {"rtp_kbps": 30.2, "wire_kbps": 36.5}),
             "TARGET --  RTP 30.2  WIRE 36.5  CAP 100 kbps",
@@ -229,6 +273,53 @@ class HudTests(unittest.TestCase):
         generation, packets = gate.feed(low_idr, low)
         self.assertEqual(generation, 3)
         self.assertEqual(packets, [low_idr])
+
+    def test_gan_generation_switches_both_input_directions(self):
+        gate = HUD.ProfileSwitchGate()
+        gan_256 = {
+            "name": "gan", "width": 256, "height": 144,
+            "fps": 10, "generation": 8,
+        }
+        gan_320 = {
+            "name": "gan", "width": 320, "height": 180,
+            "fps": 8, "generation": 9,
+        }
+        gan_256_again = {
+            "name": "gan", "width": 256, "height": 144,
+            "fps": 10, "generation": 10,
+        }
+        self.assertEqual(HUD.gan_profile_sizes(gan_256),
+                         ((256, 144), (512, 288), (640, 360)))
+        self.assertEqual(HUD.gan_profile_sizes(gan_320),
+                         ((320, 180), (640, 360), (640, 360)))
+        self.assertNotEqual(HUD.gan_profile_signature(gan_256),
+                            HUD.gan_profile_signature(gan_320))
+
+        first_idr = rtp_profile_packet(60, 4, 256, 144, 10, 8)
+        self.assertEqual(gate.feed(first_idr, gan_256), (8, [first_idr]))
+        pending_320 = rtp_profile_packet(61, 4, 320, 180, 8, 9, nal_type=1)
+        self.assertEqual(gate.feed(pending_320, gan_320), (None, []))
+        idr_320 = rtp_profile_packet(62, 4, 320, 180, 8, 9)
+        self.assertEqual(gate.feed(idr_320, gan_320), (9, [idr_320]))
+        idr_256 = rtp_profile_packet(63, 4, 256, 144, 10, 10)
+        self.assertEqual(gate.feed(idr_256, gan_256_again), (10, [idr_256]))
+
+    def test_profile_gate_restarts_on_geometry_change_after_sender_restart(self):
+        gate = HUD.ProfileSwitchGate()
+        before_restart = {
+            "name": "gan", "width": 256, "height": 144,
+            "fps": 10, "generation": 0,
+        }
+        after_restart = {
+            "name": "gan", "width": 320, "height": 180,
+            "fps": 8, "generation": 0,
+        }
+        old_idr = rtp_profile_packet(70, 4, 256, 144, 10, 0)
+        self.assertEqual(gate.feed(old_idr, before_restart), (0, [old_idr]))
+        new_p = rtp_profile_packet(71, 4, 320, 180, 8, 0, nal_type=1)
+        self.assertEqual(gate.feed(new_p, after_restart), (None, []))
+        new_idr = rtp_profile_packet(72, 4, 320, 180, 8, 0)
+        self.assertEqual(gate.feed(new_idr, after_restart), (0, [new_idr]))
 
     def test_profile_switch_gate_supports_legacy_stream(self):
         gate = HUD.ProfileSwitchGate()

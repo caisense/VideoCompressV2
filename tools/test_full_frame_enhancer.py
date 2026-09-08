@@ -9,9 +9,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
+import tools.full_frame_enhancer as FFE
 from tools.full_frame_enhancer import (
     EnhancementDiagnostics,
     FullFrameEnhancer,
@@ -72,6 +74,19 @@ class FullFrameEnhancerTests(unittest.TestCase):
         self.assertEqual(native.shape, (288, 512, 3))
         self.assertEqual(output.shape, (360, 640, 3))
         self.assertEqual(enhancer.provider, "Lanczos4")
+
+    def test_320x180_native_output_skips_redundant_presentation_resize(self) -> None:
+        enhancer = FullFrameEnhancer(
+            "none", input_size=(320, 180), native_size=(640, 360),
+            output_size=(640, 360), warmup=0)
+        frame = np.zeros((180, 320, 3), dtype=np.uint8)
+        with mock.patch.object(FFE.cv2, "resize", wraps=FFE.cv2.resize) as resize:
+            output = enhancer.enhance(frame)
+        self.assertEqual(output.shape, (360, 640, 3))
+        # The only resize is source -> x2 native.  Native already equals the
+        # required presentation size, so enhance() must not resize a second time.
+        self.assertEqual(resize.call_count, 1)
+        self.assertEqual(resize.call_args.args[1], (640, 360))
 
     def test_model_postprocess_converts_rgb_to_bgr(self) -> None:
         enhancer = self._esrgan_without_loading_model()
@@ -178,6 +193,19 @@ class FullFrameEnhancerTests(unittest.TestCase):
             self.assertLessEqual(int(values["running"]) + int(values["pending"]), 2)
             self.assertIn("rolling_5s_fps", values)
             self.assertIn("rolling_10s_fps", values)
+        finally:
+            worker.stop()
+
+    def test_worker_propagates_generation_to_output(self) -> None:
+        worker = LatestOnlyEnhancerWorker(SlowFakeEnhancer(0.001), max_latency_ms=500)
+        frame = np.zeros((180, 320, 3), dtype=np.uint8)
+        try:
+            self.assertTrue(worker.submit(frame, 81, input_fps=8.0, generation=12))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] >= 1))
+            output = worker.poll_output()
+            self.assertIsNotNone(output)
+            assert output is not None
+            self.assertEqual(output.generation, 12)
         finally:
             worker.stop()
 

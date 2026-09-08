@@ -27,7 +27,26 @@ from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
 DEFAULT_VIDEO_PORT = 5004
-GAN_LINK_CAP_KBPS = 100
+
+
+def gan_profile_sizes(profile: dict) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    """Return RTP-selected source, x2-native, and fixed presentation sizes."""
+    width = int(profile.get("width", 0))
+    height = int(profile.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"GAN profile has invalid input size {width}x{height}")
+    return (width, height), (width * 2, height * 2), (640, 360)
+
+
+def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int]:
+    """Identity of an enhancer/decoder generation, including its cadence."""
+    input_size, _, _ = gan_profile_sizes(profile)
+    return (
+        int(profile.get("generation", -1)),
+        input_size[0],
+        input_size[1],
+        int(profile.get("fps", 0)),
+    )
 
 
 def gan_target_kbps_text(profile: Optional[dict]) -> str:
@@ -36,12 +55,56 @@ def gan_target_kbps_text(profile: Optional[dict]) -> str:
     return "--" if target is None else str(int(target))
 
 
+def gan_link_cap_kbps(profile: Optional[dict]) -> int:
+    """Read advertised GAN CAP, retaining the documented old-stream fallback."""
+    advertised = None if profile is None else profile.get("link_cap_kbps")
+    if advertised is not None and int(advertised) > 0:
+        return int(advertised)
+    # Both the 8-byte legacy record and the former TARGET+reserved tail were
+    # the original 100 kbps GAN profile.  This is a compatibility fallback,
+    # not the active link-rate source for new senders.
+    return 100
+
+
 def gan_bitrate_hud_line(profile: Optional[dict], values: dict) -> str:
     """Keep configured target and observed receive rates visibly distinct."""
     return (
         f"TARGET {gan_target_kbps_text(profile)}  RTP {values['rtp_kbps']:.1f}  "
-        f"WIRE {values['wire_kbps']:.1f}  CAP {GAN_LINK_CAP_KBPS} kbps"
+        f"WIRE {values['wire_kbps']:.1f}  CAP {gan_link_cap_kbps(profile)} kbps"
     )
+
+
+def gan_waiting_worker_snapshot() -> dict:
+    """HUD-safe zero metrics while a new generation waits for its IDR."""
+    return {
+        "backend": "warming",
+        "provider": "--",
+        "rolling_1s_fps": 0.0,
+        "max_latency_ms": 0.0,
+        "infer_all_p50_ms": 0.0,
+        "infer_all_p95_ms": 0.0,
+        "infer_all_p99_ms": 0.0,
+        "infer_all_max_ms": 0.0,
+        "last_finished_infer_ms": 0.0,
+        "good_total_p50_ms": 0.0,
+        "good_total_p95_ms": 0.0,
+        "good_total_p99_ms": 0.0,
+        "good_total_max_ms": 0.0,
+        "last_good_total_ms": 0.0,
+        "last_queue_wait_ms": 0.0,
+        "running": False,
+        "running_age_ms": 0.0,
+        "pending": False,
+        "dropped": 0,
+        "drop_percent": 0.0,
+        "drop_reason_counts": {
+            "replaced_pending": 0,
+            "output_replaced": 0,
+            "stale_before_infer": 0,
+            "stale_after_infer": 0,
+            "inference_error": 0,
+        },
+    }
 
 
 class RtpStats:
@@ -93,21 +156,30 @@ class RtpStats:
         payload = packet[offset + 4:payload_end]
         if len(payload) < 8 or payload[0] != 1:
             return None
-        target_bitrate_kbps = None
-        # New GAN senders append a uint16 target plus two reserved bytes to
-        # the v1 record. Old senders still stop at byte 7.
-        if len(payload) >= 10:
-            advertised_target = int.from_bytes(payload[8:10], "big")
-            if advertised_target > 0:
-                target_bitrate_kbps = advertised_target
         names = {0: "low", 1: "medium", 2: "high", 3: "rebuild", 4: "gan"}
+        name = names.get(payload[1], "unknown")
+        target_bitrate_kbps = None
+        link_cap_kbps = None
+        # GAN v1 originally had an eight-byte core.  The current sender then
+        # appended TARGET plus two reserved bytes; new senders reuse those
+        # final two bytes as CAP without increasing the 12-byte tail layout.
+        if name == "gan":
+            if len(payload) >= 10:
+                advertised_target = int.from_bytes(payload[8:10], "big")
+                if advertised_target > 0:
+                    target_bitrate_kbps = advertised_target
+            if len(payload) >= 12:
+                advertised_cap = int.from_bytes(payload[10:12], "big")
+                if advertised_cap > 0:
+                    link_cap_kbps = advertised_cap
         return {
-            "name": names.get(payload[1], "unknown"),
+            "name": name,
             "width": int.from_bytes(payload[2:4], "big"),
             "height": int.from_bytes(payload[4:6], "big"),
             "fps": payload[6],
             "generation": payload[7],
             "target_bitrate_kbps": target_bitrate_kbps,
+            "link_cap_kbps": link_cap_kbps,
         }
 
     @staticmethod
@@ -241,12 +313,27 @@ class RtpStats:
             }
 
 
+def profile_switch_key(profile: Optional[dict]) -> Tuple[Any, ...]:
+    """Decoder identity; dimensions matter when a sender process restarts."""
+    if profile is None:
+        return (-1, "legacy", 0, 0, 0)
+    return (
+        int(profile.get("generation", -1)),
+        str(profile.get("name", "unknown")),
+        int(profile.get("width", 0)),
+        int(profile.get("height", 0)),
+        int(profile.get("fps", 0)),
+    )
+
+
 class ProfileSwitchGate:
-    """Buffer the first complete IDR of each RTP profile generation."""
+    """Buffer the first complete IDR of each RTP decoder profile identity."""
 
     def __init__(self) -> None:
         self.active_generation: Optional[int] = None
+        self.active_profile_key: Optional[Tuple[Any, ...]] = None
         self.pending_generation: Optional[int] = None
+        self.pending_profile_key: Optional[Tuple[Any, ...]] = None
         self.pending_packets = []
         self.pending_has_idr = False
 
@@ -254,10 +341,12 @@ class ProfileSwitchGate:
         # Generation -1 keeps compatibility with senders that do not carry
         # the project-specific profile extension.
         generation = -1 if profile is None else profile["generation"]
-        if self.active_generation == generation:
+        key = profile_switch_key(profile)
+        if self.active_profile_key == key:
             return None, [packet]
-        if self.pending_generation != generation:
+        if self.pending_profile_key != key:
             self.pending_generation = generation
+            self.pending_profile_key = key
             self.pending_packets = []
             self.pending_has_idr = False
         self.pending_packets.append(packet)
@@ -269,7 +358,9 @@ class ProfileSwitchGate:
             return None, []
         buffered = self.pending_packets
         self.active_generation = generation
+        self.active_profile_key = key
         self.pending_generation = None
+        self.pending_profile_key = None
         self.pending_packets = []
         self.pending_has_idr = False
         return generation, buffered
@@ -1171,33 +1262,58 @@ def main() -> int:
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     decoder_lock = threading.Lock()
-    decoder_state = {"process": None, "generation": None, "token": 0}
+    decoder_state = {
+        "process": None, "generation": None, "profile_key": None, "token": 0,
+    }
     decoder_threads = []
     gan_worker_lock = threading.Lock()
-    gan_worker_holder = {"worker": None}
+    gan_worker_holder = {"worker": None, "signature": None}
     gan_controller: Optional[GanFallbackController] = None
 
-    def set_gan_worker(worker: Optional[LatestOnlyEnhancerWorker]) -> None:
+    def set_gan_worker(
+        worker: Optional[LatestOnlyEnhancerWorker],
+        signature: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
         with gan_worker_lock:
             gan_worker_holder["worker"] = worker
+            gan_worker_holder["signature"] = signature
 
-    def get_gan_worker() -> Optional[LatestOnlyEnhancerWorker]:
+    def get_gan_worker(profile: Optional[dict]) -> Optional[LatestOnlyEnhancerWorker]:
         with gan_worker_lock:
-            return gan_worker_holder["worker"]
+            worker = gan_worker_holder["worker"]
+            signature = gan_worker_holder["signature"]
+        if worker is None or profile is None:
+            return None
+        try:
+            return worker if signature == gan_profile_signature(profile) else None
+        except (TypeError, ValueError):
+            return None
+
+    def gan_profile_decoder_ready(profile: Optional[dict]) -> bool:
+        """Only bind a worker after ProfileSwitchGate accepted a full IDR."""
+        if profile is None:
+            return False
+        try:
+            generation = int(profile["generation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        with decoder_lock:
+            return (decoder_state["generation"] == generation and
+                    decoder_state["profile_key"] == profile_switch_key(profile))
 
     gan_worker: Optional[LatestOnlyEnhancerWorker] = None
+    gan_worker_signature: Optional[Tuple[int, int, int, int]] = None
 
     def ensure_gan_worker(profile: dict) -> bool:
-        nonlocal gan_worker, gan_controller
-        if gan_worker is not None:
-            return True
-        if profile.get("width") != 256 or profile.get("height") != 144:
-            print(
-                f"GAN profile has unexpected input size {profile.get('width')}x"
-                f"{profile.get('height')} (expected 256x144)",
-                file=sys.stderr,
-            )
+        nonlocal gan_worker, gan_worker_signature, gan_controller
+        try:
+            signature = gan_profile_signature(profile)
+            input_size, native_size, output_size = gan_profile_sizes(profile)
+        except (TypeError, ValueError) as error:
+            print(f"GAN enhancer profile invalid: {error}", file=sys.stderr)
             return False
+        if gan_worker is not None:
+            return gan_worker_signature == signature
         model_path = (
             args.gan_esrnet_model
             if args.gan_enhancer == "esrnet"
@@ -1215,16 +1331,17 @@ def main() -> int:
             return False
         try:
             print(
-                f"GAN WARMING: backend={args.gan_enhancer} input=256x144 "
+                f"GAN WARMING: backend={args.gan_enhancer} "
+                f"input={input_size[0]}x{input_size[1]} "
                 f"warmup={args.gan_warmup}",
                 flush=True,
             )
             enhancer = FullFrameEnhancer(
                 args.gan_enhancer,
                 model_path=model_path,
-                input_size=(256, 144),
-                native_size=(512, 288),
-                output_size=(640, 360),
+                input_size=input_size,
+                native_size=native_size,
+                output_size=output_size,
                 require_cuda=args.gan_require_cuda,
                 threads=args.gan_threads,
                 warmup=args.gan_warmup,
@@ -1238,13 +1355,14 @@ def main() -> int:
             print(f"GAN enhancer initialization failed: {error}", file=sys.stderr)
             return False
         gan_worker = worker
+        gan_worker_signature = signature
         gan_controller = GanFallbackController(
             output_budget_ms=output_budget_ms,
             hard_stall_ms=args.gan_hard_stall_ms,
             recovery_good_frames=args.gan_recovery_good_frames,
             recovery_max_sequence_lag=args.gan_recovery_max_sequence_lag,
         )
-        set_gan_worker(worker)
+        set_gan_worker(worker, signature)
         budget_mode = (
             f"LEGACY_FIXED {output_budget_ms:.1f}ms"
             if args.gan_max_inference_latency_ms is not None else
@@ -1254,7 +1372,9 @@ def main() -> int:
         )
         print(
             f"GAN READY: full-frame enhancer ready: backend={worker.backend} "
-            f"provider={worker.provider} input=256x144 native=512x288 output=640x360 "
+            f"provider={worker.provider} input={input_size[0]}x{input_size[1]} "
+            f"native={native_size[0]}x{native_size[1]} "
+            f"output={output_size[0]}x{output_size[1]} "
             f"output_budget_ms={output_budget_ms:.1f} ({budget_mode}) "
             f"hard_stall_ms={args.gan_hard_stall_ms:.0f} "
             f"recovery={args.gan_recovery_good_frames}frames/"
@@ -1264,10 +1384,11 @@ def main() -> int:
         return True
 
     def disable_gan_worker() -> None:
-        nonlocal gan_worker, gan_controller
+        nonlocal gan_worker, gan_worker_signature, gan_controller
         worker = gan_worker
         controller = gan_controller
         gan_worker = None
+        gan_worker_signature = None
         gan_controller = None
         set_gan_worker(None)
         if worker is not None:
@@ -1287,12 +1408,13 @@ def main() -> int:
                 rtp_timestamp = decoded_pts.pop()
                 source_sequence = latest.put(frame, rtp_timestamp)
                 stats.on_decoded_frame()
-                worker = get_gan_worker()
-                if worker is not None:
-                    profile = stats.snapshot()["profile"]
+                profile = stats.snapshot()["profile"]
+                worker = get_gan_worker(profile)
+                if worker is not None and profile is not None:
                     worker.submit(
                         frame, source_sequence, rtp_timestamp,
-                        input_fps=0.0 if profile is None else float(profile["fps"]),
+                        input_fps=float(profile["fps"]),
+                        generation=int(profile["generation"]),
                     )
 
     def stderr_loop(process: subprocess.Popen) -> None:
@@ -1334,20 +1456,23 @@ def main() -> int:
             process.kill()
             process.wait(timeout=2.0)
 
-    def ensure_decoder(generation: Optional[int]) -> None:
+    def ensure_decoder(generation: Optional[int], profile: Optional[dict]) -> None:
+        next_profile_key = profile_switch_key(profile)
         with decoder_lock:
             process = decoder_state["process"]
-            changed = decoder_state["generation"] is not None and \
-                generation is not None and generation != decoder_state["generation"]
+            changed = (decoder_state["profile_key"] is not None and
+                       next_profile_key != decoder_state["profile_key"])
             dead = process is None or process.poll() is not None
             if changed or dead:
                 stop_decoder_locked()
                 latest.clear()
                 decoded_pts.clear()
                 decoder_state["generation"] = generation
+                decoder_state["profile_key"] = next_profile_key
                 launch_decoder_locked()
-            elif decoder_state["generation"] is None and generation is not None:
+            elif decoder_state["generation"] is None:
                 decoder_state["generation"] = generation
+                decoder_state["profile_key"] = next_profile_key
 
     def write_decoder(data: bytes) -> None:
         if not data:
@@ -1378,7 +1503,7 @@ def main() -> int:
                     if nal_type is not None
                 })
                 print(f"Profile generation {restart_generation}: replay IDR RTP NAL types {nal_types}")
-                ensure_decoder(restart_generation)
+                ensure_decoder(restart_generation, profile)
                 depacketizer.reset()
             for ready_packet in ready_packets:
                 annex_b = depacketizer.feed(ready_packet)
@@ -1438,9 +1563,32 @@ def main() -> int:
                         break
                     if args.esrgan != "off" and resolver is not None:
                         resolver.enable_async()
-                if is_gan and not ensure_gan_worker(profile):
+
+            # The profile record can arrive before the new IDR is complete.
+            # Never bind the old worker to that metadata (or display its last
+            # output over a new-size source); wait until ProfileSwitchGate has
+            # restarted FFmpeg on the complete IDR, then replace the worker.
+            if is_gan and profile is not None:
+                try:
+                    wanted_gan_signature = gan_profile_signature(profile)
+                except (TypeError, ValueError) as error:
+                    print(f"GAN profile invalid: {error}", file=sys.stderr)
                     stopping.set()
                     break
+                needs_gan_worker = (
+                    gan_worker is None or gan_worker_signature != wanted_gan_signature
+                )
+                if gan_worker_signature != wanted_gan_signature:
+                    current_canvas = None
+                    current_source_sequence = None
+                    next_gan_present = now
+                    gan_display_fallback = False
+                if needs_gan_worker and gan_profile_decoder_ready(profile):
+                    if gan_worker is not None:
+                        disable_gan_worker()
+                    if not ensure_gan_worker(profile):
+                        stopping.set()
+                        break
 
             # A completed RB/1 reference reaches this queue on the socket
             # thread.  Give Real-ESRGAN the crop immediately; do not wait for
@@ -1452,13 +1600,22 @@ def main() -> int:
                     rebuild_composer.prefetch(reference)
                 rebuild_composer.prefetch_pending()
 
-            worker = gan_worker if is_gan else None
+            worker = get_gan_worker(profile) if is_gan else None
             if is_gan and worker is not None:
                 newest_output = None
                 while True:
                     output = worker.poll_output()
                     if output is None:
                         break
+                    if output.generation != int(profile["generation"]):
+                        worker.debug_event({
+                            "TYPE": "GAN_GENERATION_DROP",
+                            "SEQ": output.source_sequence,
+                            "OUTPUT_GENERATION": output.generation,
+                            "ACTIVE_GENERATION": int(profile["generation"]),
+                            "AT": now,
+                        })
+                        continue
                     newest_output = output
                 worker_values = worker.snapshot()
                 if gan_controller is None:
@@ -1596,7 +1753,10 @@ def main() -> int:
                 if is_rebuild and rebuild_composer is not None
                 else {}
             )
-            gan_values = worker.snapshot() if is_gan and worker is not None else {}
+            gan_values = (
+                worker.snapshot() if is_gan and worker is not None
+                else gan_waiting_worker_snapshot() if is_gan else {}
+            )
             gan_controller_values = (
                 gan_controller.snapshot(now, float(profile["fps"]))
                 if is_gan and gan_controller is not None and profile is not None
@@ -1646,6 +1806,7 @@ def main() -> int:
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
                     elif is_gan:
+                        input_size, native_size, output_size = gan_profile_sizes(profile)
                         drop_counts = gan_values["drop_reason_counts"]
                         gan_text = (
                             f" source_fps={profile['fps']}"
@@ -1654,7 +1815,9 @@ def main() -> int:
                             f" display_fps={presentation_values['fps']:.1f}"
                             f" enhancer={gan_values['backend']}"
                             f" provider={gan_values['provider']}"
-                            f" input=256x144 native=512x288 output=640x360"
+                            f" input={input_size[0]}x{input_size[1]}"
+                            f" native={native_size[0]}x{native_size[1]}"
+                            f" output={output_size[0]}x{output_size[1]}"
                             f" output_budget_ms={gan_values['max_latency_ms']:.1f}"
                             f" infer_all_p50_ms={gan_values['infer_all_p50_ms']:.1f}"
                             f" infer_all_p95_ms={gan_values['infer_all_p95_ms']:.1f}"
@@ -1686,7 +1849,7 @@ def main() -> int:
                             f" hard_stalls={gan_controller_values.get('hard_stall_count', 0)}"
                             f" rtp_kbps={values['rtp_kbps']:.1f}"
                             f" wire_kbps={values['wire_kbps']:.1f}"
-                            f" link_cap_kbps={GAN_LINK_CAP_KBPS}"
+                            f" link_cap_kbps={gan_link_cap_kbps(profile)}"
                         )
                         rebuild_text = gan_text
                     print(
@@ -1774,6 +1937,7 @@ def main() -> int:
                     f"S{composer_values['sr_stale']}",
                 ]
             elif is_gan:
+                input_size, native_size, output_size = gan_profile_sizes(profile)
                 output_backend = (
                     "FALLBACK / Lanczos4" if gan_display_fallback else
                     f"{gan_values['backend'].upper()} / {gan_values['provider']}"
@@ -1792,8 +1956,9 @@ def main() -> int:
                 lines = [
                     f"GAN H265-only RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} "
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
-                    "INPUT 256x144 NATIVE 512x288",
-                    f"OUTPUT 640x360  {output_backend}",
+                    f"INPUT {input_size[0]}x{input_size[1]} "
+                    f"NATIVE {native_size[0]}x{native_size[1]}",
+                    f"OUTPUT {output_size[0]}x{output_size[1]}  {output_backend}",
                     gan_bitrate_hud_line(profile, values),
                     f"INFER ALL L/P50/P95/P99/MAX "
                     f"{gan_values['last_finished_infer_ms']:.0f}/"

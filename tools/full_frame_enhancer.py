@@ -3,8 +3,9 @@
 
 The module deliberately has no knowledge of RB/1, semantic masks, reference
 JPEGs, registration, or ROI compositing.  Every backend consumes the same
-decoded 256x144 BGR frame and produces a native 512x288 frame before the
-shared 640x360 Lanczos presentation resize.
+decoded BGR frame and produces an x2 native frame.  The receiver selects the
+input size from RTP profile metadata, then only resizes at presentation when
+the x2 native frame is not already the shared 640x360 output.
 """
 
 from __future__ import annotations
@@ -96,6 +97,9 @@ class EnhancementInput:
     rtp_timestamp: Optional[int]
     arrived_at: float
     input_fps: float
+    # Bound to the RTP profile generation by the HUD.  It allows presentation
+    # to reject a late result if a decoder/profile switch occurs mid-inference.
+    generation: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +125,7 @@ class EnhancementOutput:
     enhancer: str
     provider: str
     diagnostics: Optional[EnhancementDiagnostics] = None
+    generation: Optional[int] = None
 
 
 class FullFrameEnhancer:
@@ -522,6 +527,7 @@ class LatestOnlyEnhancerWorker:
             "TYPE": "GAN_WORKER",
             "SEQ": item.source_sequence,
             "PTS": item.rtp_timestamp,
+            "GENERATION": item.generation,
             "ARRIVAL": item.arrived_at,
             "INPUT_FPS": item.input_fps,
             "FRAME_PERIOD_MS": frame_period_ms,
@@ -589,6 +595,7 @@ class LatestOnlyEnhancerWorker:
         rtp_timestamp: Optional[int] = None,
         arrived_at: Optional[float] = None,
         input_fps: float = 0.0,
+        generation: Optional[int] = None,
     ) -> bool:
         if not isinstance(frame, np.ndarray):
             raise ValueError("enhancer worker frame must be a numpy array")
@@ -601,6 +608,7 @@ class LatestOnlyEnhancerWorker:
             rtp_timestamp=rtp_timestamp,
             arrived_at=arrived_at,
             input_fps=float(input_fps),
+            generation=None if generation is None else int(generation),
         )
         with self.condition:
             if self.stopping:
@@ -702,6 +710,7 @@ class LatestOnlyEnhancerWorker:
                         enhancer=self.backend,
                         provider=self.provider,
                         diagnostics=diagnostics,
+                        generation=item.generation,
                     )
                     with self.condition:
                         if self.output is not None:

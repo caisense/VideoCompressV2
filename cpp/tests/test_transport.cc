@@ -124,11 +124,12 @@ void testProfileMetadataUsesRtpHeaderExtension() {
     roi_h265::RtpStreamProfile profile;
     profile.valid = true;
     profile.profile = 4;
-    profile.width = 256;
-    profile.height = 144;
+    profile.width = 320;
+    profile.height = 180;
     profile.fps = 10;
     profile.generation = 7;
-    profile.target_bitrate_kbps = 75;
+    profile.target_bitrate_kbps = 110;
+    profile.link_cap_kbps = 150;
     roi_h265::H265RtpPacketizer packetizer(1, 2, 1200);
     const std::vector<std::vector<uint8_t> > packets = packetizer.packetize(
         access_unit, sizeof(access_unit), 1234, &profile);
@@ -137,11 +138,11 @@ void testProfileMetadataUsesRtpHeaderExtension() {
     CHECK(packets[0][12] == 0x52 && packets[0][13] == 0x4f);
     CHECK(packets[0][14] == 0 && packets[0][15] == 3);
     CHECK(packets[0][16] == 1 && packets[0][17] == 4);
-    CHECK((static_cast<int>(packets[0][18]) << 8 | packets[0][19]) == 256);
-    CHECK((static_cast<int>(packets[0][20]) << 8 | packets[0][21]) == 144);
+    CHECK((static_cast<int>(packets[0][18]) << 8 | packets[0][19]) == 320);
+    CHECK((static_cast<int>(packets[0][20]) << 8 | packets[0][21]) == 180);
     CHECK(packets[0][22] == 10 && packets[0][23] == 7);
-    CHECK((static_cast<int>(packets[0][24]) << 8 | packets[0][25]) == 75);
-    CHECK(packets[0][26] == 0 && packets[0][27] == 0);
+    CHECK((static_cast<int>(packets[0][24]) << 8 | packets[0][25]) == 110);
+    CHECK((static_cast<int>(packets[0][26]) << 8 | packets[0][27]) == 150);
     CHECK(((packets[0][28] >> 1) & 0x3f) == 19);
 
     // The optional tail must reduce the H.265 payload budget by the same four
@@ -158,13 +159,44 @@ void testProfileMetadataUsesRtpHeaderExtension() {
         CHECK(((constrained_packets[i][28] >> 1) & 0x3f) == 49);
     }
 
-    // Zero means no GAN target. Keep legacy profiles byte-for-byte compatible
-    // with the original two-word RO extension.
+    // Packetizer fields are network-order uint16 values.  Use non-preset
+    // values here so both bytes are asserted independently; validation of
+    // permitted CAP values belongs to the config test above.
+    profile.target_bitrate_kbps = 0x1234U;
+    profile.link_cap_kbps = 0x4567U;
+    roi_h265::H265RtpPacketizer byte_order_packetizer(1, 2, 1200);
+    const std::vector<std::vector<uint8_t> > byte_order_packets =
+        byte_order_packetizer.packetize(access_unit, sizeof(access_unit), 1234, &profile);
+    CHECK(byte_order_packets.size() == 1);
+    CHECK(byte_order_packets[0][24] == 0x12 && byte_order_packets[0][25] == 0x34);
+    CHECK(byte_order_packets[0][26] == 0x45 && byte_order_packets[0][27] == 0x67);
+
+    // Current target-aware senders used the same tail with the two CAP bytes
+    // reserved as zero.  Keep that twelve-byte layout valid for receivers
+    // that now interpret CAP=0 as the historical 100 kbps GAN preset.
+    profile.profile = 4;
+    profile.width = 256;
+    profile.height = 144;
+    profile.fps = 8;
+    profile.target_bitrate_kbps = 75;
+    profile.link_cap_kbps = 0;
+    roi_h265::H265RtpPacketizer current_gan_packetizer(1, 2, 1200);
+    const std::vector<std::vector<uint8_t> > current_gan_packets =
+        current_gan_packetizer.packetize(access_unit, sizeof(access_unit), 1234, &profile);
+    CHECK(current_gan_packets.size() == 1);
+    CHECK(current_gan_packets[0][14] == 0 && current_gan_packets[0][15] == 3);
+    CHECK((static_cast<int>(current_gan_packets[0][24]) << 8 |
+           current_gan_packets[0][25]) == 75);
+    CHECK(current_gan_packets[0][26] == 0 && current_gan_packets[0][27] == 0);
+
+    // Zero TARGET and CAP keep non-GAN profiles byte-for-byte compatible with
+    // the original two-word RO extension.
     profile.profile = 1;
     profile.width = 480;
     profile.height = 270;
     profile.fps = 15;
     profile.target_bitrate_kbps = 0;
+    profile.link_cap_kbps = 0;
     roi_h265::H265RtpPacketizer legacy_packetizer(1, 2, 1200);
     const std::vector<std::vector<uint8_t> > legacy_packets = legacy_packetizer.packetize(
         access_unit, sizeof(access_unit), 1234, &profile);

@@ -319,6 +319,7 @@ void testCommandLineConfig() {
     CHECK(gan.encoder.fps == 8 && gan.gan.fps == 8 && gan.encoder.gop == 16);
     CHECK(gan.gan.inference_fps == 4 && gan.gan.max_inference_latency_ms == 90);
     CHECK(gan.encoder.target_bitrate_bps == 75000);
+    CHECK(gan.gan.link_cap_kbps == 100);
     CHECK(gan.transport.pacing_bitrate_bps == 100000);
     CHECK(gan.transport.mode == roi_h265::TRANSPORT_MODE_VIDEO);
     CHECK(!gan.transport.event.enabled);
@@ -326,9 +327,115 @@ void testCommandLineConfig() {
     CHECK(std::string(roi_h265::pipelineModeName(gan.mode)) == "gan");
     CHECK(std::string(roi_h265::rateProfileName(gan.rate_profile)) == "gan");
 
+    char *gan_100_default_argv[] = {profile_app, gan_mode};
+    AppConfig gan_100_default;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(2, gan_100_default_argv, &gan_100_default, &error));
+    CHECK(gan_100_default.gan.link_cap_kbps == 100);
+    CHECK(gan_100_default.encoder.width == 256 && gan_100_default.encoder.height == 144);
+    CHECK(gan_100_default.encoder.fps == 10 && gan_100_default.encoder.gop == 20);
+    CHECK(gan_100_default.gan.video_bitrate_kbps == 75);
+    CHECK(gan_100_default.encoder.target_bitrate_bps == 75000);
+    CHECK(gan_100_default.transport.pacing_bitrate_bps == 100000);
+
+    // The low-rate preset may precede --mode=gan; applying the profile must
+    // still select its geometry, cadence, target, and physical cap together.
+    char gan_cap_60[] = "--gan-link-cap-kbps=60";
+    char *gan_60_argv[] = {profile_app, gan_cap_60, gan_mode};
+    AppConfig gan_60;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(3, gan_60_argv, &gan_60, &error));
+    CHECK(gan_60.mode == roi_h265::PIPELINE_GAN);
+    CHECK(gan_60.gan.link_cap_kbps == 60);
+    CHECK(gan_60.encoder.width == 256 && gan_60.encoder.height == 144);
+    CHECK(gan_60.encoder.fps == 8 && gan_60.encoder.gop == 16);
+    CHECK(gan_60.gan.video_bitrate_kbps == 45);
+    CHECK(gan_60.encoder.target_bitrate_bps == 45000);
+    CHECK(gan_60.transport.pacing_bitrate_bps == 60000);
+
+    char gan_bitrate_60_max[] = "--gan-video-bitrate-kbps=50";
+    char *gan_60_max_argv[] = {
+        profile_app, gan_mode, gan_cap_60, gan_bitrate_60_max};
+    AppConfig gan_60_max;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(4, gan_60_max_argv, &gan_60_max, &error));
+    CHECK(gan_60_max.encoder.target_bitrate_bps == 50000);
+
+    char gan_cap_120[] = "--gan-link-cap-kbps=120";
+    char *gan_120_argv[] = {profile_app, gan_mode, gan_cap_120};
+    AppConfig gan_120;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(3, gan_120_argv, &gan_120, &error));
+    CHECK(gan_120.mode == roi_h265::PIPELINE_GAN);
+    CHECK(gan_120.gan.link_cap_kbps == 120);
+    CHECK(gan_120.encoder.width == 320 && gan_120.encoder.height == 180);
+    CHECK(gan_120.encoder.fps == 8 && gan_120.encoder.gop == 16);
+    CHECK(gan_120.gan.video_bitrate_kbps == 90);
+    CHECK(gan_120.encoder.target_bitrate_bps == 90000);
+    CHECK(gan_120.transport.pacing_bitrate_bps == 120000);
+
+    char gan_cap_150[] = "--gan-link-cap-kbps=150";
+    char *gan_150_argv[] = {profile_app, gan_mode, gan_cap_150};
+    AppConfig gan_150;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(3, gan_150_argv, &gan_150, &error));
+    CHECK(gan_150.gan.link_cap_kbps == 150);
+    CHECK(gan_150.encoder.width == 320 && gan_150.encoder.height == 180);
+    CHECK(gan_150.encoder.fps == 10 && gan_150.encoder.gop == 20);
+    CHECK(gan_150.gan.video_bitrate_kbps == 110);
+    CHECK(gan_150.encoder.target_bitrate_bps == 110000);
+    CHECK(gan_150.transport.pacing_bitrate_bps == 150000);
+
+    // The dedicated knobs may override a preset's defaults, but only inside
+    // its cap-specific validation range and without changing its geometry.
+    char gan_fps_12[] = "--gan-fps=12";
+    char gan_bitrate_120_max[] = "--gan-video-bitrate-kbps=100";
+    char *gan_120_override_argv[] = {
+        profile_app, gan_cap_120, gan_mode, gan_fps_12, gan_bitrate_120_max};
+    AppConfig gan_120_override;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(5, gan_120_override_argv, &gan_120_override, &error));
+    CHECK(gan_120_override.encoder.width == 320 && gan_120_override.encoder.height == 180);
+    CHECK(gan_120_override.encoder.fps == 12 && gan_120_override.encoder.gop == 24);
+    CHECK(gan_120_override.encoder.target_bitrate_bps == 100000);
+
+    char bad_gan_cap[] = "--gan-link-cap-kbps=110";
+    char *bad_gan_cap_argv[] = {profile_app, gan_mode, bad_gan_cap};
+    AppConfig invalid_gan;
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, bad_gan_cap_argv, &invalid_gan, &error));
+    CHECK(error.find("gan link cap") != std::string::npos);
+
+    char gan_bitrate_100_too_high[] = "--gan-video-bitrate-kbps=86";
+    char *bad_gan_100_bitrate_argv[] = {profile_app, gan_mode, gan_bitrate_100_too_high};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, bad_gan_100_bitrate_argv, &invalid_gan, &error));
+
+    char gan_bitrate_60_too_high[] = "--gan-video-bitrate-kbps=51";
+    char *bad_gan_60_bitrate_argv[] = {
+        profile_app, gan_mode, gan_cap_60, gan_bitrate_60_too_high};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(4, bad_gan_60_bitrate_argv, &invalid_gan, &error));
+
+    char gan_bitrate_120_too_high[] = "--gan-video-bitrate-kbps=101";
+    char *bad_gan_120_bitrate_argv[] = {
+        profile_app, gan_mode, gan_cap_120, gan_bitrate_120_too_high};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(4, bad_gan_120_bitrate_argv, &invalid_gan, &error));
+
+    char gan_bitrate_150_too_high[] = "--gan-video-bitrate-kbps=126";
+    char *bad_gan_150_bitrate_argv[] = {
+        profile_app, gan_mode, gan_cap_150, gan_bitrate_150_too_high};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(4, bad_gan_150_bitrate_argv, &invalid_gan, &error));
+
+    char gan_pacing_override[] = "--pacing-bitrate=150000";
+    char *bad_gan_pacing_argv[] = {profile_app, gan_mode, gan_pacing_override};
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, bad_gan_pacing_argv, &invalid_gan, &error));
+
     char bad_gan_fps[] = "--gan-fps=9";
     char *bad_gan_argv[] = {profile_app, gan_mode, bad_gan_fps};
-    AppConfig invalid_gan;
     error.clear();
     CHECK(!roi_h265::parseAppConfig(3, bad_gan_argv, &invalid_gan, &error));
 

@@ -90,7 +90,8 @@ void printUsage(const char *program) {
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
-        "          [--gan-fps=8|10|12 --gan-inference-fps=0 --gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
+        "          [--gan-link-cap-kbps=60|100|120|150 --gan-fps=8|10|12 --gan-inference-fps=0]\n"
+        "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
         "          [--intra-refresh=on --intra-refresh-rows=1 --max-reencode-times=3]\n"
         "          [--super-i-frame-bits=12000 --super-p-frame-bits=5500]\n"
         "          [--grayscale-encode=on|off]\n"
@@ -354,10 +355,12 @@ int main(int argc, char **argv) {
     }
     if (gan_mode) {
         std::fprintf(stderr,
-            "GAN H.265-only mode enabled: source/bitstream %dx%d@%d, video=%d bps, GOP=%d, "
+            "GAN H.265-only mode enabled: source/bitstream %dx%d@%d, target=%d bps, "
+            "shared A/V cap=%d bps, GOP=%d, "
             "YOLO ROI/QP only, PC enhancer owns full-frame reconstruction, RB/1=0 PATCH=0 STATE=0\n",
             config.encoder.width, config.encoder.height, config.encoder.fps,
-            config.encoder.target_bitrate_bps, config.encoder.gop);
+            config.encoder.target_bitrate_bps, config.transport.pacing_bitrate_bps,
+            config.encoder.gop);
     }
     if (config.transport.mode == TRANSPORT_MODE_IMAGE) {
         std::fprintf(stderr,
@@ -750,6 +753,10 @@ int main(int argc, char **argv) {
             transport_unit.stream_profile.target_bitrate_kbps =
                 live.rate_profile == RATE_PROFILE_GAN
                     ? static_cast<uint16_t>(live.gan.video_bitrate_kbps)
+                    : 0U;
+            transport_unit.stream_profile.link_cap_kbps =
+                live.rate_profile == RATE_PROFILE_GAN
+                    ? static_cast<uint16_t>(live.gan.link_cap_kbps)
                     : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {
                 std::fprintf(stderr, "UDP transport enqueue error: %s\n", encoder_error.c_str());

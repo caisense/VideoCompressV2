@@ -21,7 +21,8 @@ size_t startCodeLength(const uint8_t *data, size_t length, size_t offset) {
 size_t headerBytes(const RtpStreamProfile *profile) {
     if (!profile || !profile->valid) return kRtpHeaderBytes;
     return kRtpHeaderBytes + kRtpExtensionHeaderBytes + kProfileRecordBytes +
-           (profile->target_bitrate_kbps != 0 ? kProfileTargetTailBytes : 0U);
+           ((profile->target_bitrate_kbps != 0 || profile->link_cap_kbps != 0)
+                ? kProfileTargetTailBytes : 0U);
 }
 
 }  // namespace
@@ -52,14 +53,15 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
         // version-1 eight-byte profile record. It is repeated on every packet
         // so the receiver can restart its decoder before forwarding the first
         // VPS of a new profile; standard RTP/H.265 receivers simply skip it.
-        // GAN appends a four-byte aligned target-bit-rate tail while preserving
-        // the record version and every non-GAN packet's original layout.
-        const bool include_target = profile->target_bitrate_kbps != 0;
+        // GAN appends a four-byte aligned TARGET/CAP tail while preserving the
+        // record version and every non-GAN packet's original layout.
+        const bool include_gan_tail = profile->target_bitrate_kbps != 0 ||
+                                      profile->link_cap_kbps != 0;
         header.reserve(headerBytes(profile));
         header.push_back(0x52);
         header.push_back(0x4f);
         header.push_back(0x00);
-        header.push_back(include_target ? 0x03 : 0x02);
+        header.push_back(include_gan_tail ? 0x03 : 0x02);
         header.push_back(0x01);  // metadata version
         header.push_back(profile->profile);
         header.push_back(static_cast<uint8_t>(profile->width >> 8));
@@ -68,11 +70,11 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
         header.push_back(static_cast<uint8_t>(profile->height));
         header.push_back(profile->fps);
         header.push_back(profile->generation);
-        if (include_target) {
+        if (include_gan_tail) {
             header.push_back(static_cast<uint8_t>(profile->target_bitrate_kbps >> 8));
             header.push_back(static_cast<uint8_t>(profile->target_bitrate_kbps));
-            header.push_back(0x00);  // reserved for a future RO v1 tail field
-            header.push_back(0x00);
+            header.push_back(static_cast<uint8_t>(profile->link_cap_kbps >> 8));
+            header.push_back(static_cast<uint8_t>(profile->link_cap_kbps));
         }
     }
     return header;
