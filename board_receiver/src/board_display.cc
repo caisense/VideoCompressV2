@@ -1,5 +1,6 @@
 #include "board_display.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -35,7 +36,9 @@ bool BoardDisplay::open(std::string* error) {
     }
 }
 
-bool BoardDisplay::show(const DecodedFrame& frame, std::string* error) {
+bool BoardDisplay::show(const DecodedFrame& frame,
+                        const std::vector<std::string>& hud_lines,
+                        std::string* error) {
     if (!open(error)) return false;
     if (frame.nv12.size() < static_cast<size_t>(frame.horizontal_stride) *
                             frame.vertical_stride * 3 / 2) {
@@ -59,6 +62,28 @@ bool BoardDisplay::show(const DecodedFrame& frame, std::string* error) {
         cv::Mat bgr;
         cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
         if (rotate_ccw_) cv::rotate(bgr, bgr, cv::ROTATE_90_COUNTERCLOCKWISE);
+        if (!hud_lines.empty()) {
+            const int font = cv::FONT_HERSHEY_SIMPLEX;
+            const int thickness = 1;
+            double font_scale = 0.42;
+            int baseline = 0;
+            int widest = 0;
+            for (size_t index = 0; index < hud_lines.size(); ++index) {
+                widest = std::max(widest, cv::getTextSize(
+                    hud_lines[index], font, font_scale, thickness, &baseline).width);
+            }
+            const int available = std::max(1, bgr.cols - 16);
+            if (widest > available) font_scale *= static_cast<double>(available) / widest;
+            font_scale = std::max(0.25, font_scale);
+            const int line_height = std::max(15, cv::getTextSize(
+                "Ag", font, font_scale, thickness, &baseline).height + 7);
+            for (size_t index = 0; index < hud_lines.size(); ++index) {
+                const int y = 5 + line_height * static_cast<int>(index + 1) - baseline;
+                cv::putText(bgr, hud_lines[index], cv::Point(8, y), font,
+                            font_scale, cv::Scalar(80, 255, 80), thickness,
+                            cv::LINE_AA);
+            }
+        }
         cv::imshow(kWindow, bgr);
         const int key = cv::waitKey(1);
         return key != 'q' && key != 27;

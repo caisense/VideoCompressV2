@@ -1,4 +1,4 @@
-foreach(test_name IN ITEMS rtp_parser hevc_depacketizer access_unit profile_switch)
+foreach(test_name IN ITEMS rtp_parser hevc_depacketizer access_unit profile_switch receiver_stats)
     add_executable(test_${test_name} test_${test_name}.cc)
     target_link_libraries(test_${test_name} PRIVATE board_receiver_protocol)
     target_include_directories(test_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -20,4 +20,3 @@ if(Python3_Interpreter_FOUND)
                 $<TARGET_FILE:test_sender_packetizer>
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/live_h265_hud.py)
 endif()
-

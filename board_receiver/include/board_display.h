@@ -2,6 +2,7 @@
 #define BOARD_RECEIVER_BOARD_DISPLAY_H_
 
 #include <string>
+#include <vector>
 
 #include "mpp_hevc_decoder.h"
 
@@ -13,7 +14,9 @@ public:
     ~BoardDisplay();
     static void prepareWaylandEnvironment();
     bool open(std::string* error);
-    bool show(const DecodedFrame& frame, std::string* error);
+    bool show(const DecodedFrame& frame,
+              const std::vector<std::string>& hud_lines,
+              std::string* error);
     void close();
 private:
     bool fullscreen_;
@@ -23,4 +26,3 @@ private:
 
 }  // namespace board_receiver
 #endif
-

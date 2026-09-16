@@ -71,12 +71,17 @@ Equivalent explicit command:
 ```sh
 env XDG_RUNTIME_DIR=/run WAYLAND_DISPLAY=wayland-0 \
   ./board_h265_receiver \
-  --udp-port=5004 --display=wayland --fullscreen --rotate=ccw \
+  --udp-port=5004 --display=wayland --fullscreen --rotate=ccw --hud \
   --receive-buffer-bytes=1048576 --reorder-window=32
 ```
 
 Useful diagnostics are `--headless`, `--max-frames=N`,
 `--stats-interval-ms=N`, `--idle-timeout-ms=N`, and `--rotate=none`.
+`scripts/start_receiver.sh` enables `--hud` by default. Pass `--no-hud` after
+the script name to display clean video. The board HUD shows receive/decode FPS,
+RTP and estimated wire bitrate, P/I frame rates and totals, packet/loss/error
+counters, UDP packet rate and packet sizes, active profile/resolution/FPS,
+generation, source age, and IDR age.
 Terminate with SIGINT or SIGTERM.
 
 On board 102, start the existing sender with `--preview=off`, `--audio=off`,

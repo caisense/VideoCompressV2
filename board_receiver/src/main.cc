@@ -33,6 +33,7 @@ struct Options {
     bool headless = false;
     bool fullscreen = false;
     bool rotate_ccw = true;
+    bool hud = false;
 };
 
 bool integerOption(const std::string& argument, const char* name, int* value) {
@@ -57,6 +58,8 @@ bool parseOptions(int argc, char** argv, Options* options) {
         else if (integerOption(arg, "max-frames", &number)) options->max_frames = number;
         else if (arg == "--headless") options->headless = true;
         else if (arg == "--fullscreen") options->fullscreen = true;
+        else if (arg == "--hud") options->hud = true;
+        else if (arg == "--no-hud") options->hud = false;
         else if (arg == "--display=wayland") options->headless = false;
         else if (arg == "--rotate=ccw") options->rotate_ccw = true;
         else if (arg == "--rotate=none") options->rotate_ccw = false;
@@ -134,7 +137,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             last_packet_ms = datagram.received_ms;
-            ++stats.packets;
+            stats.recordPacket(datagram.bytes.size());
             RtpPacket packet;
             if (!parseRtpPacket(datagram.bytes.data(), datagram.bytes.size(), &packet, &error)) continue;
             ReorderResult ordered = reorder.push(packet);
@@ -153,6 +156,7 @@ int main(int argc, char** argv) {
                 const AssemblyResult assembled = assembler.feed(
                     current, profile, payload, ordered.discontinuity);
                 if (!assembled.ready) continue;
+                stats.recordAccessUnit(assembled.access_unit.has_irap);
                 const GateAction action = gate.evaluate(assembled.access_unit);
                 if (action == GATE_DROP) continue;
                 if (action == GATE_RESTART_AND_FORWARD) {
@@ -170,7 +174,7 @@ int main(int argc, char** argv) {
                 }
                 mpp_errors.store(decoder.errorFrames());
                 for (size_t frame_index = 0; frame_index < frames.size(); ++frame_index) {
-                    ++stats.decoded_frames;
+                    stats.recordDecodedFrame();
                     latest.publish(frames[frame_index]);
                 }
             }
@@ -189,7 +193,9 @@ int main(int argc, char** argv) {
             display_height.store(options.rotate_ccw ? frame.width : frame.height);
             if (!options.headless) {
                 std::string error;
-                if (!display.show(frame, &error)) {
+                const std::vector<std::string> hud_lines = options.hud
+                    ? stats.hudLines(mpp_errors.load()) : std::vector<std::string>();
+                if (!display.show(frame, hud_lines, &error)) {
                     std::cerr << "Display stopped: " << error << std::endl;
                     g_running.store(false);
                 }

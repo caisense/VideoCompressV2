@@ -12,6 +12,7 @@ add_library(board_receiver_protocol STATIC
     src/access_unit_assembler.cc
     src/hevc_depacketizer.cc
     src/profile_switch_gate.cc
+    src/receiver_stats.cc
     src/rtp_packet.cc
     src/rtp_reorder_buffer.cc
     src/stream_profile.cc)
@@ -44,7 +45,7 @@ if(BOARD_RECEIVER_BUILD_APP)
     find_package(Threads REQUIRED)
     add_executable(board_h265_receiver
         src/board_display.cc src/glibc_compat.c src/main.cc src/mpp_hevc_decoder.cc
-        src/receiver_stats.cc src/rtp_receiver.cc)
+        src/rtp_receiver.cc)
     target_include_directories(board_h265_receiver PRIVATE
         include ${MPP_INCLUDE_DIR} ${CMAKE_SYSROOT}/usr/include/opencv4)
     target_link_libraries(board_h265_receiver PRIVATE board_receiver_protocol
