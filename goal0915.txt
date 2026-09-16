@@ -1,0 +1,447 @@
+Goal：实现并实机验收 RK3588 Buildroot 板端 H.265 RTP 接收显示程序
+
+工作区：
+D:\work\videoCompressV2
+
+总体目标：
+在现有项目中新建完全独立的 board_receiver 目录，实现一个运行于
+ATK-DLRK3588 Buildroot Linux 的原生 C++ 纯视频接收程序。
+
+测试拓扑：
+- 192.168.0.102：运行现有发送端
+- 192.168.0.101：运行新接收端并连接外接屏
+- 两块板用户名均为 root
+- 两块板密码均为 root
+- 凭据只能交互使用，禁止写入源码、脚本、配置、日志或文档
+
+接收端必须与 tools/live_h265_hud.py 使用相同的线上协议：
+- UDP
+- 默认端口 5004
+- RTP Version 2
+- Payload Type 96
+- 90 kHz RTP timestamp
+- RFC 7798 H.265
+- 项目自定义 RO v1 RTP Header Extension
+- 相同的 profile/generation/宽高/FPS 解释
+- 相同的 Single NAL、AP type 48、FU type 49 解包结果
+- 相同的切档等待随机访问帧语义
+
+只支持：
+- low：profile=0，320×180，10 fps
+- medium：profile=1，480×270，15 fps
+- high：profile=2，640×360，20 fps
+
+注意：
+- 用户口头所说的 med 在线上和发送端命令中应使用 medium
+- 明确拒绝 rebuild、gan 和未知 profile
+- 不实现音频、Codec2、RB/1、GAN增强、图片协议、检测事件或YOLO
+
+一、工作区约束
+
+1. 开始前检查 git status，保护已有用户修改。
+2. 所有新增实现、测试、构建脚本、部署脚本和测试记录均放入：
+   D:\work\videoCompressV2\board_receiver
+3. 原则上不修改现有 cpp、tools、README.md、协议.md。
+4. 如果发现现有发送协议存在阻断性错误，先记录证据并询问用户，不得自行改变线上协议。
+5. 不提交或推送 Git，除非用户另行要求。
+6. 不复制 cpp/3rdparty 中的大型第三方源码；优先链接 Buildroot sysroot 已有库。
+
+二、权威参考文件
+
+实现前必须完整阅读并对照：
+
+- 协议.md
+- tools/live_h265_hud.py
+  - RtpStats._payload_offset
+  - RtpStats._profile_extension
+  - profile_switch_key
+  - ProfileSwitchGate
+  - HevcRtpDepacketizer
+- tools/test_live_h265_hud.py
+- cpp/transport/packetizer.h
+- cpp/transport/packetizer.cc
+- cpp/tests/test_transport.cc
+- cpp/preview/board_preview.h
+- cpp/preview/board_preview.cc
+- cpp/encoder/mpp_h265_encoder.cc
+- cpp/CMakeLists.txt
+- cpp/build-linux.sh
+
+不得根据印象重新定义协议。
+
+三、目标目录
+
+board_receiver/
+├── CMakeLists.txt
+├── build-linux.sh
+├── README.md
+├── include/
+│   ├── rtp_packet.h
+│   ├── rtp_receiver.h
+│   ├── rtp_reorder_buffer.h
+│   ├── stream_profile.h
+│   ├── hevc_depacketizer.h
+│   ├── access_unit_assembler.h
+│   ├── profile_switch_gate.h
+│   ├── mpp_hevc_decoder.h
+│   ├── board_display.h
+│   └── receiver_stats.h
+├── src/
+│   ├── main.cc
+│   ├── rtp_receiver.cc
+│   ├── rtp_reorder_buffer.cc
+│   ├── stream_profile.cc
+│   ├── hevc_depacketizer.cc
+│   ├── access_unit_assembler.cc
+│   ├── profile_switch_gate.cc
+│   ├── mpp_hevc_decoder.cc
+│   ├── board_display.cc
+│   └── receiver_stats.cc
+├── tests/
+│   ├── CMakeLists.txt
+│   ├── test_rtp_parser.cc
+│   ├── test_hevc_depacketizer.cc
+│   ├── test_access_unit.cc
+│   └── test_profile_switch.cc
+├── scripts/
+│   ├── start_receiver.sh
+│   ├── deploy_receiver.ps1
+│   └── test_three_profiles.sh
+└── test-results/
+    └── README.md
+
+文件可根据实现适当合并，但必须保持协议、解码、显示和测试职责分离。
+
+四、接收程序架构
+
+数据路径：
+
+102发送端
+  → UDP 5004
+  → RTP解析
+  → 有界乱序缓冲
+  → RO档位解析
+  → RFC 7798解包
+  → 完整Annex-B Access Unit
+  → 档位/IDR闸门
+  → Rockchip MPP HEVC硬解码
+  → NV12解码帧
+  → 旋转与等比例缩放
+  → Weston/Wayland全屏外接屏
+
+建议类：
+
+1. UdpRtpReceiver
+   - bind 0.0.0.0:5004
+   - SO_RCVBUF 至少 1 MiB
+   - 支持可配置端口
+   - 记录来源地址、包长和接收时间
+   - 干净响应 SIGINT/SIGTERM
+
+2. RtpParser
+   - 验证 RTP V2
+   - 解析 P/X/CC/M/PT
+   - 正确跳过 CSRC
+   - 根据扩展 length 动态计算 payload offset
+   - 正确处理 padding
+   - 只接受 PT=96
+   - 不得假设头长度固定为24或28字节
+
+3. StreamProfileParser
+   - 识别扩展 profile 0x524F，即 "RO"
+   - 只接受 metadata version=1
+   - 解析 profile、width、height、fps、generation
+   - 允许理解8字节和12字节RO布局，但只激活profile 0/1/2
+   - unsupported profile只记录并等待，不送入解码器
+   - 非法宽高/FPS不得触发缓冲区越界或超大分配
+
+4. RtpReorderBuffer
+   - 使用16位sequence的模回绕比较
+   - 有界窗口，不建立无限队列
+   - 重复包丢弃
+   - 窗口外旧包计为reordered/stale
+   - 确认缺包后通知AccessUnitAssembler丢弃当前残缺帧
+   - 目标是保护少量局域网乱序，不增加显著延迟
+
+5. HevcRtpDepacketizer
+   - Single NAL：添加 00 00 00 01
+   - AP type 48：逐个读取16位NAL长度并添加start code
+   - FU type 49：恢复原始HEVC两字节NAL头
+   - FU sequence中断必须清空当前FU
+   - 截断、零长度、越界AP/FU必须拒绝
+   - 输出字节必须与PC HevcRtpDepacketizer一致
+
+6. AccessUnitAssembler
+   - 以RTP timestamp聚合
+   - marker表示当前Access Unit结束
+   - 记录NAL type集合
+   - 识别VPS=32、SPS=33、PPS=34
+   - 识别IRAP/随机访问NAL type 16..21
+   - 有缺包、无marker或FU未完成时丢弃整帧
+
+7. ProfileSwitchGate
+   解码器身份至少包含：
+   - generation
+   - profile
+   - width
+   - height
+   - fps
+
+   首次启动或身份变化后：
+   - 立即停止向旧解码器提交新包
+   - 清空乱序/FU/AU旧状态
+   - 等待新身份的完整VPS/SPS/PPS和IRAP Access Unit
+   - 使用该随机访问单元启动或重建MPP解码器
+   - 旧generation迟到包不得回滚当前档位
+
+8. MppHevcDecoder
+   - 使用 mpp_create
+   - 使用 mpp_init(MPP_CTX_DEC, MPP_VIDEO_CodingHEVC)
+   - 使用 decode_put_packet/decode_get_frame
+   - 必须确认实际使用Rockchip MPP硬件解码
+   - 处理info_change
+   - 正确处理width、height、hor_stride、ver_stride
+   - 处理errinfo、discard、EOS
+   - 档位变化时优先完整重建解码上下文，避免旧stride和旧帧污染
+   - 所有MppPacket、MppFrame、MppBuffer和MppCtx必须RAII释放
+
+9. BoardDisplay
+   首版使用101板已经验证的显示路径：
+   - XDG_RUNTIME_DIR=/run
+   - WAYLAND_DISPLAY=wayland-0
+   - /run/wayland-0
+   - OpenCV HighGUI运行在主线程
+   - 全屏显示，不画YOLO框、mask或HUD
+   - 保持宽高比，必要时黑边
+   - 默认支持ccw90，允许命令行选择none
+   - 正确去除MPP stride区域
+   - 不得让慢显示阻塞网络接收；使用有界latest-only帧交接
+
+五、命令行接口
+
+接收端至少支持：
+
+./board_h265_receiver \
+  --udp-port=5004 \
+  --display=wayland \
+  --fullscreen \
+  --rotate=ccw \
+  --receive-buffer-bytes=1048576 \
+  --reorder-window=32
+
+可选诊断参数：
+
+- --headless
+- --max-frames=N
+- --stats-interval-ms=1000
+- --idle-timeout-ms=3000
+- --log-level=info|debug
+
+日志必须至少显示：
+
+- 当前profile名称
+- width/height/fps/generation
+- RTP包数
+- 接收FPS
+- 解码FPS
+- 丢包、重复、乱序
+- 被拒绝的profile
+- MPP错误帧数
+- 最近IDR年龄
+- 当前显示尺寸
+- 解码器重启次数
+
+六、单元测试
+
+必须包含以下测试：
+
+1. RTP V2/PT96正常包。
+2. 错误版本和错误PT。
+3. CSRC列表。
+4. 无扩展RTP。
+5. 8字节RO扩展。
+6. 12字节RO扩展及正确payload offset。
+7. 截断扩展、非法length、padding。
+8. low/medium/high正确解析。
+9. profile 3、4和未知值必须拒绝。
+10. Single NAL解包。
+11. AP type 48多个NAL解包。
+12. AP长度越界。
+13. FU type 49起始、中间和结束。
+14. FU缺失中间包。
+15. sequence从65535回绕到0。
+16. 重复包和小范围乱序。
+17. 不完整Access Unit不得解码。
+18. 启动时P帧不得越过闸门。
+19. 收到完整VPS/SPS/PPS/IDR后闸门打开。
+20. generation切换后旧P帧不得进入新解码器。
+21. 同generation但几何变化也必须重启。
+22. unsupported profile不能改变当前有效解码器。
+
+增加差分测试：
+- 使用现有发送端packetizer生成测试RTP datagram。
+- 同一批datagram分别交给PC Python解析器和新C++解析器。
+- 比较profile结果、payload offset、NAL type和最终Annex-B字节。
+- 差异必须解释并修正，不得只修改测试预期。
+
+七、交叉编译环境
+
+VMware虚拟机：
+
+F:\BaiduNetdiskDownload\开发板光盘B盘-开发环境及SDK\
+【正点原子】ATK-DLRK3588开发板网盘B盘-开发环境及SDK（2026最新版，推荐使用）\
+01、Ubuntu开发环境\ATK-DLRK3XXX\ATK-DLRK3XXX.vmx
+
+可使用：
+
+C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe
+
+Ubuntu账号：
+- 用户名 alientek
+- 密码 1234
+- 凭据不得落盘
+
+工具链预期：
+- /opt/atk-dlrk3588-toolchain
+- aarch64-buildroot-linux-gnu-gcc
+- aarch64-buildroot-linux-gnu-g++
+
+交叉构建必须：
+- 使用Buildroot sysroot
+- 查找rk_mpi.h和librockchip_mpp
+- 查找目标OpenCV HighGUI/Imgproc
+- 构建产物不能错误链接宿主机x86_64库
+- 使用readelf/file检查为AArch64 ELF
+- 检查动态依赖和目标板glibc兼容性
+- 不盲目捆绑比板端glibc更新的MPP运行库
+
+八、部署与实机测试
+
+预检查：
+- ping 192.168.0.101
+- ping 192.168.0.102
+- SSH登录两板
+- 101确认 /run/wayland-0 和Weston
+- 101确认MPP运行库
+- 102确认摄像头、模型和现有发送程序
+- 确认5004端口没有其他接收器占用
+
+建议部署目录：
+- 101：/opt/atk/board_receiver
+- 102：使用现有 /opt/atk/rknn_yolov8_seg_cam
+
+启动顺序：
+
+1. 先在101启动接收器：
+
+cd /opt/atk/board_receiver
+env LD_LIBRARY_PATH="$PWD/lib" ./board_h265_receiver \
+  --udp-port=5004 \
+  --display=wayland \
+  --fullscreen \
+  --rotate=ccw
+
+2. 再在102启动现有发送端，目标改为101：
+
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=low \
+  --mode=segmentation \
+  --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.101 \
+  --udp-port=5004 \
+  --audio=off \
+  --preview=off \
+  --profile-control=/tmp/roi-rate-profile
+
+3. 运行时切档：
+
+echo low > /tmp/roi-rate-profile
+echo medium > /tmp/roi-rate-profile
+echo high > /tmp/roi-rate-profile
+
+九、实机验收矩阵
+
+A. 单档冒烟测试
+- low运行至少60秒
+- medium运行至少60秒
+- high运行至少60秒
+- 每档确认外接屏有连续画面
+- 日志中的profile、宽高、FPS与发送端一致
+- 实际局域网正常条件下不应出现持续解码错误
+
+B. 连续切档
+- 按 low → medium → high → low 循环
+- 每20秒切换一次
+- 至少30次切换
+- 接收程序不得重启或崩溃
+- 每次应识别新generation
+- 等待新VPS/SPS/PPS/IDR后恢复
+- 不得出现旧尺寸帧覆盖新档画面
+
+C. 异常测试
+- 接收端晚于发送端启动
+- 短暂断网后恢复
+- 发送端停止并重新启动，generation重新从0开始
+- 注入单包丢失、FU缺片和小范围乱序
+- 发送profile 3/4测试包，接收端必须拒绝且保持稳定
+
+D. 稳定性
+- high档连续运行至少30分钟
+- 记录RSS、CPU、接收/解码FPS和错误计数
+- 内存不得持续线性增长
+- 停止后UDP端口、MPP和显示资源必须释放
+
+十、外接屏验收证据
+
+仅凭“解码日志正常”不能证明外接屏完成。
+
+必须至少取得一种证据：
+- Weston截图工具捕获实际显示输出；或
+- 用户提供外接屏照片并明确确认；或
+- 可验证的显示输出截图加101端进程/时间对应关系
+
+应确认：
+- 无黑屏、绿屏和持续花屏
+- 横竖方向正确
+- 比例正确
+- 切档后显示尺寸正确
+- 不显示YOLO框、mask或PC HUD
+
+十一、结果记录
+
+在 board_receiver/test-results 下保存：
+
+- 构建日期与Git revision
+- 交叉编译完整命令
+- file/readelf/ldd结果
+- 101接收端启动命令和日志
+- 102发送端启动命令和日志
+- 三档测试结果
+- 连续切档结果
+- 稳定性结果
+- 外接屏验证证据说明
+- 已知问题
+
+日志中不得出现密码。
+
+十二、完成标准
+
+只有以下条件全部有证据时才算Goal完成：
+
+1. board_receiver为独立目录。
+2. 协议实现与PC接收端完成差分验证。
+3. 所有协议单元测试通过。
+4. AArch64 Buildroot交叉编译通过。
+5. 101成功运行MPP硬件解码接收端。
+6. 102能够向101发送low、medium、high。
+7. 三档均能在101外接屏显示。
+8. 运行时切档无须重启接收程序。
+9. rebuild/gan/未知档位被明确拒绝。
+10. 丢包、乱序、重启和几何变化不会导致崩溃或错误代次回滚。
+11. 30分钟稳定性测试通过。
+12. README和test-results能够让第三方复现完整流程。
+
+若102未上线、外接屏不可见、VMware无法启动或缺少MPP/OpenCV目标库，
+不得把局部实现标记为完成；应先穷尽安全诊断，再明确记录外部阻塞条件。
