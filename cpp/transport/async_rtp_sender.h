@@ -16,6 +16,7 @@
 
 #include "common/frame_meta.h"
 #include "transport/packetizer.h"
+#include "transport/local_tx_rate_publisher.h"
 #include "transport/udp_sender.h"
 
 namespace roi_h265 {
@@ -38,13 +39,14 @@ struct AsyncRtpSenderSnapshot {
     uint64_t last_sent_frame_id;
     uint64_t last_capture_to_send_us;
     uint64_t last_queue_delay_us;
+    uint32_t tx_wire_bps;
     bool waiting_for_key_frame;
     bool sending;
 
     AsyncRtpSenderSnapshot()
         : queued_frames(0), queued_bytes(0), sent_frames(0), dropped_p_frames(0),
           dropped_key_frames(0), last_sent_frame_id(0), last_capture_to_send_us(0),
-          last_queue_delay_us(0), waiting_for_key_frame(false), sending(false) {}
+          last_queue_delay_us(0), tx_wire_bps(0), waiting_for_key_frame(false), sending(false) {}
 };
 
 // Owns the blocking token bucket and UDP socket on a dedicated worker thread.
@@ -55,7 +57,8 @@ class AsyncRtpSender {
 public:
     AsyncRtpSender(const std::string &host, int port, int pacing_bitrate_bps, int mtu,
                    size_t max_queue_frames, int max_queue_latency_ms,
-                   const std::shared_ptr<RatePacer> &pacer = std::shared_ptr<RatePacer>());
+                   const std::shared_ptr<RatePacer> &pacer = std::shared_ptr<RatePacer>(),
+                   const std::string &tx_rate_socket_path = "/tmp/board_tx_wire_rate.sock");
     ~AsyncRtpSender();
 
     bool start(std::string *error);
@@ -75,6 +78,13 @@ private:
         std::chrono::steady_clock::time_point enqueued_at;
     };
 
+    struct WireSample {
+        std::chrono::steady_clock::time_point at;
+        size_t bytes;
+        WireSample(const std::chrono::steady_clock::time_point &value_at,
+                   size_t value_bytes) : at(value_at), bytes(value_bytes) {}
+    };
+
     static uint32_t rtpTimestamp(uint64_t pts_us);
     void workerLoop();
     void dropAllPFramesLocked();
@@ -84,6 +94,7 @@ private:
 
     UdpSender udp_sender_;
     H265RtpPacketizer packetizer_;
+    LocalTxRatePublisher tx_rate_publisher_;
     const size_t max_queue_frames_;
     const std::chrono::milliseconds max_queue_latency_;
 
@@ -103,6 +114,7 @@ private:
     uint64_t last_sent_frame_id_;
     uint64_t last_capture_to_send_us_;
     uint64_t last_queue_delay_us_;
+    std::deque<WireSample> wire_samples_;
 };
 
 }  // namespace roi_h265

@@ -11,8 +11,22 @@ video through the board's Weston/Wayland OpenCV HighGUI backend.
 - RTP version 2, payload type 96, 90 kHz timestamps
 - RFC 7798 Single NAL, AP type 48, and FU type 49
 - RTP extension profile `0x524f` (`RO`), metadata version 1
-- `low` (0, 320x180 at 10 fps), `medium` (1, 480x270 at 15 fps), and
-  `high` (2, 640x360 at 20 fps)
+- eight ordinary rate profiles:
+
+| ID | Name | Encoded video | H.265 target / shared wire cap |
+| ---: | --- | --- | --- |
+| 0 | `rate60` | 320x180 @ 10, grayscale | 42 / 60 kbps |
+| 5 | `rate80` | 320x180 @ 10, color | 56 / 80 kbps |
+| 6 | `rate100` | 384x216 @ 10, color | 72 / 100 kbps |
+| 7 | `rate120` | 480x270 @ 10, color | 88 / 120 kbps |
+| 1 | `rate150` | 480x270 @ 15, color | 110 / 150 kbps |
+| 8 | `rate180` | 512x288 @ 15, color | 135 / 180 kbps |
+| 9 | `rate200` | 512x288 @ 18, color | 150 / 200 kbps |
+| 2 | `rate300` | 640x360 @ 20, color | 240 / 300 kbps |
+
+The rate number is the shared physical A/V cap, not the raw H.265 target.
+`rate150` is the renamed former medium profile; there is no duplicate 150 kbps
+profile. Wire IDs 0/1/2 are retained for old-sender compatibility.
 
 Profiles 3 (`rebuild`), 4 (`gan`), and unknown values are parsed only so they
 can be explicitly rejected. Audio, Codec2, image packets, GAN, and inference
@@ -78,23 +92,25 @@ env XDG_RUNTIME_DIR=/run WAYLAND_DISPLAY=wayland-0 \
 Useful diagnostics are `--headless`, `--max-frames=N`,
 `--stats-interval-ms=N`, `--idle-timeout-ms=N`, and `--rotate=none`.
 `scripts/start_receiver.sh` enables `--hud` by default. Pass `--no-hud` after
-the script name to display clean video. The board HUD shows receive/decode FPS,
-RTP and estimated wire bitrate, P/I frame rates and totals, packet/loss/error
-counters, UDP packet rate and packet sizes, active profile/resolution/FPS,
-generation, source age, and IDR age.
+the script name to display clean video. The board HUD contains five green-text
+lines with no black mask: this board's locally measured physical transmit bitrate
+(`TX`) and locally estimated physical receive bitrate (`RX`) in kbps; cumulative P/I/total
+frame counts; packet/loss/reorder/decode-error counters; active
+profile/resolution/FPS/generation; and source/IDR age. TX and RX use the same
+Ethernet-wire accounting. The local sender publishes TX through the Unix datagram
+socket `/tmp/board_tx_wire_rate.sock`; it is not part of the RTP protocol. If no
+local sender telemetry arrives for two seconds, the HUD displays `TX --`.
 Terminate with SIGINT or SIGTERM.
 
 On board 102, start the existing sender with `--preview=off`, `--audio=off`,
 and `--udp-host=192.168.0.101`. Use `--send-queue-frames=16` and
-`--send-max-latency-ms=2000`: the default 250 ms queue lifetime is shorter than
-a paced high-profile IDR and can trigger avoidable P-frame recovery drops.
-These values remain bounded and passed the high-profile board test. The online
-spelling for the middle profile is `medium`, not `med`. Runtime switching uses:
+`--send-max-latency-ms=2000`. These are also the normal rate-profile defaults.
+Runtime switching supports all eight physical-link caps:
 
 ```sh
-echo low > /tmp/roi-rate-profile
-echo medium > /tmp/roi-rate-profile
-echo high > /tmp/roi-rate-profile
+for profile in rate60 rate80 rate100 rate120 rate150 rate180 rate200 rate300; do
+  echo "$profile" > /tmp/roi-rate-profile
+done
 ```
 
 ## Two-board full-duplex startup
@@ -127,7 +143,7 @@ mkfifo /tmp/roi-rate-profile
 
 env LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   ./rknn_yolov8_seg_cam \
-  --rate-profile=medium \
+  --rate-profile=rate150 \
   --mode=segmentation \
   --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
@@ -158,7 +174,7 @@ mkfifo /tmp/roi-rate-profile
 
 env LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   ./rknn_yolov8_seg_cam \
-  --rate-profile=medium \
+  --rate-profile=rate150 \
   --mode=segmentation \
   --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
@@ -175,9 +191,14 @@ To change the outgoing profile on either board, open another SSH terminal to
 that board and write one of these values to its local control FIFO:
 
 ```sh
-echo low > /tmp/roi-rate-profile
-echo medium > /tmp/roi-rate-profile
-echo high > /tmp/roi-rate-profile
+echo rate60  > /tmp/roi-rate-profile
+echo rate80  > /tmp/roi-rate-profile
+echo rate100 > /tmp/roi-rate-profile
+echo rate120 > /tmp/roi-rate-profile
+echo rate150 > /tmp/roi-rate-profile
+echo rate180 > /tmp/roi-rate-profile
+echo rate200 > /tmp/roi-rate-profile
+echo rate300 > /tmp/roi-rate-profile
 ```
 
 The two directions switch independently. Stop each foreground sender and
@@ -186,6 +207,6 @@ receiver with `Ctrl+C`. Do not recreate the FIFO while its sender is running.
 ## Validation
 
 Save commands and password-free logs under `test-results/`. Completion requires
-all protocol tests, AArch64 ELF/ABI checks, three 60-second profile runs,
-30 repeated switches, fault recovery, a 30-minute high-profile soak, and direct
+all protocol tests, AArch64 ELF/ABI checks, eight 60-second profile runs,
+30 repeated switches, fault recovery, a 30-minute rate300 soak, and direct
 external-screen evidence. Decoder logs alone are not screen evidence.

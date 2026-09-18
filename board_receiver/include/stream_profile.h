@@ -10,11 +10,16 @@
 namespace board_receiver {
 
 enum ProfileId {
-    PROFILE_LOW = 0,
-    PROFILE_MEDIUM = 1,
-    PROFILE_HIGH = 2,
+    PROFILE_RATE60 = 0,
+    PROFILE_RATE150 = 1,
+    PROFILE_RATE300 = 2,
     PROFILE_REBUILD = 3,
     PROFILE_GAN = 4,
+    PROFILE_RATE80 = 5,
+    PROFILE_RATE100 = 6,
+    PROFILE_RATE120 = 7,
+    PROFILE_RATE180 = 8,
+    PROFILE_RATE200 = 9,
 };
 
 enum ProfileParseStatus {
@@ -33,7 +38,6 @@ struct StreamProfile {
     uint8_t generation;
     uint16_t target_bitrate_kbps;
     uint16_t link_cap_kbps;
-
     StreamProfile();
     const char* name() const;
     bool supported() const;

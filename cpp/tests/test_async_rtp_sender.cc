@@ -107,12 +107,33 @@ void testRuntimeProfileSwitchRequiresFreshIdr() {
     close(receiver);
 }
 
+void testSenderReportsPhysicalWireRate() {
+    uint16_t port = 0;
+    const int receiver = makeLoopbackReceiver(&port);
+    CHECK(receiver >= 0);
+    roi_h265::AsyncRtpSender sender("127.0.0.1", port, 1000000, 1200, 3, 1000);
+    std::string error;
+    CHECK(sender.start(&error));
+    CHECK(sender.enqueue(makeUnit(1, true, 100), &error));
+    roi_h265::AsyncRtpSenderSnapshot snapshot;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        snapshot = sender.snapshot();
+        if (snapshot.sent_frames == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(snapshot.sent_frames == 1);
+    CHECK(snapshot.tx_wire_bps == 1440U);
+    sender.stop();
+    close(receiver);
+}
+
 }  // namespace
 
 int main() {
     testEnqueueDoesNotWaitForPacer();
     testBacklogDropsPAndRequestsRecoveryIdr();
     testRuntimeProfileSwitchRequiresFreshIdr();
+    testSenderReportsPhysicalWireRate();
     if (failures) return EXIT_FAILURE;
     std::cout << "asynchronous RTP sender tests passed\n";
     return EXIT_SUCCESS;

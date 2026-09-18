@@ -9,8 +9,9 @@
 ```
 ## Rate profiles
 
-Use `--rate-profile=low|medium|high|rebuild|gan` (or the shorter `--profile=`) to select a
-complete synchronized sender profile. Options written after `low`/`medium`/`high`
+Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan`
+(or the shorter `--profile=`) to select a complete synchronized sender profile.
+Options written after an ordinary `rateNN` profile
 can override individual values. `rebuild` is deliberately atomic: its wire size,
 FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
 options from another profile. `gan` is also atomic: it is H.265-only on the wire,
@@ -20,24 +21,49 @@ and never starts the rebuild side channels. Generic encoder geometry and
 
 | Profile | Wire source / FPS | H.265 target | Shared physical A/V cap | PC display |
 | --- | --- | ---: | ---: | --- |
-| `low` | 320×180 / 10 fps | 42 kbps | 60 kbps | decoded grayscale video |
-| `medium` | 480×270 / 15 fps | 110 kbps | 150 kbps | decoded color video |
-| `high` | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
+| `rate60` (ID 0, former low) | 320×180 / 10 fps | 42 kbps | 60 kbps | decoded grayscale video |
+| `rate80` (ID 5) | 320×180 / 10 fps | 56 kbps | 80 kbps | decoded color video |
+| `rate100` (ID 6) | 384×216 / 10 fps | 72 kbps | 100 kbps | decoded color video |
+| `rate120` (ID 7) | 480×270 / 10 fps | 88 kbps | 120 kbps | decoded color video |
+| `rate150` (ID 1, former medium) | 480×270 / 15 fps | 110 kbps | 150 kbps | decoded color video |
+| `rate180` (ID 8) | 512×288 / 15 fps | 135 kbps | 180 kbps | decoded color video |
+| `rate200` (ID 9) | 512×288 / 18 fps | 150 kbps | 200 kbps | decoded color video |
+| `rate300` (ID 2, former high) | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
 | `rebuild` | 256×144 / 6 fps | 28 kbps | **100 kbps** | reconstructed 640×360 / 12 fps |
 | `gan` CAP 60 | 256×144 / **8 fps** default | 45 kbps | **60 kbps** | x2 512×288, then Lanczos4 640×360 |
 | `gan` CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
 | `gan` CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x2 native 640×360 |
 | `gan` CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360, recommended |
 
+The ordinary rate presets use the following encoder details. `I QP` is the
+inclusive I-frame QP range; frame limits are bits.
+
+| Profile | QP init | I QP | max I | max P | background ΔQP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `rate60` | 38 | 36–48 | 12000 | 5500 | +12 |
+| `rate80` | 37 | 35–47 | 16000 | 7000 | +12 |
+| `rate100` | 36 | 34–46 | 22000 | 9000 | +11 |
+| `rate120` | 35 | 33–45 | 28000 | 11000 | +10 |
+| `rate150` | 34 | 32–44 | 35000 | 14000 | +10 |
+| `rate180` | 33 | 31–44 | 42000 | 17000 | +8 |
+| `rate200` | 32 | 30–43 | 48000 | 19000 | +8 |
+| `rate300` | 30 | 28–42 | 60000 | 24000 | +6 |
+
+All ordinary presets use `qp_min=10`, `qp_max=51`, `halo_delta_qp=2`,
+`core_delta_qp=-6`, `edge_delta_qp=-10`, one-row intra refresh, at most three
+re-encodes, MTU 1200, a 16-frame send queue, and a 2000 ms send-age limit.
+The old CLI/FIFO names are rejected with migration hints: low → rate60,
+medium → rate150, and high → rate300.
+
 Examples:
 
 ```bash
-./rknn_yolov8_seg_cam --rate-profile=low --model=model/yolov8_seg.rknn \
+./rknn_yolov8_seg_cam --rate-profile=rate60 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
   --audio=on --audio-device=hw:3,0 --audio-udp-port=5006
-./rknn_yolov8_seg_cam --rate-profile=medium --model=model/yolov8_seg.rknn \
+./rknn_yolov8_seg_cam --rate-profile=rate150 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
-./rknn_yolov8_seg_cam --rate-profile=high --model=model/yolov8_seg.rknn \
+./rknn_yolov8_seg_cam --rate-profile=rate300 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
 ./rknn_yolov8_seg_cam --rate-profile=rebuild --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
@@ -271,9 +297,14 @@ The sender can change H.265 profiles or switch into detection-triggered image
 mode without restarting. By default it creates the FIFO `/tmp/roi-rate-profile`:
 
 ```bash
-echo low > /tmp/roi-rate-profile
-echo medium > /tmp/roi-rate-profile
-echo high > /tmp/roi-rate-profile
+echo rate60 > /tmp/roi-rate-profile
+echo rate80 > /tmp/roi-rate-profile
+echo rate100 > /tmp/roi-rate-profile
+echo rate120 > /tmp/roi-rate-profile
+echo rate150 > /tmp/roi-rate-profile
+echo rate180 > /tmp/roi-rate-profile
+echo rate200 > /tmp/roi-rate-profile
+echo rate300 > /tmp/roi-rate-profile
 echo rebuild > /tmp/roi-rate-profile
 echo gan > /tmp/roi-rate-profile
 echo image > /tmp/roi-rate-profile
@@ -281,7 +312,7 @@ echo video > /tmp/roi-rate-profile
 ```
 
 Use `--profile-control=/another/path` to move the FIFO, or
-`--profile-control=` to disable runtime control. `low`/`medium`/`high`/`rebuild` enter
+`--profile-control=` to disable runtime control. Ordinary `rateNN` profiles and `rebuild` enter
 video mode; `gan` enters the H.265-only full-frame path and keeps RB/1, RSNP and
 ROEV disabled. `image` (or `snapshot`) drains the H.265 access unit currently on
 the wire, drops queued dependency frames, shuts down MPP, and keeps camera plus
@@ -293,14 +324,18 @@ Every RTP packet carries an RFC 3550 header extension identified by `0x524f`
 (`RO`) with metadata version, profile, width, height, FPS and generation. GAN
 packets additionally append network-order 16-bit `TARGET` and `CAP` fields:
 `TARGET` is `gan_video_bitrate_kbps`, and `CAP` is the selected shared physical
-link ceiling. They reuse the existing four-byte GAN tail, so non-GAN packets
-retain the original eight-byte profile record and RFC 7798 H.265 payload remains
-unchanged. A receiver treats the former `TARGET` + zero-reserved tail and the
-older no-tail GAN record as CAP 100; the latter displays `TARGET --`. The HUD
+link ceiling. Non-GAN packets retain the original eight-byte profile record.
+A receiver treats the former `TARGET` + zero-reserved tail
+and the older no-tail GAN record as CAP 100; the latter displays `TARGET --`. The HUD
 buffers the first complete random-access unit of each generation/geometry,
 converts RFC 7798 packets directly to Annex-B, and restarts only its internal
 FFmpeg pipe decoder and full-frame worker. It follows the new SPS dimensions;
 the receiver application does not restart.
+
+On a board running both processes, the sender publishes its preceding-one-second
+physical video transmit rate to `/tmp/board_tx_wire_rate.sock` using a local Unix
+datagram. The board receiver uses that local value for HUD `TX`; `RX` remains its
+own receive-side wire estimate. TX telemetry is not carried to the peer in RTP.
 
 With only one serial console, start the sender in the background and write the
 same FIFO from that shell; a second serial terminal is not required:
@@ -323,7 +358,7 @@ A standard FFmpeg/GStreamer/libavcodec receiver can decode the resulting stream.
 
 Optional audio is a separate Codec2 RTP stream on UDP 5006. It is disabled by
 default so a camera-only board keeps its prior behavior. When enabled, `main()`
-partitions the `60/150/300/100 kbps` physical-wire ceiling into an audio child
+partitions the selected rate/rebuild physical-wire ceiling into an audio child
 bucket and a video child bucket; it is a total cap, not one cap per media
 stream. The recommended constrained-link
 profile uses Codec2-2400 and four 20 ms frames per RTP packet (80 ms ptime).
@@ -518,7 +553,7 @@ no extra delay.
 ```bash
 cd /opt/atk/rknn_yolov8_seg_cam
 LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
-  --transport-mode=image --rate-profile=low --mode=segmentation \
+  --transport-mode=image --rate-profile=rate60 --mode=segmentation \
   --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
   --camera-width=1920 --camera-height=1080 --fps=10 \
   --udp-host=192.168.0.100 --pacing-bitrate=60000 \
@@ -602,7 +637,7 @@ flowchart TD
     DTX --> AQ["有界整 RTP 包队列\n160 ms 上限，丢最旧语音"]
     AQ --> ARTP["私有动态 Codec2 RTP\nPT 97 / UDP :5006"]
     ARTP --> PACER
-    CTRL["/tmp/roi-rate-profile\necho low / medium / high / rebuild / image / video"] -. "运行时切换" .-> MPP
+    CTRL["/tmp/roi-rate-profile\necho rate60..rate300 / rebuild / image / video"] -. "运行时切换" .-> MPP
     CTRL -. "图片模式启停" .-> SNAPQ
     RTP -. "RTP扩展: 档位/尺寸/FPS/代次" .-> PROXY
     PACER --> UDP["H.265 UDP socket :5004"]
@@ -1001,7 +1036,7 @@ board. The HUDs can be started before the senders and wait for a complete IDR.
 # Board A terminal
 cd /opt/atk/rknn_yolov8_seg_cam
 LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
-  --rate-profile=low --mode=segmentation --model=model/yolov8_seg.rknn \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5004 \
   --audio=off --preview=off
@@ -1011,7 +1046,7 @@ LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
 # Board B terminal
 cd /opt/atk/rknn_yolov8_seg_cam
 LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
-  --rate-profile=low --mode=segmentation --model=model/yolov8_seg.rknn \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 \
   --udp-host=192.168.0.100 --udp-port=5005 \
   --audio=off --preview=off

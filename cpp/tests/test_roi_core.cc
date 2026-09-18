@@ -148,6 +148,71 @@ void testRegionMergeAndPriorityLimit() {
     CHECK(merged[0].x == 0 && merged[0].width == 64 && merged[0].height == 16);
 }
 
+void testRateProfilePresets() {
+    struct Expected {
+        const char *name;
+        roi_h265::RateProfile profile;
+        int wire_id;
+        int width;
+        int height;
+        int fps;
+        int target;
+        int cap;
+        int gop;
+        int qp_init;
+        int qp_min_i;
+        int qp_max_i;
+        int super_i;
+        int super_p;
+        int background_delta;
+        bool grayscale;
+    };
+    const Expected expected[] = {
+        {"rate60", roi_h265::RATE_PROFILE_RATE60, 0, 320, 180, 10, 42000, 60000, 50, 38, 36, 48, 12000, 5500, 12, true},
+        {"rate80", roi_h265::RATE_PROFILE_RATE80, 5, 320, 180, 10, 56000, 80000, 50, 37, 35, 47, 16000, 7000, 12, false},
+        {"rate100", roi_h265::RATE_PROFILE_RATE100, 6, 384, 216, 10, 72000, 100000, 50, 36, 34, 46, 22000, 9000, 11, false},
+        {"rate120", roi_h265::RATE_PROFILE_RATE120, 7, 480, 270, 10, 88000, 120000, 50, 35, 33, 45, 28000, 11000, 10, false},
+        {"rate150", roi_h265::RATE_PROFILE_RATE150, 1, 480, 270, 15, 110000, 150000, 75, 34, 32, 44, 35000, 14000, 10, false},
+        {"rate180", roi_h265::RATE_PROFILE_RATE180, 8, 512, 288, 15, 135000, 180000, 75, 33, 31, 44, 42000, 17000, 8, false},
+        {"rate200", roi_h265::RATE_PROFILE_RATE200, 9, 512, 288, 18, 150000, 200000, 90, 32, 30, 43, 48000, 19000, 8, false},
+        {"rate300", roi_h265::RATE_PROFILE_RATE300, 2, 640, 360, 20, 240000, 300000, 100, 30, 28, 42, 60000, 24000, 6, false},
+    };
+    for (size_t index = 0; index < sizeof(expected) / sizeof(expected[0]); ++index) {
+        roi_h265::RateProfile parsed = roi_h265::RATE_PROFILE_REBUILD;
+        CHECK(roi_h265::parseRateProfile(expected[index].name, &parsed));
+        CHECK(parsed == expected[index].profile);
+        CHECK(static_cast<int>(parsed) == expected[index].wire_id);
+        CHECK(std::string(roi_h265::rateProfileName(parsed)) == expected[index].name);
+        AppConfig config;
+        roi_h265::applyRateProfile(parsed, &config);
+        CHECK(config.rate_profile == parsed);
+        CHECK(config.encoder.width == expected[index].width);
+        CHECK(config.encoder.height == expected[index].height);
+        CHECK(config.encoder.fps == expected[index].fps);
+        CHECK(config.encoder.target_bitrate_bps == expected[index].target);
+        CHECK(config.transport.pacing_bitrate_bps == expected[index].cap);
+        CHECK(config.encoder.gop == expected[index].gop);
+        CHECK(config.encoder.qp_min == 10 && config.encoder.qp_max == 51);
+        CHECK(config.encoder.qp_init == expected[index].qp_init);
+        CHECK(config.encoder.qp_min_i == expected[index].qp_min_i);
+        CHECK(config.encoder.qp_max_i == expected[index].qp_max_i);
+        CHECK(config.encoder.super_i_frame_bits == expected[index].super_i);
+        CHECK(config.encoder.super_p_frame_bits == expected[index].super_p);
+        CHECK(config.encoder.grayscale_encode == expected[index].grayscale);
+        CHECK(config.roi.background_delta_qp == expected[index].background_delta);
+        CHECK(config.roi.halo_delta_qp == 2);
+        CHECK(config.roi.core_delta_qp == -6);
+        CHECK(config.roi.edge_delta_qp == -10);
+        CHECK(config.encoder.intra_refresh && config.encoder.intra_refresh_rows == 1);
+        CHECK(config.encoder.max_reencode_times == 3);
+        CHECK(config.transport.mtu == 1200);
+        CHECK(config.transport.send_queue_frames == 16);
+        CHECK(config.transport.send_max_latency_ms == 2000);
+    }
+    CHECK(static_cast<int>(roi_h265::RATE_PROFILE_REBUILD) == 3);
+    CHECK(static_cast<int>(roi_h265::RATE_PROFILE_GAN) == 4);
+}
+
 void testCommandLineConfig() {
     char app[] = "roi_sender";
     char width[] = "--encoder-width=320";
@@ -271,21 +336,21 @@ void testCommandLineConfig() {
     CHECK(audio.audio.preprocess.voice_min_voicing_percent == 65);
 
     char profile_app[] = "roi_sender";
-    char profile_high[] = "--rate-profile=high";
-    char *profile_argv[] = {profile_app, profile_high};
-    AppConfig high;
-    CHECK(roi_h265::parseAppConfig(2, profile_argv, &high, &error));
-    CHECK(high.encoder.width == 640 && high.encoder.height == 360);
-    CHECK(high.encoder.fps == 20 && high.transport.pacing_bitrate_bps == 300000);
-    CHECK(!high.encoder.grayscale_encode);
+    char profile_rate300[] = "--rate-profile=rate300";
+    char *profile_argv[] = {profile_app, profile_rate300};
+    AppConfig rate300;
+    CHECK(roi_h265::parseAppConfig(2, profile_argv, &rate300, &error));
+    CHECK(rate300.encoder.width == 640 && rate300.encoder.height == 360);
+    CHECK(rate300.encoder.fps == 20 && rate300.transport.pacing_bitrate_bps == 300000);
+    CHECK(!rate300.encoder.grayscale_encode);
 
-    char profile_medium[] = "--profile=medium";
-    char *medium_argv[] = {profile_app, profile_medium};
-    AppConfig medium;
+    char profile_rate150[] = "--profile=rate150";
+    char *rate150_argv[] = {profile_app, profile_rate150};
+    AppConfig rate150;
     error.clear();
-    CHECK(roi_h265::parseAppConfig(2, medium_argv, &medium, &error));
-    CHECK(medium.encoder.width == 480 && medium.encoder.height == 270);
-    CHECK(medium.encoder.fps == 15 && medium.transport.pacing_bitrate_bps == 150000);
+    CHECK(roi_h265::parseAppConfig(2, rate150_argv, &rate150, &error));
+    CHECK(rate150.encoder.width == 480 && rate150.encoder.height == 270);
+    CHECK(rate150.encoder.fps == 15 && rate150.transport.pacing_bitrate_bps == 150000);
 
     char profile_rebuild[] = "--profile=rebuild";
     char *rebuild_argv[] = {profile_app, profile_rebuild};
@@ -451,13 +516,25 @@ void testCommandLineConfig() {
     CHECK(!roi_h265::parseAppConfig(3, invalid_rebuild_argv, &invalid_rebuild, &error));
     CHECK(error.find("rebuild is an atomic") != std::string::npos);
 
-    roi_h265::RateProfile parsed_profile = roi_h265::RATE_PROFILE_LOW;
-    CHECK(roi_h265::parseRateProfile("high", &parsed_profile));
-    CHECK(parsed_profile == roi_h265::RATE_PROFILE_HIGH);
-    roi_h265::applyRateProfile(parsed_profile, &medium);
-    CHECK(medium.rate_profile == roi_h265::RATE_PROFILE_HIGH);
-    CHECK(medium.encoder.width == 640 && medium.encoder.fps == 20);
-    CHECK(std::string(roi_h265::rateProfileName(medium.rate_profile)) == "high");
+    roi_h265::RateProfile parsed_profile = roi_h265::RATE_PROFILE_RATE60;
+    CHECK(roi_h265::parseRateProfile("rate300", &parsed_profile));
+    CHECK(parsed_profile == roi_h265::RATE_PROFILE_RATE300);
+    roi_h265::applyRateProfile(parsed_profile, &rate150);
+    CHECK(rate150.rate_profile == roi_h265::RATE_PROFILE_RATE300);
+    CHECK(rate150.encoder.width == 640 && rate150.encoder.fps == 20);
+    CHECK(std::string(roi_h265::rateProfileName(rate150.rate_profile)) == "rate300");
+
+    const char *legacy_names[] = {"low", "medium", "high"};
+    const char *replacement_names[] = {"rate60", "rate150", "rate300"};
+    for (size_t index = 0; index < 3; ++index) {
+        std::string option = std::string("--rate-profile=") + legacy_names[index];
+        char *legacy_argv[] = {profile_app, &option[0]};
+        AppConfig legacy;
+        error.clear();
+        CHECK(!roi_h265::parseAppConfig(2, legacy_argv, &legacy, &error));
+        CHECK(error.find(replacement_names[index]) != std::string::npos);
+        CHECK(!roi_h265::parseRateProfile(legacy_names[index], &parsed_profile));
+    }
 
     char bad_mtu[] = "--mtu=63";
     char *bad_argv[] = {app, bad_mtu};
@@ -500,6 +577,7 @@ int main() {
     testSourceToEncoderMapping();
     testTemporalHysteresisAndAge();
     testRegionMergeAndPriorityLimit();
+    testRateProfilePresets();
     testCommandLineConfig();
     if (failures != 0) {
         std::cerr << failures << " ROI core test(s) failed\n";

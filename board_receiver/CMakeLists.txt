@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(Threads REQUIRED)
+
 option(BOARD_RECEIVER_BUILD_APP "Build the RK3588 receiver application" ON)
 option(BOARD_RECEIVER_BUILD_TESTS "Build protocol unit tests" ON)
 
@@ -42,9 +44,9 @@ if(BOARD_RECEIVER_BUILD_APP)
             PATHS ${CMAKE_SYSROOT}/usr/lib ${CMAKE_SYSROOT}/usr/lib64
             NO_DEFAULT_PATH REQUIRED)
     endforeach()
-    find_package(Threads REQUIRED)
     add_executable(board_h265_receiver
-        src/board_display.cc src/glibc_compat.c src/main.cc src/mpp_hevc_decoder.cc
+        src/board_display.cc src/glibc_compat.c src/local_tx_rate_receiver.cc
+        src/main.cc src/mpp_hevc_decoder.cc
         src/rtp_receiver.cc)
     target_include_directories(board_h265_receiver PRIVATE
         include ${MPP_INCLUDE_DIR} ${CMAKE_SYSROOT}/usr/include/opencv4)

@@ -1,0 +1,15 @@
+ROI core tests passed
+audio preprocessor tests passed
+audio DTX tests passed
+bounded audio queue tests passed
+transport tests passed
+UDP sender tests passed
+Snapshot protocol tests passed
+Detection event protocol tests passed
+Detection event sent: seq=1 frame=10 present_mask=0x0001 entered_mask=0x0001 exited_mask=0x0000
+Detection event sent: seq=3 frame=12 present_mask=0x0000 entered_mask=0x0000 exited_mask=0x0001
+Detection event sender tests passed
+Snapshot crop tests passed
+rebuild protocol tests passed
+asynchronous RTP sender tests passed
+statistics tests passed

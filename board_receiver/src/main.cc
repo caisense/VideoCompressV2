@@ -12,6 +12,7 @@
 #include "access_unit_assembler.h"
 #include "board_display.h"
 #include "hevc_depacketizer.h"
+#include "local_tx_rate_receiver.h"
 #include "mpp_hevc_decoder.h"
 #include "profile_switch_gate.h"
 #include "receiver_stats.h"
@@ -34,6 +35,7 @@ struct Options {
     bool fullscreen = false;
     bool rotate_ccw = true;
     bool hud = false;
+    std::string tx_rate_socket = "/tmp/board_tx_wire_rate.sock";
 };
 
 bool integerOption(const std::string& argument, const char* name, int* value) {
@@ -63,6 +65,8 @@ bool parseOptions(int argc, char** argv, Options* options) {
         else if (arg == "--display=wayland") options->headless = false;
         else if (arg == "--rotate=ccw") options->rotate_ccw = true;
         else if (arg == "--rotate=none") options->rotate_ccw = false;
+        else if (arg.compare(0, 17, "--tx-rate-socket=") == 0)
+            options->tx_rate_socket = arg.substr(17);
         else if (arg.compare(0, 12, "--log-level=") == 0) {}
         else { std::cerr << "Unknown or invalid option: " << arg << std::endl; return false; }
     }
@@ -102,6 +106,12 @@ int main(int argc, char** argv) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
     ReceiverStats stats;
+    LocalTxRateReceiver tx_rate_receiver;
+    std::string tx_rate_error;
+    if (!tx_rate_receiver.open(options.tx_rate_socket, &tx_rate_error)) {
+        std::cerr << "Local TX telemetry unavailable: " << tx_rate_error << std::endl;
+    }
+    std::chrono::steady_clock::time_point last_tx_rate;
     LatestFrame latest;
     std::atomic<uint64_t> mpp_errors(0);
     std::atomic<int> display_width(0), display_height(0);
@@ -187,6 +197,16 @@ int main(int argc, char** argv) {
     BoardDisplay display(options.fullscreen, options.rotate_ccw);
     int64_t next_stats = 0;
     while (g_running.load()) {
+        uint32_t local_tx_wire_bps = 0;
+        if (tx_rate_receiver.receiveLatest(&local_tx_wire_bps)) {
+            stats.setLocalTxWireBps(local_tx_wire_bps);
+            last_tx_rate = std::chrono::steady_clock::now();
+        } else if (last_tx_rate.time_since_epoch().count() != 0 &&
+                   std::chrono::steady_clock::now() - last_tx_rate >
+                       std::chrono::seconds(2)) {
+            stats.setLocalTxWireBps(0);
+            last_tx_rate = std::chrono::steady_clock::time_point();
+        }
         DecodedFrame frame;
         if (latest.take(&frame, 20)) {
             display_width.store(options.rotate_ccw ? frame.height : frame.width);

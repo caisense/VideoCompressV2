@@ -15,9 +15,11 @@ uint64_t steadyNowMicros() {
 
 AsyncRtpSender::AsyncRtpSender(const std::string &host, int port, int pacing_bitrate_bps, int mtu,
                                size_t max_queue_frames, int max_queue_latency_ms,
-                               const std::shared_ptr<RatePacer> &pacer)
+                               const std::shared_ptr<RatePacer> &pacer,
+                               const std::string &tx_rate_socket_path)
     : udp_sender_(host, port, pacing_bitrate_bps, mtu, pacer),
       packetizer_(0, 0x524f4931U, mtu - 28),
+      tx_rate_publisher_(tx_rate_socket_path),
       max_queue_frames_(std::max<size_t>(1, max_queue_frames)),
       max_queue_latency_(std::max(1, max_queue_latency_ms)),
       started_(false), stopping_(false), failed_(false), waiting_for_key_frame_(false),
@@ -128,6 +130,10 @@ void AsyncRtpSender::workerLoop() {
         const std::vector<std::vector<uint8_t> > packets = packetizer_.packetize(
             item.access_unit.bytes.data(), item.access_unit.bytes.size(),
             rtpTimestamp(item.access_unit.frame.pts_us), &item.access_unit.stream_profile);
+        size_t sent_wire_bytes = 0;
+        for (size_t index = 0; index < packets.size(); ++index) {
+            sent_wire_bytes += RatePacer::wireBytesForUdpPayload(packets[index].size());
+        }
         std::string send_error;
         const bool sent = udp_sender_.sendPackets(packets, &send_error);
         const uint64_t completed_us = steadyNowMicros();
@@ -148,6 +154,22 @@ void AsyncRtpSender::workerLoop() {
         last_queue_delay_us_ = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - item.enqueued_at).count());
+        const std::chrono::steady_clock::time_point completed_at =
+            std::chrono::steady_clock::now();
+        wire_samples_.push_back(WireSample(completed_at, sent_wire_bytes));
+        const std::chrono::steady_clock::time_point cutoff =
+            completed_at - std::chrono::seconds(1);
+        while (!wire_samples_.empty() && wire_samples_.front().at < cutoff) {
+            wire_samples_.pop_front();
+        }
+        uint64_t wire_bytes = 0;
+        for (std::deque<WireSample>::const_iterator it = wire_samples_.begin();
+             it != wire_samples_.end(); ++it) {
+            wire_bytes += it->bytes;
+        }
+        const uint64_t wire_bps = wire_bytes * 8U;
+        tx_rate_publisher_.publish(static_cast<uint32_t>(
+            std::min<uint64_t>(wire_bps, static_cast<uint64_t>(UINT32_MAX))));
     }
 }
 
@@ -209,6 +231,16 @@ AsyncRtpSenderSnapshot AsyncRtpSender::snapshot() const {
     value.last_sent_frame_id = last_sent_frame_id_;
     value.last_capture_to_send_us = last_capture_to_send_us_;
     value.last_queue_delay_us = last_queue_delay_us_;
+    uint64_t wire_bytes = 0;
+    const std::chrono::steady_clock::time_point cutoff =
+        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    for (std::deque<WireSample>::const_iterator it = wire_samples_.begin();
+         it != wire_samples_.end(); ++it) {
+        if (it->at >= cutoff) wire_bytes += it->bytes;
+    }
+    const uint64_t wire_bps = wire_bytes * 8U;
+    value.tx_wire_bps = static_cast<uint32_t>(
+        std::min<uint64_t>(wire_bps, static_cast<uint64_t>(UINT32_MAX)));
     value.waiting_for_key_frame = waiting_for_key_frame_;
     value.sending = sending_;
     return value;

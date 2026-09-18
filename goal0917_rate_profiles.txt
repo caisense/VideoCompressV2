@@ -1,0 +1,285 @@
+Goal：实现普通 H.265 视频的 rate60/rate80/rate100/rate120/rate150/rate180/rate200/rate300 八个预设档位，并完成协议、PC/板端接收器、文档和双板实机验收
+
+工作区：
+D:\work\videoCompressV2
+
+执行说明：
+- 本文件是供后续 agent 执行的完整目标；本次只生成目标，不执行任何代码修改、编译、部署或板端操作。
+- 用户原文中的 `rate60/rate/150/rate300` 按 `rate60/rate150/rate300` 理解。
+- 150 kbps 只保留一个 `rate150`：它就是现有 `medium` 的改名，不得再创建重复的第二个 150 kbps 档。
+- `low`、`medium`、`high` 分别正式改名为 `rate60`、`rate150`、`rate300`。
+- 新增 `rate80`、`rate100`、`rate120`、`rate180`、`rate200`。
+- `rebuild`、`gan`、`image`、`video` 的名称和行为保持不变。
+
+总体结果：
+1. 发送端命令行 `--rate-profile=`/`--profile=` 和运行时 FIFO 均支持八个 rate 档。
+2. PC 接收端和 `board_receiver` 能识别、显示并无缝切换全部八档。
+3. 协议保持 RO v1、RTP PT 96、RFC 7798 H.265，不改变已有包结构。
+4. 更新 `协议.md`、`启动.md`、根 `README.md`、`board_receiver/README.md` 及相关帮助文本和脚本。
+5. 在 192.168.0.101 与 192.168.0.102 上完成单向和全双工实机测试。
+
+一、工作区和安全约束
+
+1. 开始前执行 `git status --short`，保护用户现有未提交修改；不得覆盖或回退与本目标无关的改动。
+2. 禁止使用 `git reset --hard`、`git checkout --` 等破坏性恢复命令。
+3. 不提交、不推送 Git，除非用户另行明确要求。
+4. 虚拟机：192.168.0.10，用户 alientek；仅交互使用既有凭据，禁止把密码写入源码、脚本、文档或日志。
+5. 测试板：192.168.0.101、192.168.0.102，用户 root；仅交互使用既有凭据，禁止持久化密码。
+6. 部署前先停止两板上遗留的收发进程，记录进程和端口状态；部署后不得留下重复发送端、重复接收端或争用摄像头的进程。
+7. 不改变 GAN、rebuild、图片、音频和检测事件协议；只在普通 H.265 rate 档范围内实施必要修改。
+
+二、八档权威配置
+
+这里的档位数字表示共享物理 A/V 线速上限 `pacing_bitrate_bps`，不是 H.265 裸码流目标。H.265 目标必须给 RTP、UDP/IP、以太网开销、IDR 和编码波动留出余量。
+
+| 名称 | 物理上限 | H.265 目标 | 编码尺寸 | FPS | GOP | 色彩 | QP 初值 | I 帧 QP | 最大 I 帧 | 最大 P 帧 | 背景 ΔQP |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `rate60` | 60 kbps | 42 kbps | 320x180 | 10 | 50 | 灰度 | 38 | 36-48 | 12000 bit | 5500 bit | +12 |
+| `rate80` | 80 kbps | 56 kbps | 320x180 | 10 | 50 | 彩色 | 37 | 35-47 | 16000 bit | 7000 bit | +12 |
+| `rate100` | 100 kbps | 72 kbps | 384x216 | 10 | 50 | 彩色 | 36 | 34-46 | 22000 bit | 9000 bit | +11 |
+| `rate120` | 120 kbps | 88 kbps | 480x270 | 10 | 50 | 彩色 | 35 | 33-45 | 28000 bit | 11000 bit | +10 |
+| `rate150` | 150 kbps | 110 kbps | 480x270 | 15 | 75 | 彩色 | 34 | 32-44 | 35000 bit | 14000 bit | +10 |
+| `rate180` | 180 kbps | 135 kbps | 512x288 | 15 | 75 | 彩色 | 33 | 31-44 | 42000 bit | 17000 bit | +8 |
+| `rate200` | 200 kbps | 150 kbps | 512x288 | 18 | 90 | 彩色 | 32 | 30-43 | 48000 bit | 19000 bit | +8 |
+| `rate300` | 300 kbps | 240 kbps | 640x360 | 20 | 100 | 彩色 | 30 | 28-42 | 60000 bit | 24000 bit | +6 |
+
+八档共同参数：
+
+```text
+qp_min=10
+qp_max=51
+core_delta_qp=-6
+edge_delta_qp=-10
+halo_delta_qp=2
+intra_refresh=on
+intra_refresh_rows=1
+max_reencode_times=3
+mtu=1200
+send_queue_frames=16
+send_max_latency_ms=2000
+```
+
+说明：
+- 保留现有 `rate60` 灰度策略；其余普通 rate 档均为彩色。
+- `rate60`、`rate150`、`rate300` 除名称和队列建议外必须保持现有 low/medium/high 的已验证编码参数。
+- 普通档仍允许现有命令行参数覆盖语义；先应用完整预设，再按参数出现顺序应用显式覆盖。文档必须明确覆盖后不再等同于标准预设。
+- 音频开启时，Codec2 的保留线速仍从该档共享物理上限中扣除，不得形成第二份独立带宽额度。
+
+三、线上协议编号和兼容策略
+
+保持 RO metadata version=1。不得重新编号已有线上值 0-4；采用以下权威映射：
+
+| RO profile 字节 | 新名称 | 说明 |
+| ---: | --- | --- |
+| 0 | `rate60` | 原 `low`，参数不变 |
+| 1 | `rate150` | 原 `medium`，参数不变 |
+| 2 | `rate300` | 原 `high`，参数不变 |
+| 3 | `rebuild` | 完全不变 |
+| 4 | `gan` | 完全不变 |
+| 5 | `rate80` | 新增 |
+| 6 | `rate100` | 新增 |
+| 7 | `rate120` | 新增 |
+| 8 | `rate180` | 新增 |
+| 9 | `rate200` | 新增 |
+
+协议约束：
+1. 普通 rate 档继续使用 RO v1 的 8 字节核心记录：version/profile/width/height/fps/generation。
+2. 普通 rate 档不要启用当前 GAN 专用的 TARGET/CAP 四字节尾部，避免改变普通包的 24 字节 RTP+RO 头和既有带宽计算口径。
+3. TARGET/CAP 对普通档由 profile ID 的协议表定义；GAN 的 12 字节扩展行为保持原样。
+4. 切档必须递增 generation，并以 generation、profile、width、height、fps 组成解码器身份。
+5. 接收端遇到新身份后清理旧 FU/AU/乱序状态，等待新档完整 VPS/SPS/PPS 和 IRAP，再重建解码器。
+6. 旧发送端产生的 ID 0/1/2 数据仍可解码，但新接收端显示名称为 rate60/rate150/rate300。
+7. 新增 ID 5-9 对未升级旧接收端属于 unsupported profile；不得误当成 low/medium/high 解码。
+
+四、发送端修改范围
+
+至少检查并按职责修改：
+- `cpp/common/config.h`
+- `cpp/common/config.cc`
+- `cpp/main.cc`
+- 所有使用 `RateProfile`、`RATE_PROFILE_LOW/MEDIUM/HIGH`、profile 名称或 profile 白名单的源码和测试
+- 运行时 FIFO 解析与帮助文本
+- 日志/HUD 所使用的 profile 名称
+
+实现要求：
+1. 将普通枚举改为清晰的 `RATE_PROFILE_RATE60` 等名称；rebuild=3、gan=4 线上数值必须保持。
+2. `rateProfileName()`、`parseRateProfile()`、`applyRateProfile()` 完整覆盖八档。
+3. 默认普通档由原 low 改为 `rate60`。
+4. 命令行帮助显示：
+   `rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan`。
+5. FIFO 支持上述全部名称以及既有 `image|video|rebuild|gan` 控制。
+6. `video` 从图片模式返回最近一个普通/rebuild/gan 视频档的现有语义不变。
+7. `low`、`medium`、`high` 是完成改名后的废弃名称：命令行和 FIFO 必须明确拒绝并给出新名称提示，例如 `low was renamed to rate60`，不得静默回退。
+8. 所有档位切换均触发正确 generation、编码器重建、pacer 重置和新 IDR；不得把旧档队列发到新档之后。
+9. 每档应用表中准确的宽高、FPS、目标码率、GOP、QP、super-frame、灰度和 ROI 参数。
+10. 全部普通档的发送队列默认采用 16 帧和 2000 ms；如保留用户显式覆盖，必须有边界验证和测试。
+
+五、PC 接收端修改范围
+
+至少检查并修改：
+- `tools/live_h265_hud.py`
+- `tools/test_live_h265_hud.py`
+- 任何按 0/1/2 映射名称、只允许三档或输出 low/medium/high 的工具
+
+要求：
+1. RO profile 名称按协议表映射全部八档，同时保持 rebuild/gan。
+2. ProfileSwitchGate 必须把 ID、generation、几何和 FPS 的变化视为新身份。
+3. HUD 的 `Profile` 行显示准确的新名称、尺寸、FPS、generation。
+4. 普通档 RTP/WIRE 统计口径不变；不得把档位数字误显示成 H.265 实际码率。
+5. 未知 ID 继续显示 unknown/unsupported 并拒绝送入解码器。
+6. 更新测试中的旧名称、映射表、切档序列和预期输出。
+
+六、板端接收器修改范围
+
+至少检查并修改：
+- `board_receiver/include/stream_profile.h`
+- `board_receiver/src/stream_profile.cc`
+- `board_receiver/src/receiver_stats.cc`
+- `board_receiver/tests/`
+- `board_receiver/scripts/`
+
+要求：
+1. `StreamProfile::name()` 映射八个 rate 档及 rebuild/gan。
+2. `supported()` 支持八个普通 rate 档，继续拒绝 rebuild、gan 和未知 ID，因为板端接收器目标仍是普通纯视频接收。
+3. 切档等待 IRAP、MPP 重建、旋转显示、HUD 和无 HUD 模式保持现有行为。
+4. HUD 不恢复黑色遮罩；仅显示当前已实现的绿色文字叠加。
+5. 将只写三档的测试脚本改为八档；文件可重命名为 `test_rate_profiles.sh`，同时更新所有引用。
+6. `start_receiver.sh` 的默认启动行为不因档位扩展而改变。
+
+七、自动化测试
+
+新增或更新测试，至少覆盖：
+1. 每个名称均能解析为准确枚举和线上 ID。
+2. 每个枚举均返回准确名称。
+3. 八档逐项断言表中所有参数，不能只断言码率。
+4. `low`、`medium`、`high` 被拒绝且错误消息指向 rate60/rate150/rate300。
+5. rebuild=3、gan=4 保持不变；ID 5-9 按表编码。
+6. 普通档 RTP RO 扩展仍为 8 字节核心，包头总长度和 MTU 分片行为不变。
+7. GAN TARGET/CAP 尾部回归测试继续通过。
+8. PC 接收端能解析 0-9，正确区分 supported/unsupported/unknown。
+9. 板端接收器接受八个普通档，拒绝 3、4 和未知 ID。
+10. 连续切换八档时，旧 generation 迟到包不得回滚档位；必须等待新 IDR。
+11. `image -> video` 返回切换前档位。
+12. 命令行显式覆盖顺序与现有语义一致。
+
+执行项目现有全部相关测试，而不是只运行新增测试：
+
+```text
+cpp/tests/build_roi_tests.sh
+tools/test_live_h265_hud.py
+board_receiver 的全部 CTest
+所有协议差分测试
+```
+
+出现测试失败时先定位根因，不得通过删除断言、放宽协议校验或跳过测试伪造通过。
+
+八、文档更新
+
+必须更新：
+- `协议.md`
+- `启动.md`
+- `README.md`
+- `board_receiver/README.md`
+- 相关 `--help` 文本、脚本注释和示例
+
+文档必须包含：
+1. 八档总表，参数与本目标第二节完全一致。
+2. RO v1 profile ID 0-9 映射，并说明 0/1/2 保持线上值但改名。
+3. 明确 `rate150` 就是原 medium，不存在第二个 150 档。
+4. 说明数字是共享物理 A/V cap，H.265 target 小于 cap。
+5. 命令行示例：
+
+```sh
+./rknn_yolov8_seg_cam --rate-profile=rate120 ...
+```
+
+6. FIFO 八档切换示例：
+
+```sh
+echo rate60  > /tmp/roi-rate-profile
+echo rate80  > /tmp/roi-rate-profile
+echo rate100 > /tmp/roi-rate-profile
+echo rate120 > /tmp/roi-rate-profile
+echo rate150 > /tmp/roi-rate-profile
+echo rate180 > /tmp/roi-rate-profile
+echo rate200 > /tmp/roi-rate-profile
+echo rate300 > /tmp/roi-rate-profile
+```
+
+7. 两板单向和全双工启动命令，保持：
+   - 101 接收时，102 发送到 192.168.0.101:5004；
+   - 102 接收时，101 发送到 192.168.0.102:5004；
+   - 发送端 `--preview=off`，接收端独占外接屏；
+   - `--send-queue-frames=16 --send-max-latency-ms=2000`。
+8. 删除或改写所有把普通可选档描述为仅 low/medium/high 的当前说明。
+9. 历史测试记录若需要保留原始名称，必须标注“历史名称”，不得篡改既有事实。
+
+完成前执行文本审计：搜索 `low|medium|high`。源码、帮助、活动脚本和当前文档中不得残留旧的普通档命令；允许存在英文一般语义、历史记录以及明确的迁移说明。
+
+九、构建、交叉编译和部署
+
+1. 本机或虚拟机先完成主机测试。
+2. 使用 192.168.0.10 上既有 ATK-DLRK3588 AArch64 交叉编译环境编译发送端与 `board_receiver`。
+3. 用 `file`/`readelf` 验证产物是 ARM aarch64，检查动态库依赖。
+4. 部署前计算 SHA-256；部署到 101、102 后再次计算并要求一致。
+5. 发送端部署到既有 `/opt/atk/rknn_yolov8_seg_cam`，接收端部署到 `/opt/atk/board_receiver`；先备份当前可执行文件为带时间戳文件，便于回退。
+6. 部署脚本不得保存密码。
+
+十、双板实机验收
+
+测试拓扑：
+- 192.168.0.102 发送，192.168.0.101 接收并显示。
+- 随后开启全双工：101 和 102 均同时运行一个发送端、一个接收端，各自显示对端摄像头。
+- UDP 视频端口 5004；两机使用相同端口不会冲突，因为各自在本机监听并向对端发送。
+
+单档测试：
+1. 按 rate60、rate80、rate100、rate120、rate150、rate180、rate200、rate300 顺序测试。
+2. 每档至少稳定运行 60 秒。
+3. 记录发送端参数、接收端 profile、generation、分辨率、FPS、RTP kbps、WIRE kbps、丢包、乱序、重复、MPP 错误和进程退出码。
+4. 接收分辨率/FPS 必须与表一致；允许 1 秒窗口存在正常的 ±1 帧抖动。
+5. 物理线速的持续平均值不得超过档位 cap；短窗口峰值须结合 pacer burst 解释，不能用单个 IDR 窗口武断判失败或伪报通过。
+6. 外接屏画面连续，方向和比例正确，无黑屏、绿屏、花屏；HUD 名称和数据正确，且没有黑色 HUD 遮罩。
+
+切档测试：
+1. 按八档升序、降序各切换一轮。
+2. 再执行至少 30 次循环切换，覆盖相同几何不同 profile（rate60/rate80）、相同几何不同 FPS（rate120/rate150）和不同几何切换。
+3. 每次切档必须看到 generation 增加、新 IDR 后恢复显示、旧帧不回滚。
+4. 不允许持续黑屏、绿屏、花屏、尺寸错乱、旧档 HUD 名称或队列长时间积压。
+
+全双工测试：
+1. 两端先使用 rate150 同时收发 60 秒。
+2. 两端同步切到 rate60、rate100、rate200、rate300，各运行至少 30 秒。
+3. 最后恢复 rate150，确认两端约 15 fps。
+4. 两端要求 lost=0、duplicate=0、reordered=0、rejected_profile=0、mpp_errors=0；若出现非零，保存原始日志、定位原因并修复后重测，不得只清零计数。
+
+十一、测试证据和交付物
+
+把不含凭据的测试证据保存到合适的 `test-results/` 目录，至少包括：
+- 主机测试结果；
+- AArch64 产物类型和 SHA-256；
+- 八档单向测试摘要；
+- 30 次切档测试摘要；
+- 双板全双工测试摘要；
+- 用户对两块外接屏画面的直接确认。
+
+最终交付说明必须列出：
+1. 修改文件清单。
+2. 最终八档参数表和协议 ID 表。
+3. 自动化测试数量与结果。
+4. 两板部署路径、产物 SHA-256。
+5. 八档和全双工实测结果。
+6. 当前板端是否仍有测试进程运行，以及停止命令。
+7. 未解决问题；如果没有，明确写“无已知遗留问题”。
+
+十二、完成定义
+
+只有同时满足以下条件才可宣告完成：
+- 八个 rate 名称在 CLI、FIFO、发送日志、PC HUD、板端 HUD、协议和文档中一致。
+- low/medium/high 已从当前可执行接口移除，并提供清晰迁移错误消息。
+- RO v1 编号按本目标表实现，rebuild/gan 无回归。
+- 所有主机测试、协议差分测试、AArch64 交叉编译通过。
+- 101/102 部署哈希一致。
+- 八档单向、循环切档及双板全双工实测通过。
+- 物理外接屏由用户确认画面与 HUD 正常。
+- 协议和启动文档已经更新，示例可直接复制执行。
+- 未覆盖用户修改，未保存凭据，未擅自提交或推送。

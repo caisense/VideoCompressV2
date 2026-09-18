@@ -32,8 +32,8 @@ def rtp_profile_packet(sequence: int, profile: int, width: int, height: int,
     packet = bytearray(rtp_packet(sequence, marker=True, nal_type=nal_type))
     packet[0] |= 0x10
     has_gan_tail = target_bitrate_kbps is not None or link_cap_kbps is not None
-    extension = bytearray(b"RO\x00\x03" if has_gan_tail else
-                          b"RO\x00\x02")
+    words = 2 + (1 if has_gan_tail else 0)
+    extension = bytearray(b"RO" + words.to_bytes(2, "big"))
     extension.extend((1, profile))
     extension.extend(width.to_bytes(2, "big"))
     extension.extend(height.to_bytes(2, "big"))
@@ -154,13 +154,40 @@ class HudTests(unittest.TestCase):
         self.assertFalse(stats.on_packet(rtp_profile_packet(30, 1, 480, 270, 15, 3)))
         values = stats.snapshot()
         self.assertEqual(values["profile"], {
-            "name": "medium", "width": 480, "height": 270,
+            "name": "rate150", "width": 480, "height": 270,
             "fps": 15, "generation": 3, "target_bitrate_kbps": None,
             "link_cap_kbps": None,
         })
         self.assertEqual(values["i_frames"], 1)
         self.assertTrue(stats.on_packet(rtp_profile_packet(31, 0, 320, 180, 10, 4)))
-        self.assertEqual(stats.snapshot()["profile"]["name"], "low")
+        self.assertEqual(stats.snapshot()["profile"]["name"], "rate60")
+
+    def test_all_rate_profile_ids_keep_the_protocol_mapping(self):
+        expected = {
+            0: ("rate60", 320, 180, 10),
+            1: ("rate150", 480, 270, 15),
+            2: ("rate300", 640, 360, 20),
+            5: ("rate80", 320, 180, 10),
+            6: ("rate100", 384, 216, 10),
+            7: ("rate120", 480, 270, 10),
+            8: ("rate180", 512, 288, 15),
+            9: ("rate200", 512, 288, 18),
+        }
+        for profile_id, (name, width, height, fps) in expected.items():
+            with self.subTest(profile_id=profile_id):
+                stats = HUD.RtpStats()
+                packet = rtp_profile_packet(
+                    100 + profile_id, profile_id, width, height, fps, profile_id)
+                stats.on_packet(packet)
+                profile = stats.snapshot()["profile"]
+                self.assertEqual(profile["name"], name)
+                self.assertEqual((profile["width"], profile["height"], profile["fps"]),
+                                 (width, height, fps))
+                self.assertEqual(HUD.RtpStats._payload_offset(packet), 24)
+
+        unknown = HUD.RtpStats()
+        unknown.on_packet(rtp_profile_packet(200, 99, 320, 180, 10, 1))
+        self.assertEqual(unknown.snapshot()["profile"]["name"], "unknown")
 
     def test_rebuild_profile_and_presentation_provenance(self):
         stats = HUD.RtpStats()

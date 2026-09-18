@@ -38,7 +38,7 @@ std::string ageText(int64_t milliseconds) {
 
 ReceiverStatsSnapshot::ReceiverStatsSnapshot()
     : receive_fps(0.0), decode_fps(0.0), rtp_kbps(0.0), wire_kbps(0.0),
-      p_fps(0.0), i_fps(0.0), packets_per_second(0.0), packets(0),
+      tx_wire_kbps(0.0), p_fps(0.0), i_fps(0.0), packets_per_second(0.0), packets(0),
       p_frames(0), i_frames(0), lost(0), reordered(0), duplicates(0),
       rejected_profiles(0), decoder_restarts(0), decode_errors(0),
       packet_last_bytes(0), packet_average_bytes(0.0), packet_max_bytes(0),
@@ -47,7 +47,7 @@ ReceiverStatsSnapshot::ReceiverStatsSnapshot()
 ReceiverStats::ReceiverStats()
     : packets(0), decoded_frames(0), displayed_frames(0), lost(0), duplicates(0),
       reordered(0), rejected_profiles(0), decoder_restarts(0), last_idr_ms(0),
-      started_(std::chrono::steady_clock::now()), profile_bits_(0), p_frames_(0),
+      started_(std::chrono::steady_clock::now()), profile_bits_(0), local_tx_wire_bps_(0), p_frames_(0),
       i_frames_(0), last_source_ms_(0) {}
 
 void ReceiverStats::setProfile(const StreamProfile& value) {
@@ -57,6 +57,10 @@ void ReceiverStats::setProfile(const StreamProfile& value) {
     bits |= static_cast<uint64_t>(value.width) << 24;
     bits |= static_cast<uint64_t>(value.height) << 40;
     profile_bits_.store(bits);
+}
+
+void ReceiverStats::setLocalTxWireBps(uint32_t wire_bps) {
+    local_tx_wire_bps_.store(wire_bps);
 }
 
 void ReceiverStats::trimLocked(const std::chrono::steady_clock::time_point& now) {
@@ -105,6 +109,8 @@ ReceiverStatsSnapshot ReceiverStats::snapshot(uint64_t mpp_errors) {
     ReceiverStatsSnapshot value;
     const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
     value.profile = unpackProfile(profile_bits_.load());
+    const uint32_t local_tx_wire_bps = local_tx_wire_bps_.load();
+    value.tx_wire_kbps = static_cast<double>(local_tx_wire_bps) / 1000.0;
     value.packets = packets.load();
     value.lost = lost.load();
     value.reordered = reordered.load();
@@ -148,23 +154,16 @@ std::vector<std::string> ReceiverStats::hudLines(uint64_t mpp_errors) {
     const ReceiverStatsSnapshot value = snapshot(mpp_errors);
     std::vector<std::string> lines;
     std::ostringstream out;
-    out << std::fixed << std::setprecision(1)
-        << "RX " << value.receive_fps << "  DEC " << value.decode_fps << " fps";
+    out << std::fixed << std::setprecision(1) << "TX ";
+    if (value.tx_wire_kbps == 0.0) out << "--";
+    else out << value.tx_wire_kbps;
+    out << "  RX " << value.wire_kbps << " kbps";
     lines.push_back(out.str()); out.str(""); out.clear();
-    out << std::fixed << std::setprecision(1)
-        << "RTP " << value.rtp_kbps << "  WIRE " << value.wire_kbps << " kbps";
-    lines.push_back(out.str()); out.str(""); out.clear();
-    out << std::fixed << std::setprecision(1)
-        << "P " << value.p_fps << "  I " << value.i_fps
-        << "  TOTAL " << value.p_frames << '/' << value.i_frames;
+    out << "P " << value.p_frames << "  I " << value.i_frames
+        << "  TOTAL " << (value.p_frames + value.i_frames);
     lines.push_back(out.str()); out.str(""); out.clear();
     out << "PKT " << value.packets << "  LOSS " << value.lost
         << "  REO " << value.reordered << "  ERR " << value.decode_errors;
-    lines.push_back(out.str()); out.str(""); out.clear();
-    out << std::fixed << std::setprecision(1)
-        << "UDP " << value.packets_per_second << "pps  L/A/M "
-        << value.packet_last_bytes << '/' << std::setprecision(0)
-        << value.packet_average_bytes << '/' << value.packet_max_bytes << 'B';
     lines.push_back(out.str()); out.str(""); out.clear();
     out << "PROFILE " << value.profile.name() << ' ' << value.profile.width << 'x'
         << value.profile.height << '@' << static_cast<int>(value.profile.fps)
@@ -188,6 +187,7 @@ std::string ReceiverStats::report(uint64_t mpp_errors, int display_width,
         << " rtp=" << value.packets
         << " recv_fps=" << value.receive_fps
         << " decode_fps=" << value.decode_fps
+        << " tx_wire_kbps=" << value.tx_wire_kbps
         << " rtp_kbps=" << value.rtp_kbps
         << " wire_kbps=" << value.wire_kbps
         << " lost=" << value.lost << " duplicate=" << value.duplicates

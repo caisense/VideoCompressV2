@@ -157,7 +157,10 @@ class RtpStats:
         payload = packet[offset + 4:payload_end]
         if len(payload) < 8 or payload[0] != 1:
             return None
-        names = {0: "low", 1: "medium", 2: "high", 3: "rebuild", 4: "gan"}
+        names = {
+            0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan",
+            5: "rate80", 6: "rate100", 7: "rate120", 8: "rate180", 9: "rate200",
+        }
         name = names.get(payload[1], "unknown")
         target_bitrate_kbps = None
         link_cap_kbps = None

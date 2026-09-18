@@ -20,6 +20,7 @@ struct ReceiverStatsSnapshot {
     double decode_fps;
     double rtp_kbps;
     double wire_kbps;
+    double tx_wire_kbps;
     double p_fps;
     double i_fps;
     double packets_per_second;
@@ -45,6 +46,7 @@ class ReceiverStats {
 public:
     ReceiverStats();
     void setProfile(const StreamProfile& profile);
+    void setLocalTxWireBps(uint32_t wire_bps);
     void recordPacket(size_t bytes);
     void recordAccessUnit(bool is_irap);
     void recordDecodedFrame();
@@ -73,6 +75,7 @@ private:
 
     std::chrono::steady_clock::time_point started_;
     std::atomic<uint64_t> profile_bits_;
+    std::atomic<uint32_t> local_tx_wire_bps_;
     std::mutex samples_mutex_;
     std::deque<PacketSample> packet_samples_;
     std::deque<std::chrono::steady_clock::time_point> decode_samples_;

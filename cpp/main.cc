@@ -86,7 +86,7 @@ std::string debugPathForFrame(const std::string &pattern, uint64_t frame_id) {
 
 void printUsage(const char *program) {
     std::fprintf(stderr,
-        "Usage: %s [--rate-profile=low|medium|high|rebuild|gan] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan]\n"
+        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan]\n"
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
@@ -99,7 +99,7 @@ void printUsage(const char *program) {
         "          [--core-delta-qp=-6 --edge-delta-qp=-10 --mask-occupancy-threshold=0.10]\n"
         "          [--erosion-radius=2 --dilation-radius=3 --roi-hold-frames=3 --roi-max-age=9]\n"
         "          [--max-roi-region=64 --udp-host=HOST --udp-port=5004 --pacing-bitrate=60000]\n"
-        "          [--send-queue-frames=3 --send-max-latency-ms=250]\n"
+        "          [--send-queue-frames=16 --send-max-latency-ms=2000]\n"
         "          [--rtp-sdp-path=/tmp/roi-live.sdp]\n"
         "          [--audio=on|off --audio-device=hw:3,0 --audio-udp-port=5006]\n"
         "          [--audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400]\n"
@@ -152,7 +152,8 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
         return;
     }
     std::fprintf(stderr,
-        "Runtime control ready: echo low|medium|high|rebuild|image|video > %s\n", path.c_str());
+        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan|image|video > %s\n",
+        path.c_str());
     std::string pending;
     while (running->load()) {
         pollfd descriptor;
@@ -183,6 +184,12 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
                     requested_transport_mode->store(static_cast<int>(mode));
                     std::fprintf(stderr, "Runtime transport mode requested: %s\n",
                                  transportModeName(mode));
+                } else if (name == "low") {
+                    std::fprintf(stderr, "Invalid runtime profile: low was renamed to rate60\n");
+                } else if (name == "medium") {
+                    std::fprintf(stderr, "Invalid runtime profile: medium was renamed to rate150\n");
+                } else if (name == "high") {
+                    std::fprintf(stderr, "Invalid runtime profile: high was renamed to rate300\n");
                 } else if (!name.empty()) {
                     std::fprintf(stderr, "Ignoring invalid runtime control '%s'\n", name.c_str());
                 }

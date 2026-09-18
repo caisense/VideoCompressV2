@@ -13,6 +13,17 @@ target_include_directories(test_sender_packetizer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp)
 target_link_libraries(test_sender_packetizer PRIVATE board_receiver_protocol)
 add_test(NAME sender_packetizer_differential COMMAND test_sender_packetizer)
+
+add_executable(test_local_tx_rate_ipc
+    test_local_tx_rate_ipc.cc
+    ../src/local_tx_rate_receiver.cc
+    ../../cpp/transport/local_tx_rate_publisher.cc)
+target_include_directories(test_local_tx_rate_ipc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../cpp)
+target_link_libraries(test_local_tx_rate_ipc PRIVATE Threads::Threads)
+add_test(NAME local_tx_rate_ipc COMMAND test_local_tx_rate_ipc)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     add_test(NAME python_cpp_protocol_differential

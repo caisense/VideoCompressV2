@@ -14,7 +14,7 @@ std::vector<uint8_t> fixedHeader(uint8_t first, uint8_t second) {
 int main() {
     using namespace board_receiver;
     const RtpPacket packet = makePacket(65535, 90000, true, nal(19, 0xaa),
-                                        PROFILE_HIGH, 640, 360, 20, 7);
+                                        PROFILE_RATE300, 640, 360, 20, 7);
     CHECK(packet.marker);
     CHECK(packet.sequence == 65535);
     CHECK(packet.timestamp == 90000);
@@ -25,7 +25,7 @@ int main() {
     StreamProfile profile;
     std::string error;
     CHECK(parseStreamProfile(packet, &profile, &error) == PROFILE_SUPPORTED);
-    CHECK(profile.id == PROFILE_HIGH);
+    CHECK(profile.id == PROFILE_RATE300);
     CHECK(profile.width == 640 && profile.height == 360);
     CHECK(profile.fps == 20 && profile.generation == 7);
 
@@ -56,7 +56,7 @@ int main() {
 
     std::vector<uint8_t> extension8 = fixedHeader(0x90, 96);
     appendBe16(&extension8, 0x524f); appendBe16(&extension8, 2);
-    const std::vector<uint8_t> low8 = profileExtension(PROFILE_LOW, 320, 180, 10, 3);
+    const std::vector<uint8_t> low8 = profileExtension(PROFILE_RATE60, 320, 180, 10, 3);
     extension8.insert(extension8.end(), low8.begin(), low8.begin() + 8);
     extension8.push_back(2); extension8.push_back(1);
     CHECK(parseRtpPacket(extension8.data(), extension8.size(), &invalid_packet, &error));
@@ -75,11 +75,17 @@ int main() {
     padded.back() = 0;
     CHECK(!parseRtpPacket(padded.data(), padded.size(), &invalid_packet, &error));
 
-    const uint8_t supported_profiles[] = {PROFILE_LOW, PROFILE_MEDIUM, PROFILE_HIGH};
-    for (size_t i = 0; i < 3; ++i) {
+    const uint8_t supported_profiles[] = {
+        PROFILE_RATE60, PROFILE_RATE80, PROFILE_RATE100, PROFILE_RATE120,
+        PROFILE_RATE150, PROFILE_RATE180, PROFILE_RATE200, PROFILE_RATE300};
+    const char* supported_names[] = {
+        "rate60", "rate80", "rate100", "rate120",
+        "rate150", "rate180", "rate200", "rate300"};
+    for (size_t i = 0; i < sizeof(supported_profiles) / sizeof(supported_profiles[0]); ++i) {
         const RtpPacket p = makePacket(static_cast<uint16_t>(20 + i), 2, true,
                                        nal(1, 0), supported_profiles[i]);
         CHECK(parseStreamProfile(p, &profile, &error) == PROFILE_SUPPORTED);
+        CHECK(std::string(profile.name()) == supported_names[i]);
     }
     const uint8_t rejected_profiles[] = {PROFILE_REBUILD, PROFILE_GAN, 99};
     for (size_t i = 0; i < 3; ++i) {

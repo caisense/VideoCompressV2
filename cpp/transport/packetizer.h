@@ -21,7 +21,6 @@ struct RtpStreamProfile {
     // Present with TARGET for GAN. This reuses the existing two trailing RO
     // v1 bytes, so the profile extension remains the same 12-byte payload.
     uint16_t link_cap_kbps;
-
     RtpStreamProfile()
         : valid(false), profile(0), width(0), height(0), fps(0), generation(0),
           target_bitrate_kbps(0), link_cap_kbps(0) {}

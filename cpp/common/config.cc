@@ -80,7 +80,10 @@ CameraConfig::CameraConfig()
 AppConfig::AppConfig()
     : model_path("model/yolov8_seg.rknn"), mode(PIPELINE_SEGMENTATION_ROI),
       preview(true), preview_width(720), preview_height(1280), preview_rotate_ccw(true),
-      debug_roi(false), debug_roi_path("roi_map.pgm"), rate_profile(RATE_PROFILE_LOW) {}
+      debug_roi(false), debug_roi_path("roi_map.pgm"), rate_profile(RATE_PROFILE_RATE60) {
+    transport.send_queue_frames = 16;
+    transport.send_max_latency_ms = 2000;
+}
 
 bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset) {
     static const GanBandwidthPreset kPresets[] = {
@@ -134,37 +137,100 @@ bool parseBool(const std::string &text, bool *value) {
 }
 
 void applyRateProfileValues(RateProfile profile, AppConfig *config) {
-    if (profile == RATE_PROFILE_LOW) {
-        config->rate_profile = RATE_PROFILE_LOW;
+    if (profile == RATE_PROFILE_RATE60) {
+        config->rate_profile = RATE_PROFILE_RATE60;
         config->encoder.width = 320; config->encoder.height = 180; config->encoder.fps = 10;
         config->encoder.target_bitrate_bps = 42000; config->encoder.gop = 50;
         config->encoder.qp_init = 38; config->encoder.qp_min_i = 36; config->encoder.qp_max_i = 48;
         config->encoder.super_i_frame_bits = 12000; config->encoder.super_p_frame_bits = 5500;
         config->encoder.grayscale_encode = true;
         config->roi.background_delta_qp = 12; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
-        config->transport.pacing_bitrate_bps = 60000; config->transport.send_max_latency_ms = 250;
+        config->transport.pacing_bitrate_bps = 60000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
         return;
     }
-    if (profile == RATE_PROFILE_MEDIUM) {
-        config->rate_profile = RATE_PROFILE_MEDIUM;
+    if (profile == RATE_PROFILE_RATE80) {
+        config->rate_profile = RATE_PROFILE_RATE80;
+        config->encoder.width = 320; config->encoder.height = 180; config->encoder.fps = 10;
+        config->encoder.target_bitrate_bps = 56000; config->encoder.gop = 50;
+        config->encoder.qp_init = 37; config->encoder.qp_min_i = 35; config->encoder.qp_max_i = 47;
+        config->encoder.super_i_frame_bits = 16000; config->encoder.super_p_frame_bits = 7000;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 12; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
+        config->transport.pacing_bitrate_bps = 80000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
+        return;
+    }
+    if (profile == RATE_PROFILE_RATE100) {
+        config->rate_profile = RATE_PROFILE_RATE100;
+        config->encoder.width = 384; config->encoder.height = 216; config->encoder.fps = 10;
+        config->encoder.target_bitrate_bps = 72000; config->encoder.gop = 50;
+        config->encoder.qp_init = 36; config->encoder.qp_min_i = 34; config->encoder.qp_max_i = 46;
+        config->encoder.super_i_frame_bits = 22000; config->encoder.super_p_frame_bits = 9000;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 11; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
+        config->transport.pacing_bitrate_bps = 100000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
+        return;
+    }
+    if (profile == RATE_PROFILE_RATE120) {
+        config->rate_profile = RATE_PROFILE_RATE120;
+        config->encoder.width = 480; config->encoder.height = 270; config->encoder.fps = 10;
+        config->encoder.target_bitrate_bps = 88000; config->encoder.gop = 50;
+        config->encoder.qp_init = 35; config->encoder.qp_min_i = 33; config->encoder.qp_max_i = 45;
+        config->encoder.super_i_frame_bits = 28000; config->encoder.super_p_frame_bits = 11000;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 10; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
+        config->transport.pacing_bitrate_bps = 120000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
+        return;
+    }
+    if (profile == RATE_PROFILE_RATE150) {
+        config->rate_profile = RATE_PROFILE_RATE150;
         config->encoder.width = 480; config->encoder.height = 270; config->encoder.fps = 15;
         config->encoder.target_bitrate_bps = 110000; config->encoder.gop = 75;
         config->encoder.qp_init = 34; config->encoder.qp_min_i = 32; config->encoder.qp_max_i = 44;
         config->encoder.super_i_frame_bits = 35000; config->encoder.super_p_frame_bits = 14000;
         config->encoder.grayscale_encode = false;
         config->roi.background_delta_qp = 10; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
-        config->transport.pacing_bitrate_bps = 150000; config->transport.send_max_latency_ms = 250;
+        config->transport.pacing_bitrate_bps = 150000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
         return;
     }
-    if (profile == RATE_PROFILE_HIGH) {
-        config->rate_profile = RATE_PROFILE_HIGH;
+    if (profile == RATE_PROFILE_RATE180) {
+        config->rate_profile = RATE_PROFILE_RATE180;
+        config->encoder.width = 512; config->encoder.height = 288; config->encoder.fps = 15;
+        config->encoder.target_bitrate_bps = 135000; config->encoder.gop = 75;
+        config->encoder.qp_init = 33; config->encoder.qp_min_i = 31; config->encoder.qp_max_i = 44;
+        config->encoder.super_i_frame_bits = 42000; config->encoder.super_p_frame_bits = 17000;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 8; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
+        config->transport.pacing_bitrate_bps = 180000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
+        return;
+    }
+    if (profile == RATE_PROFILE_RATE200) {
+        config->rate_profile = RATE_PROFILE_RATE200;
+        config->encoder.width = 512; config->encoder.height = 288; config->encoder.fps = 18;
+        config->encoder.target_bitrate_bps = 150000; config->encoder.gop = 90;
+        config->encoder.qp_init = 32; config->encoder.qp_min_i = 30; config->encoder.qp_max_i = 43;
+        config->encoder.super_i_frame_bits = 48000; config->encoder.super_p_frame_bits = 19000;
+        config->encoder.grayscale_encode = false;
+        config->roi.background_delta_qp = 8; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
+        config->transport.pacing_bitrate_bps = 200000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
+        return;
+    }
+    if (profile == RATE_PROFILE_RATE300) {
+        config->rate_profile = RATE_PROFILE_RATE300;
         config->encoder.width = 640; config->encoder.height = 360; config->encoder.fps = 20;
         config->encoder.target_bitrate_bps = 240000; config->encoder.gop = 100;
         config->encoder.qp_init = 30; config->encoder.qp_min_i = 28; config->encoder.qp_max_i = 42;
         config->encoder.super_i_frame_bits = 60000; config->encoder.super_p_frame_bits = 24000;
         config->encoder.grayscale_encode = false;
         config->roi.background_delta_qp = 6; config->roi.core_delta_qp = -6; config->roi.edge_delta_qp = -10;
-        config->transport.pacing_bitrate_bps = 300000; config->transport.send_max_latency_ms = 200;
+        config->transport.pacing_bitrate_bps = 300000;
+        config->transport.send_queue_frames = 16; config->transport.send_max_latency_ms = 2000;
         return;
     }
     if (profile == RATE_PROFILE_REBUILD) {
@@ -180,6 +246,7 @@ void applyRateProfileValues(RateProfile profile, AppConfig *config) {
         config->roi.background_delta_qp = 14; config->roi.core_delta_qp = -7;
         config->roi.edge_delta_qp = -11;
         config->transport.pacing_bitrate_bps = 100000;
+        config->transport.send_queue_frames = 3;
         config->transport.send_max_latency_ms = 250;
         return;
     }
@@ -207,6 +274,7 @@ void applyRateProfileValues(RateProfile profile, AppConfig *config) {
         config->roi.core_delta_qp = -7;
         config->roi.edge_delta_qp = -11;
         config->transport.pacing_bitrate_bps = preset.link_cap_kbps * 1000;
+        config->transport.send_queue_frames = 3;
         config->transport.send_max_latency_ms = 250;
         config->transport.event.enabled = false;
         return;
@@ -226,20 +294,30 @@ const char *pipelineModeName(PipelineMode mode) {
 
 const char *rateProfileName(RateProfile profile) {
     switch (profile) {
-    case RATE_PROFILE_LOW: return "low";
-    case RATE_PROFILE_MEDIUM: return "medium";
-    case RATE_PROFILE_HIGH: return "high";
+    case RATE_PROFILE_RATE60: return "rate60";
+    case RATE_PROFILE_RATE150: return "rate150";
+    case RATE_PROFILE_RATE300: return "rate300";
     case RATE_PROFILE_REBUILD: return "rebuild";
     case RATE_PROFILE_GAN: return "gan";
+    case RATE_PROFILE_RATE80: return "rate80";
+    case RATE_PROFILE_RATE100: return "rate100";
+    case RATE_PROFILE_RATE120: return "rate120";
+    case RATE_PROFILE_RATE180: return "rate180";
+    case RATE_PROFILE_RATE200: return "rate200";
     }
     return "unknown";
 }
 
 bool parseRateProfile(const std::string &name, RateProfile *profile) {
     if (!profile) return false;
-    if (name == "low") *profile = RATE_PROFILE_LOW;
-    else if (name == "medium") *profile = RATE_PROFILE_MEDIUM;
-    else if (name == "high") *profile = RATE_PROFILE_HIGH;
+    if (name == "rate60") *profile = RATE_PROFILE_RATE60;
+    else if (name == "rate80") *profile = RATE_PROFILE_RATE80;
+    else if (name == "rate100") *profile = RATE_PROFILE_RATE100;
+    else if (name == "rate120") *profile = RATE_PROFILE_RATE120;
+    else if (name == "rate150") *profile = RATE_PROFILE_RATE150;
+    else if (name == "rate180") *profile = RATE_PROFILE_RATE180;
+    else if (name == "rate200") *profile = RATE_PROFILE_RATE200;
+    else if (name == "rate300") *profile = RATE_PROFILE_RATE300;
     else if (name == "rebuild") *profile = RATE_PROFILE_REBUILD;
     else if (name == "gan") *profile = RATE_PROFILE_GAN;
     else return false;
@@ -318,7 +396,13 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "rate-profile" || key == "profile") {
             RateProfile profile;
             if (!parseRateProfile(value, &profile)) {
-                if (error) *error = "rate profile must be low, medium, high, rebuild, or gan";
+                if (error) {
+                    if (value == "low") *error = "low was renamed to rate60";
+                    else if (value == "medium") *error = "medium was renamed to rate150";
+                    else if (value == "high") *error = "high was renamed to rate300";
+                    else *error = "rate profile must be rate60, rate80, rate100, rate120, "
+                                  "rate150, rate180, rate200, rate300, rebuild, or gan";
+                }
                 return false;
             }
             applyRateProfile(profile, config);

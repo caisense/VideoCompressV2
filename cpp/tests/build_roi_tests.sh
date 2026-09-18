@@ -97,6 +97,7 @@ g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/transport/rate_pacer.cc" \
   "$cpp_dir/transport/packetizer.cc" \
   "$cpp_dir/transport/udp_sender.cc" \
+  "$cpp_dir/transport/local_tx_rate_publisher.cc" \
   "$cpp_dir/transport/async_rtp_sender.cc" \
   "$cpp_dir/tests/test_async_rtp_sender.cc" \
   -o "$out_dir/test_async_rtp_sender"

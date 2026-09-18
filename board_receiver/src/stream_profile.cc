@@ -21,17 +21,24 @@ StreamProfile::StreamProfile()
 
 const char* StreamProfile::name() const {
     switch (id) {
-        case PROFILE_LOW: return "low";
-        case PROFILE_MEDIUM: return "medium";
-        case PROFILE_HIGH: return "high";
+        case PROFILE_RATE60: return "rate60";
+        case PROFILE_RATE150: return "rate150";
+        case PROFILE_RATE300: return "rate300";
         case PROFILE_REBUILD: return "rebuild";
         case PROFILE_GAN: return "gan";
+        case PROFILE_RATE80: return "rate80";
+        case PROFILE_RATE100: return "rate100";
+        case PROFILE_RATE120: return "rate120";
+        case PROFILE_RATE180: return "rate180";
+        case PROFILE_RATE200: return "rate200";
         default: return "unknown";
     }
 }
 
 bool StreamProfile::supported() const {
-    return id == PROFILE_LOW || id == PROFILE_MEDIUM || id == PROFILE_HIGH;
+    return id == PROFILE_RATE60 || id == PROFILE_RATE80 || id == PROFILE_RATE100 ||
+           id == PROFILE_RATE120 || id == PROFILE_RATE150 || id == PROFILE_RATE180 ||
+           id == PROFILE_RATE200 || id == PROFILE_RATE300;
 }
 
 ProfileKey::ProfileKey()

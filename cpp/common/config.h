@@ -17,14 +17,20 @@ enum PipelineMode {
 };
 
 enum RateProfile {
-    RATE_PROFILE_LOW = 0,
-    RATE_PROFILE_MEDIUM = 1,
-    RATE_PROFILE_HIGH = 2,
+    // Keep the original on-wire values for the three renamed presets.
+    RATE_PROFILE_RATE60 = 0,
+    RATE_PROFILE_RATE150 = 1,
+    RATE_PROFILE_RATE300 = 2,
     // A low-rate live base layer plus semantic state and sparse source-camera
     // references.  The PC reconstructs a 640x360@12 display from this stream.
     RATE_PROFILE_REBUILD = 3,
     // Full-frame enhancement is a PC-side presentation path over H.265 only.
     RATE_PROFILE_GAN = 4,
+    RATE_PROFILE_RATE80 = 5,
+    RATE_PROFILE_RATE100 = 6,
+    RATE_PROFILE_RATE120 = 7,
+    RATE_PROFILE_RATE180 = 8,
+    RATE_PROFILE_RATE200 = 9,
 };
 
 // Video is the normal H.265/RTP path.  Image mode leaves capture and YOLO
@@ -177,7 +183,7 @@ struct TransportConfig {
     // Optional receiver SDP emitted from the first IDR access unit.  It carries
     // the H.265 VPS/SPS/PPS required by FFmpeg to determine frame dimensions.
     std::string rtp_sdp_path;
-    // Runtime profile commands are written as low/medium/high/rebuild/gan lines to this
+    // Runtime profile commands are written as rate60/.../rate300/rebuild/gan lines to this
     // FIFO. image/snapshot switches to detection-triggered JPEG transfer;
     // video returns to H.265. Empty disables live switching.
     std::string profile_control_path;

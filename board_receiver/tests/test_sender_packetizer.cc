@@ -30,7 +30,7 @@ int main(int argc, char**) {
 
     roi_h265::RtpStreamProfile sender_profile;
     sender_profile.valid = true;
-    sender_profile.profile = PROFILE_MEDIUM;
+    sender_profile.profile = PROFILE_RATE150;
     sender_profile.width = 480;
     sender_profile.height = 270;
     sender_profile.fps = 15;
@@ -49,7 +49,7 @@ int main(int argc, char**) {
                              &packet, &error));
         StreamProfile parsed;
         CHECK(parseStreamProfile(packet, &parsed, &error) == PROFILE_SUPPORTED);
-        CHECK(parsed.id == PROFILE_MEDIUM && parsed.width == 480 &&
+        CHECK(parsed.id == PROFILE_RATE150 && parsed.width == 480 &&
               parsed.height == 270 && parsed.fps == 15 && parsed.generation == 9);
         const DepacketizedPayload output = receiver.feed(packet);
         CHECK(output.valid);

@@ -41,8 +41,8 @@ inline std::vector<uint8_t> profileExtension(uint8_t profile, uint16_t width,
     appendBe16(&out, height);
     out.push_back(fps);
     out.push_back(generation);
-    appendBe16(&out, 800);
-    appendBe16(&out, 1000);
+    appendBe16(&out, 80);
+    appendBe16(&out, 100);
     return out;
 }
 
@@ -58,9 +58,9 @@ inline board_receiver::RtpPacket makePacket(
     appendBe32(&bytes, timestamp);
     appendBe32(&bytes, ssrc);
     appendBe16(&bytes, 0x524f);
-    appendBe16(&bytes, 3);
     const std::vector<uint8_t> extension =
         profileExtension(profile, width, height, fps, generation);
+    appendBe16(&bytes, 3);
     bytes.insert(bytes.end(), extension.begin(), extension.end());
     bytes.insert(bytes.end(), payload.begin(), payload.end());
 
@@ -94,4 +94,3 @@ inline std::vector<uint8_t> nal(uint8_t type, uint8_t body) {
 }
 
 #endif
-

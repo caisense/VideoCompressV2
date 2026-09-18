@@ -1,0 +1,19 @@
+Test project /tmp/rate_profiles_work_a/board_receiver/build-tests
+    Start 1: rtp_parser
+1/7 Test #1: rtp_parser .........................   Passed    0.00 sec
+    Start 2: hevc_depacketizer
+2/7 Test #2: hevc_depacketizer ..................   Passed    0.00 sec
+    Start 3: access_unit
+3/7 Test #3: access_unit ........................   Passed    0.00 sec
+    Start 4: profile_switch
+4/7 Test #4: profile_switch .....................   Passed    0.00 sec
+    Start 5: receiver_stats
+5/7 Test #5: receiver_stats .....................   Passed    0.00 sec
+    Start 6: sender_packetizer_differential
+6/7 Test #6: sender_packetizer_differential .....   Passed    0.00 sec
+    Start 7: python_cpp_protocol_differential
+7/7 Test #7: python_cpp_protocol_differential ...   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 7
+
+Total Test time (real) =   0.04 sec
