@@ -18,18 +18,19 @@ int alignTo(int value, int alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-bool isKeyH265AccessUnit(const std::vector<uint8_t> &bytes) {
+std::string h265FrameType(const std::vector<uint8_t> &bytes) {
     for (size_t i = 0; i + 5 < bytes.size(); ++i) {
         size_t code = 0;
         if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1) code = 3;
         else if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 && bytes[i + 3] == 1) code = 4;
         if (code) {
             const int nal_type = (bytes[i + code] >> 1) & 0x3f;
-            if (nal_type >= 16 && nal_type <= 21) return true;
+            if (nal_type == 19 || nal_type == 20) return "IDR";
+            if (nal_type >= 16 && nal_type <= 21) return "I";
             i += code;
         }
     }
-    return false;
+    return "P";
 }
 
 }  // namespace
@@ -101,7 +102,7 @@ bool setEncoderConfig(MppEncoderState *state, const EncoderConfig &config, std::
         mpp_enc_cfg_set_s32(state->config, "rc:gop", config.gop),
         mpp_enc_cfg_set_s32(state->config, "rc:max_reenc_times", config.max_reencode_times),
         mpp_enc_cfg_set_s32(state->config, "rc:priority", MPP_ENC_RC_BY_FRM_SIZE_FIRST),
-        mpp_enc_cfg_set_s32(state->config, "rc:super_mode", MPP_ENC_RC_SUPER_FRM_REENC),
+        mpp_enc_cfg_set_s32(state->config, "rc:super_mode", config.super_frame_mode),
         mpp_enc_cfg_set_s32(state->config, "rc:super_i_thd", config.super_i_frame_bits),
         mpp_enc_cfg_set_s32(state->config, "rc:super_p_thd", config.super_p_frame_bits),
         mpp_enc_cfg_set_s32(state->config, "rc:qp_init", config.qp_init),
@@ -109,9 +110,11 @@ bool setEncoderConfig(MppEncoderState *state, const EncoderConfig &config, std::
         mpp_enc_cfg_set_s32(state->config, "rc:qp_max", config.qp_max),
         mpp_enc_cfg_set_s32(state->config, "rc:qp_min_i", config.qp_min_i),
         mpp_enc_cfg_set_s32(state->config, "rc:qp_max_i", config.qp_max_i),
+        mpp_enc_cfg_set_u32(state->config, "rc:debreath_en", config.debreath ? 1U : 0U),
+        mpp_enc_cfg_set_u32(state->config, "rc:debreath_strength", config.debreath_strength),
         mpp_enc_cfg_set_s32(state->config, "rc:refresh_en", config.intra_refresh ? 1 : 0),
-        mpp_enc_cfg_set_s32(state->config, "rc:refresh_mode", MPP_ENC_RC_INTRA_REFRESH_ROW),
-        mpp_enc_cfg_set_s32(state->config, "rc:refresh_num", config.intra_refresh_rows),
+        mpp_enc_cfg_set_s32(state->config, "rc:refresh_mode", config.intra_refresh_mode),
+        mpp_enc_cfg_set_s32(state->config, "rc:refresh_num", config.intra_refresh_num),
     };
     const char *const keys[] = {
         "codec:type", "prep:width", "prep:height", "prep:hor_stride", "prep:ver_stride",
@@ -119,13 +122,16 @@ bool setEncoderConfig(MppEncoderState *state, const EncoderConfig &config, std::
         "rc:fps_out_flex", "rc:fps_out_num", "rc:fps_out_denorm", "rc:bps_target",
         "rc:bps_min", "rc:bps_max", "rc:gop", "rc:max_reenc_times", "rc:priority",
         "rc:super_mode", "rc:super_i_thd", "rc:super_p_thd", "rc:qp_init", "rc:qp_min",
-        "rc:qp_max", "rc:qp_min_i", "rc:qp_max_i", "rc:refresh_en", "rc:refresh_mode",
-        "rc:refresh_num",
+        "rc:qp_max", "rc:qp_min_i", "rc:qp_max_i", "rc:debreath_en",
+        "rc:debreath_strength", "rc:refresh_en", "rc:refresh_mode", "rc:refresh_num",
     };
     for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); ++i) {
         const std::string operation = std::string("mpp_enc_cfg_set ") + keys[i];
         if (!checkMpp(results[i], operation.c_str(), error)) return false;
     }
+    if (config.qp_ip >= 0 &&
+        !checkMpp(mpp_enc_cfg_set_s32(state->config, "rc:qp_ip", config.qp_ip),
+                  "mpp_enc_cfg_set rc:qp_ip", error)) return false;
     if (!checkMpp(state->mpi->control(state->context, MPP_ENC_SET_CFG, state->config),
                   "MPP_ENC_SET_CFG", error)) return false;
     MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
@@ -279,12 +285,17 @@ bool MppH265Encoder::encode(const FramePacket &frame, const std::vector<RoiRegio
     }
     output->frame = frame.meta;
     output->bytes.assign(payload, payload + length);
-    output->key_frame = isKeyH265AccessUnit(output->bytes);
+    output->frame_type = h265FrameType(output->bytes);
+    output->key_frame = output->frame_type != "P";
     output->average_qp = -1;
+    output->start_qp = -1;
+    output->frame_qp = -1;
     output->realtime_bitrate_bps = 0;
     if (mpp_packet_has_meta(packet)) {
         MppMeta packet_meta = mpp_packet_get_meta(packet);
         mpp_meta_get_s32(packet_meta, KEY_ENC_AVERAGE_QP, &output->average_qp);
+        mpp_meta_get_s32(packet_meta, KEY_ENC_START_QP, &output->start_qp);
+        mpp_meta_get_s32(packet_meta, KEY_ENC_FRAME_QP, &output->frame_qp);
         // MPP 1.3.9 does not expose the newer KEY_ENC_BPS_RT meta key.
         // RuntimeStatistics computes instantaneous and average bitrate from
         // actual encoded bytes when this SDK-provided metric is unavailable.

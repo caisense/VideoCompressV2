@@ -203,7 +203,7 @@ void testRateProfilePresets() {
         CHECK(config.roi.halo_delta_qp == 2);
         CHECK(config.roi.core_delta_qp == -6);
         CHECK(config.roi.edge_delta_qp == -10);
-        CHECK(config.encoder.intra_refresh && config.encoder.intra_refresh_rows == 1);
+        CHECK(config.encoder.intra_refresh && config.encoder.intra_refresh_num == 1);
         CHECK(config.encoder.max_reencode_times == 3);
         CHECK(config.transport.mtu == 1200);
         CHECK(config.transport.send_queue_frames == 16);
@@ -438,6 +438,31 @@ void testCommandLineConfig() {
     CHECK(gan_120.gan.video_bitrate_kbps == 90);
     CHECK(gan_120.encoder.target_bitrate_bps == 90000);
     CHECK(gan_120.transport.pacing_bitrate_bps == 120000);
+    CHECK(!gan_120.encoder.debreath && !gan_120.encoder.intra_refresh);
+    CHECK(gan_120.gan.gop_seconds == 2 && gan_120.gan.super_frame_policy == "current");
+
+    char gan_gop[] = "--gan-gop-seconds=4";
+    char gan_debreath[] = "--gan-debreath=on";
+    char gan_debreath_strength[] = "--gan-debreath-strength=8";
+    char gan_gdr[] = "--gan-intra-refresh=on";
+    char gan_refresh_mode[] = "--gan-refresh-mode=col";
+    char gan_refresh_num[] = "--gan-refresh-num=2";
+    char gan_qp_ip[] = "--gan-qp-ip=2";
+    char gan_super_relaxed[] = "--gan-super-frame=relaxed";
+    char encoder_log[] = "--encoder-debug-log=/tmp/encoder.jsonl";
+    char *gan_experiment_argv[] = {profile_app, gan_mode, gan_cap_60, gan_gop,
+        gan_debreath, gan_debreath_strength, gan_gdr, gan_refresh_mode,
+        gan_refresh_num, gan_qp_ip, gan_super_relaxed, encoder_log};
+    AppConfig gan_experiment;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(12, gan_experiment_argv, &gan_experiment, &error));
+    CHECK(gan_experiment.encoder.gop == 32 && gan_experiment.encoder.debreath);
+    CHECK(gan_experiment.encoder.debreath_strength == 8 && gan_experiment.encoder.intra_refresh);
+    CHECK(gan_experiment.encoder.intra_refresh_mode == 1 && gan_experiment.encoder.intra_refresh_num == 2);
+    CHECK(gan_experiment.encoder.qp_ip == 2 && gan_experiment.encoder.super_frame_mode == 2);
+    CHECK(gan_experiment.encoder.super_p_frame_bits == 11250);
+    CHECK(gan_experiment.encoder.super_i_frame_bits == 33750);
+    CHECK(gan_experiment.encoder.debug_log_path == "/tmp/encoder.jsonl");
 
     char gan_cap_150[] = "--gan-link-cap-kbps=150";
     char *gan_150_argv[] = {profile_app, gan_mode, gan_cap_150};

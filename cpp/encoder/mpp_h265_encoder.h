@@ -15,10 +15,15 @@ struct EncodedAccessUnit {
     FrameMeta frame;
     std::vector<uint8_t> bytes;
     bool key_frame;
+    // "IDR", "I", or "P", derived from the actual HEVC VCL NAL type.
+    std::string frame_type;
     int average_qp;
+    int start_qp;
+    int frame_qp;
     int realtime_bitrate_bps;
 
-    EncodedAccessUnit() : key_frame(false), average_qp(-1), realtime_bitrate_bps(0) {}
+    EncodedAccessUnit() : key_frame(false), frame_type("P"), average_qp(-1), start_qp(-1),
+                          frame_qp(-1), realtime_bitrate_bps(0) {}
 };
 
 class MppH265Encoder {

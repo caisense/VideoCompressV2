@@ -15,12 +15,13 @@ RoiConfig::RoiConfig()
 EncoderConfig::EncoderConfig()
     : width(320), height(180), fps(10), target_bitrate_bps(42000),
       gop(50), qp_min(10), qp_max(51), qp_init(38), qp_min_i(36), qp_max_i(48),
-      intra_refresh(true), intra_refresh_rows(1), max_reencode_times(3),
+      qp_ip(-1), debreath(false), debreath_strength(16), intra_refresh(true),
+      intra_refresh_mode(0), intra_refresh_num(1), super_frame_mode(2), max_reencode_times(3),
       super_i_frame_bits(12000), super_p_frame_bits(5500), grayscale_encode(true) {}
 
 GanConfig::GanConfig()
     : fps(10), inference_fps(0), link_cap_kbps(100), video_bitrate_kbps(75),
-      max_inference_latency_ms(100) {}
+      max_inference_latency_ms(100), gop_seconds(2), super_frame_policy("current") {}
 
 SnapshotConfig::SnapshotConfig()
     // Balanced 60 kbps evidence defaults: cap payload bytes before they enter
@@ -263,10 +264,17 @@ void applyRateProfileValues(RateProfile profile, AppConfig *config) {
         config->encoder.height = preset.source_height;
         config->encoder.fps = config->gan.fps;
         config->encoder.target_bitrate_bps = config->gan.video_bitrate_kbps * 1000;
-        config->encoder.gop = config->gan.fps * 2;
+        config->encoder.gop = config->gan.fps * config->gan.gop_seconds;
         config->encoder.qp_init = 39;
         config->encoder.qp_min_i = 36;
         config->encoder.qp_max_i = 49;
+        // Preserve the historical behavior unless an experiment opts in.
+        config->encoder.qp_ip = -1;
+        config->encoder.debreath = false;
+        config->encoder.intra_refresh = false;
+        config->encoder.intra_refresh_mode = 0;
+        config->encoder.intra_refresh_num = 1;
+        config->encoder.super_frame_mode = 2;
         config->encoder.super_i_frame_bits = 10000;
         config->encoder.super_p_frame_bits = 4500;
         config->encoder.grayscale_encode = false;
@@ -417,7 +425,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
             config->gan.fps = integer;
             if (config->rate_profile == RATE_PROFILE_GAN) {
                 config->encoder.fps = integer;
-                config->encoder.gop = integer * 2;
+                config->encoder.gop = integer * config->gan.gop_seconds;
             }
         }
         else if (key == "gan-inference-fps" && parseInt(value, &integer)) {
@@ -448,13 +456,35 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "gan-max-inference-latency-ms" && parseInt(value, &integer)) {
             config->gan.max_inference_latency_ms = integer;
         }
+        else if (key == "gan-gop-seconds" && parseInt(value, &integer)) {
+            config->gan.gop_seconds = integer;
+            if (config->rate_profile == RATE_PROFILE_GAN) config->encoder.gop = config->gan.fps * integer;
+        }
+        else if (key == "gan-debreath" && parseBool(value, &boolean)) config->encoder.debreath = boolean;
+        else if (key == "gan-debreath-strength" && parseInt(value, &integer)) config->encoder.debreath_strength = integer;
+        else if (key == "gan-intra-refresh" && parseBool(value, &boolean)) config->encoder.intra_refresh = boolean;
+        else if (key == "gan-refresh-mode") {
+            if (value == "row") config->encoder.intra_refresh_mode = 0;
+            else if (value == "col" || value == "column") config->encoder.intra_refresh_mode = 1;
+            else { if (error) *error = "gan refresh mode must be row or col"; return false; }
+        }
+        else if (key == "gan-refresh-num" && parseInt(value, &integer)) config->encoder.intra_refresh_num = integer;
+        else if (key == "gan-qp-ip" && parseInt(value, &integer)) config->encoder.qp_ip = integer;
+        else if (key == "gan-super-frame") {
+            if (value != "current" && value != "off" && value != "relaxed") {
+                if (error) *error = "gan super-frame must be current, off, or relaxed";
+                return false;
+            }
+            config->gan.super_frame_policy = value;
+        }
+        else if (key == "encoder-debug-log") config->encoder.debug_log_path = value;
         else if (key == "qp-min" && parseInt(value, &integer)) config->encoder.qp_min = integer;
         else if (key == "qp-max" && parseInt(value, &integer)) config->encoder.qp_max = integer;
         else if (key == "qp-init" && parseInt(value, &integer)) config->encoder.qp_init = integer;
         else if (key == "qp-min-i" && parseInt(value, &integer)) config->encoder.qp_min_i = integer;
         else if (key == "qp-max-i" && parseInt(value, &integer)) config->encoder.qp_max_i = integer;
         else if (key == "intra-refresh" && parseBool(value, &boolean)) config->encoder.intra_refresh = boolean;
-        else if (key == "intra-refresh-rows" && parseInt(value, &integer)) config->encoder.intra_refresh_rows = integer;
+        else if (key == "intra-refresh-rows" && parseInt(value, &integer)) config->encoder.intra_refresh_num = integer;
         else if (key == "max-reencode-times" && parseInt(value, &integer)) config->encoder.max_reencode_times = integer;
         else if (key == "super-i-frame-bits" && parseInt(value, &integer)) config->encoder.super_i_frame_bits = integer;
         else if (key == "super-p-frame-bits" && parseInt(value, &integer)) config->encoder.super_p_frame_bits = integer;
@@ -572,7 +602,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
          config->encoder.height != gan_preset.source_height ||
          config->encoder.fps != config->gan.fps ||
          config->encoder.target_bitrate_bps != config->gan.video_bitrate_kbps * 1000 ||
-         config->encoder.gop != config->gan.fps * 2 ||
+         config->encoder.gop != config->gan.fps * config->gan.gop_seconds ||
          config->transport.pacing_bitrate_bps != gan_preset.link_cap_kbps * 1000 ||
          config->encoder.grayscale_encode)) {
         if (error) {
@@ -586,6 +616,15 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         // The default event switch is on for the legacy profiles.  GAN always
         // suppresses it so the only optional companion traffic is audio.
         config->transport.event.enabled = false;
+        if (config->gan.super_frame_policy == "off") {
+            config->encoder.super_frame_mode = 0;
+            config->encoder.max_reencode_times = 0;
+        } else if (config->gan.super_frame_policy == "relaxed") {
+            const int average_frame_bits = config->encoder.target_bitrate_bps / config->encoder.fps;
+            config->encoder.super_frame_mode = 2;
+            config->encoder.super_p_frame_bits = average_frame_bits * 2;
+            config->encoder.super_i_frame_bits = average_frame_bits * 6;
+        }
     }
 
     if (config->encoder.width <= 0 || config->encoder.height <= 0 || config->encoder.fps <= 0 ||
@@ -690,6 +729,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->gan.inference_fps < 0 || config->gan.inference_fps > 30 ||
         config->gan.max_inference_latency_ms < 1 ||
         config->gan.max_inference_latency_ms > 2000 ||
+        (config->gan.gop_seconds != 1 && config->gan.gop_seconds != 2 && config->gan.gop_seconds != 4) ||
         !gan_preset_valid || config->gan.video_bitrate_kbps < 1 ||
         config->gan.video_bitrate_kbps > gan_preset.max_video_bitrate_kbps ||
         config->roi.cell_size != 16 || config->roi.max_regions <= 0 || config->roi.max_age_frames < 0 ||
@@ -702,7 +742,11 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->encoder.qp_max > 51 || config->encoder.qp_min > config->encoder.qp_max ||
         config->encoder.qp_init < config->encoder.qp_min || config->encoder.qp_init > config->encoder.qp_max ||
         config->encoder.qp_min_i < config->encoder.qp_min || config->encoder.qp_max_i > config->encoder.qp_max ||
-        config->encoder.qp_min_i > config->encoder.qp_max_i || config->encoder.intra_refresh_rows <= 0 ||
+        config->encoder.qp_min_i > config->encoder.qp_max_i || config->encoder.qp_ip < -1 ||
+        config->encoder.qp_ip > 8 || config->encoder.debreath_strength < 0 ||
+        config->encoder.debreath_strength > 35 || config->encoder.intra_refresh_mode < 0 ||
+        config->encoder.intra_refresh_mode > 1 || config->encoder.intra_refresh_num <= 0 ||
+        (config->encoder.super_frame_mode != 0 && config->encoder.super_frame_mode != 2) ||
         config->encoder.max_reencode_times < 0 || config->encoder.max_reencode_times > 3 ||
         config->encoder.super_i_frame_bits <= 0 || config->encoder.super_p_frame_bits <= 0 ||
         config->roi.background_delta_qp < -51 || config->roi.background_delta_qp > 51 ||

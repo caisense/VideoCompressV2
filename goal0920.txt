@@ -1,0 +1,918 @@
+/goal
+
+基于当前 VideoCompressV2 最新代码，修复极窄带 GAN 模式下周期性“清晰 -> 模糊 -> 再清晰”的画质呼吸问题。
+
+当前已知实测背景：
+- RK3588 发送端
+- H.265 + YOLOv8-Seg + ROI/QP
+- PC 接收端 Real-ESRGAN CUDA 全帧增强
+- 典型测试：CAP≈60 kbps，8 fps
+- --gan-inference-fps=0
+- 接收端长跑约 15 分钟可做到：
+  - GAN ≈8 fps
+  - DROPPED=0
+  - SOFT_FALLBACK=0
+  - HARD_STALL=0
+- 即使每个 decoded frame 都经过 ESRGAN，仍可观察到周期性模糊/清晰变化
+- 当前 8fps GAN GOP = fps*2 = 16 frames ≈2秒
+- 已观察到疑似与16帧周期相关的输出质量变化
+
+本目标优先处理：
+1. 编码端可观测性
+2. MPP debreath
+3. GDR/Intra Refresh
+4. I/P帧质量平衡
+5. super-frame reencode
+6. ROI QP时序稳定
+
+不要通过增强GAN锐度、放宽GAN latency budget或增加接收端fallback逻辑掩盖问题。
+
+==================================================
+一、先增加逐帧编码遥测
+==================================================
+
+在 RK3588 H.265 encoder 路径增加可选 debug JSONL 日志。
+
+新增参数，例如：
+
+--encoder-debug-log=/tmp/encoder.jsonl
+
+不指定时：
+- 不写日志
+- 不影响现有性能和行为
+
+每个编码 frame 尽可能记录：
+
+TYPE=ENC_FRAME
+SEQ
+PTS
+GENERATION
+
+FRAME_TYPE:
+- IDR
+- I
+- P
+
+GOP_POSITION
+GOP_SIZE
+
+ENCODED_BYTES
+ENCODED_BITS
+
+RC_MODE
+TARGET_BITRATE_BPS
+
+QP_INIT
+QP_MIN
+QP_MAX
+QP_MIN_I
+QP_MAX_I
+
+如果 MPP API 能直接获得：
+AVG_QP / REAL_QP / FRAME_QP
+则记录；
+如果拿不到，不要伪造。
+
+SUPER_FRAME_TRIGGERED
+REENCODE_COUNT
+如果 MPP 无法暴露真实值，则明确记 UNKNOWN，
+不要根据 frame size 猜测为真实 reencode count。
+
+ROI：
+ROI_BLOCKS
+CORE_BLOCKS
+EDGE_BLOCKS
+BACKGROUND_BLOCKS
+ROI_AREA_RATIO
+
+YOLO：
+YOLO_UPDATED=true/false
+
+同时记录当前：
+DEBREATH enabled/strength
+GDR enabled/mode/refresh_num
+
+目的：
+能够把
+
+GOP position
+↓
+frame type
+↓
+encoded bits / QP
+↓
+ROI变化
+↓
+接收端清晰度
+
+对齐分析。
+
+==================================================
+二、增加实验型 debreath 开关
+==================================================
+
+利用 RK MPP 原生 debreath 功能。
+
+增加 GAN 模式参数：
+
+--gan-debreath=on|off
+--gan-debreath-strength=N
+
+要求：
+
+- 使用 MPP 官方 rc:debreath_en
+- 使用 rc:debreath_strength
+- strength 必须按当前 RK3588 MPP 实际支持范围校验
+- 不自行实现额外图像滤镜
+
+保持当前默认行为兼容：
+默认 debreath=off，
+除非已有配置本身开启。
+
+准备 A/B：
+
+A:
+debreath off
+
+B:
+debreath on
+strength=24
+
+C:
+strength=16
+
+D:
+strength=8
+
+注意：
+MPP debreath strength 的实际方向以当前所用 MPP
+头文件/实现/官方接口语义为准，
+不要根据参数名称猜测强弱。
+
+日志必须输出实际生效值。
+
+==================================================
+三、增加 GDR / Intra Refresh 实验开关
+==================================================
+
+增加 GAN 模式参数：
+
+--gan-intra-refresh=off|on
+--gan-refresh-mode=<MPP实际支持模式>
+--gan-refresh-num=N
+
+使用 MPP 原生：
+
+rc:refresh_en
+rc:refresh_mode
+rc:refresh_num
+
+禁止自行模拟 GDR。
+
+目标：
+
+当前：
+
+IDR
+ P
+ P
+ P
+ ...
+ P
+IDR
+
+改为实验性的渐进刷新：
+
+P + partial intra refresh
+P + next refresh region
+P + next refresh region
+...
+
+将一次 IDR 的刷新成本分摊到多个 frame，
+降低：
+
+- IDR bitrate spike
+- IDR之后P帧码率被压缩
+- 约2秒一次的质量悬崖
+
+==================================================
+四、正确处理 GDR 与 IDR
+==================================================
+
+不要简单：
+
+开启 GDR
++
+仍每2秒完整 IDR
+
+否则无法验证效果。
+
+需要检查当前 MPP 对 GDR、GOP、IDR 的真实行为。
+
+实现实验配置，使 GDR 测试时：
+
+- 尽量避免固定2秒完整 IDR 造成周期性悬崖
+- 场景切换、decoder recovery、启动等必要场景仍允许 IDR
+- 不破坏 RTP/decoder 可恢复性
+
+不要删除原来的普通 GOP 模式。
+
+必须支持：
+
+MODE A:
+传统 GOP
+
+MODE B:
+GDR
+
+方便直接 A/B。
+
+==================================================
+五、增加 GOP 实验参数，仅用于定位
+==================================================
+
+当前 GAN：
+
+gop = fps * 2
+
+增加实验参数：
+
+--gan-gop-seconds=N
+
+至少允许：
+
+1
+2
+4
+
+8fps 时对应：
+
+1s -> GOP8
+2s -> GOP16
+4s -> GOP32
+
+默认保持：
+2秒
+
+此参数主要用于根因验证，
+不要把“缩短 GOP”直接作为最终修复方案。
+
+验收：
+
+如果视觉模糊/清晰周期跟随：
+
+GOP8  -> ≈1秒
+GOP16 -> ≈2秒
+GOP32 -> ≈4秒
+
+则输出明确结论：
+周期与 GOP/RC 高度相关。
+
+==================================================
+六、优化 I/P 帧质量断层
+==================================================
+
+检查当前 MPP：
+
+qp_init
+qp_min
+qp_max
+qp_min_i
+qp_max_i
+qp_ip
+
+以及 GAN profile 中的真实配置。
+
+目标不是单纯：
+
+“让I帧更清晰”
+
+而是降低：
+
+I frame quality
+vs
+P frame quality
+
+之间的悬崖。
+
+增加实验参数，例如：
+
+--gan-qp-ip=N
+
+或以现有配置系统提供对应控制。
+
+要求：
+
+- 不依赖 RK3588 未明确支持的 qp_step
+- 不硬编码 |ΔQP|<=2/3 这种软件模拟逻辑
+- 优先使用 RK3588 MPP 真正支持的 RC/QP 参数
+
+设计至少：
+
+baseline
+balanced-ip-1
+balanced-ip-2
+
+三组 A/B。
+
+重点看：
+
+- IDR encoded bits
+- P frame bits
+- GOP内画质方差
+- ROI质量
+- 总wire bitrate
+
+目标是：
+允许略微降低IDR峰值质量，
+换取整个GOP内更稳定的P帧质量。
+
+==================================================
+七、重新评估 super-frame reencode
+==================================================
+
+检查当前：
+
+SUPER_FRM_REENC
+super_i_frame_bits
+super_p_frame_bits
+max_reenc_times
+
+当前极低码率下不能继续假设：
+
+super_p_frame_bits=4500
+
+一定合理。
+
+增加实验配置：
+
+--gan-super-frame=current
+--gan-super-frame=off
+--gan-super-frame=relaxed
+
+relaxed 必须根据：
+target bitrate
+fps
+平均 frame budget
+
+计算合理 threshold，
+不要继续使用和 bitrate/fps 完全无关的绝对常数。
+
+例如概念上：
+
+average_frame_bits =
+    target_bitrate / fps
+
+P super threshold 应与
+average_frame_bits
+形成合理比例关系。
+
+不要直接照搬某个未经验证的比例；
+通过测试确定。
+
+记录：
+
+frame bits
+是否触发super-frame
+reencode次数（若MPP可获得）
+最终QP（若MPP可获得）
+
+重点判断：
+
+复杂P帧
+→ super-frame
+→ reencode
+→ QP上升
+→ 后续参考质量下降
+
+是否参与周期性模糊。
+
+==================================================
+八、ROI QP map 时序稳定
+==================================================
+
+即使：
+
+--gan-inference-fps=0
+
+也不能假设 YOLO segmentation mask 完全稳定。
+
+当前 ROI 不同区域 QP delta 差距较大，
+mask轻微抖动可能导致某个block：
+
+edge/core
+↓
+background
+↓
+下一帧重新ROI
+
+产生明显质量跳变。
+
+在 ROI map 生成层增加可选 temporal stabilization。
+
+不要改变 YOLO 模型。
+
+建议实现：
+
+1. ROI HOLD
+
+目标刚从 ROI 消失时，
+不要立即变为 background。
+
+增加：
+
+--roi-hold-frames=N
+
+建议实验：
+0 / 2 / 3
+
+2. ROI DECAY
+
+从：
+
+edge/core
+
+不要一帧直接跳到：
+
+background
+
+允许中间状态逐步衰减。
+
+如果现有 ROI level 体系不适合增加 level，
+可以通过短时保持前一级 QP 实现。
+
+3. mask dilation
+
+允许对 person/face 等核心目标边缘做少量 dilation，
+降低 segmentation 边界轻微抖动影响。
+
+必须可关闭。
+
+4. ROI AREA telemetry
+
+每帧记录：
+
+ROI_AREA_RATIO
+ROI_BLOCK_COUNT
+
+用于确认清晰度变化是否跟 ROI 面积周期相关。
+
+==================================================
+九、不要固定“ROI占60%码率”
+==================================================
+
+本目标不要实现：
+
+ROI固定60%码率
+
+之类未经验证的经验值。
+
+也不要硬编码：
+
+QP > 45 就不可恢复
+
+这样的假设。
+
+可以增加统计，
+但必须通过本项目实测确定：
+
+- ROI QP
+- decoded quality
+- ESRGAN recovered quality
+
+之间关系。
+
+==================================================
+十、不修改接收端 GAN 核心
+==================================================
+
+本目标不更换：
+
+Real-ESRGAN
+ONNX Runtime CUDA
+GAN权重
+GAN分辨率
+
+不引入：
+
+BasicVSR++
+RVRT
+TecoGAN
+RIFE
+diffusion
+随机seed
+denoising strength
+
+当前阶段先解决编码输入质量周期。
+
+==================================================
+十一、不要引入大VBV / 两遍编码
+==================================================
+
+本目标不采用：
+
+- 2~4秒大VBV缓冲
+- two-pass encoding
+- MB-tree
+- 大规模lookahead
+- CRF-like离线编码
+
+原因：
+
+本项目是：
+实时摄像头
++
+严格物理CAP
++
+低延迟链路
+
+不能用延迟换掉画质呼吸。
+
+==================================================
+十二、接收端增加质量诊断，不改变显示路径
+==================================================
+
+在现有 GAN debug log 中增加可选质量指标，
+仅用于诊断。
+
+对 decoded input 和 enhanced output
+分别记录轻量指标：
+
+LUMA_MEAN
+LUMA_STD
+LAPLACIAN_VARIANCE
+EDGE_ENERGY
+
+如果计算开销可接受。
+
+不要在主实时线程同步执行昂贵指标。
+
+最好：
+- debug模式启用
+- 或低频采样
+- 或后台统计
+
+目标：
+
+比较：
+
+decoded sharpness
+vs
+ESRGAN sharpness
+
+从而判断：
+
+模糊周期已经存在于 H265 decoded input
+
+还是：
+
+Real-ESRGAN把微小差异放大。
+
+==================================================
+十三、GOP 相位分析脚本
+==================================================
+
+新增或扩展分析脚本，例如：
+
+tools/analyze_quality_cycle.py
+
+输入：
+
+encoder.jsonl
+gan.jsonl
+
+根据 PTS/SEQ 对齐。
+
+输出：
+
+每个 GOP position：
+
+frame count
+avg encoded bits
+p50/p95 encoded bits
+avg QP（如有）
+ROI area
+decoded sharpness
+enhanced sharpness
+GAN clip_high
+GAN raw_max
+
+输出 GOP phase table，例如：
+
+POS  TYPE  BITS  QP  ROI%  DEC_SHARP  GAN_SHARP
+0    IDR
+1    P
+2    P
+...
+15   P
+
+并计算：
+
+- GOP position 与 decoded sharpness 相关性
+- GOP position 与 GAN sharpness 相关性
+- QP 与 sharpness 相关性
+- encoded bits 与 sharpness 相关性
+- ROI area 与 sharpness 相关性
+
+==================================================
+十四、实验矩阵
+==================================================
+
+先使用：
+
+CAP=60
+FPS=8
+--gan-inference-fps=0
+
+保持：
+场景
+摄像机
+光照
+目标数量
+尽量一致。
+
+-------------------
+实验0：Baseline
+-------------------
+
+GOP=2s
+debreath off
+GDR off
+当前QP
+当前super-frame
+当前ROI策略
+
+至少运行3分钟。
+
+-------------------
+实验1：GOP验证
+-------------------
+
+GOP：
+1s
+2s
+4s
+
+每组至少2分钟。
+
+判断视觉周期是否变为：
+
+≈1s
+≈2s
+≈4s
+
+-------------------
+实验2：Debreath
+-------------------
+
+固定 GOP2s：
+
+off
+24
+16
+8
+
+每组至少3分钟。
+
+-------------------
+实验3：Super-frame
+-------------------
+
+current
+off
+relaxed
+
+-------------------
+实验4：I/P QP
+-------------------
+
+baseline
+balanced-1
+balanced-2
+
+-------------------
+实验5：GDR
+-------------------
+
+传统 GOP
+vs
+GDR
+
+保持尽量相同平均码率。
+
+-------------------
+实验6：ROI稳定
+-------------------
+
+hold=0
+hold=2
+hold=3
+
+根据结果再判断是否需要 dilation/decay。
+
+==================================================
+十五、评价指标
+==================================================
+
+不能只比较：
+
+平均 PSNR
+平均 SSIM
+
+重点评价时间稳定性。
+
+至少记录：
+
+平均画质
++
+画质时间方差
++
+GOP phase variance
+
+如果已有原始参考视频：
+
+PSNR
+SSIM
+
+建议增加：
+
+temporal sharpness variance
+相邻帧 edge-energy delta
+temporal LPIPS（如已有依赖）
+
+如果没有 reference：
+优先使用：
+
+Laplacian/edge-energy时间方差
+GOP phase统计
+人工A/B
+
+本目标核心指标：
+
+不是“最清晰的一帧有多清晰”，
+
+而是：
+
+同一稳定场景下，
+清晰度在时间轴上的方差是否下降。
+
+==================================================
+十六、网络限制必须保持
+==================================================
+
+所有方案必须继续满足：
+
+physical CAP <= 配置值
+
+CAP60测试时：
+不能因为 GDR/debreath/QP 调整，
+让 RatePacer 实际 wire rate 持续超过60kbps。
+
+允许瞬时 encoder frame size 改变，
+但最终发送仍必须受现有 RatePacer 控制。
+
+同时观察：
+
+RTP queue
+pacing delay
+stale frame
+decoder latency
+
+避免把：
+
+画质呼吸
+
+变成：
+
+网络排队/延迟呼吸。
+
+==================================================
+十七、预期最终组合
+==================================================
+
+不要提前硬编码最终值。
+
+根据 A/B 数据确定。
+
+优先寻找类似：
+
+CBR
++
+适度 debreath
++
+GDR
++
+较平衡的 I/P QP
++
+合理的 super-frame threshold
++
+ROI hold/stabilization
+
+的组合。
+
+相比：
+
+短GOP + 大量IDR
+
+优先选择：
+
+较平稳的渐进刷新方案。
+
+==================================================
+十八、禁止修改
+==================================================
+
+本目标不要修改：
+
+- YOLOv8-Seg模型
+- RKNN模型
+- Real-ESRGAN模型
+- GAN权重
+- ONNX Runtime provider
+- CUDA provider
+- RTP packetization核心格式
+- RatePacer wire accounting
+- Codec2
+- receiver fallback state machine
+- low/medium/high/rebuild模式
+- 其他与本问题无关的profile
+
+==================================================
+十九、验收标准
+==================================================
+
+必须满足：
+
+1. 能证明/否定周期是否与 GOP 同步。
+
+2. 可以独立切换：
+   debreath
+   GDR
+   GOP seconds
+   super-frame策略
+   ROI hold
+   I/P QP实验配置。
+
+3. 默认参数保持当前行为兼容。
+
+4. 所有实验参数实际生效值都写入日志。
+
+5. CAP60 / 8fps 下：
+   接收端 GAN 仍保持约8fps，
+   不因为修改引入新的fallback/drop。
+
+6. 修复后相同场景：
+   周期性“清晰->模糊->清晰”
+   的幅度明显下降。
+
+7. 如果峰值单帧清晰度略下降，
+   但时间稳定性明显改善，
+   可以接受。
+
+8. 不允许通过单纯降低GAN增强强度
+   伪装问题。
+
+9. 不允许通过显著增加端到端延迟
+   换取稳定性。
+
+10. 给出每组A/B：
+    - 平均wire bitrate
+    - frame bits
+    - GOP phase quality
+    - sharpness mean/std
+    - ROI area variance
+    - fallback/drop
+    - 主观画质结论
+
+==================================================
+二十、最终输出
+==================================================
+
+完成后输出：
+
+1. 根因判断
+
+明确区分：
+- GOP/IDR
+- RC/QP
+- super-frame reencode
+- ROI map波动
+- ESRGAN放大效应
+
+各自贡献。
+
+2. 修改文件列表。
+
+3. 所有新增CLI参数及默认值。
+
+4. 编码器 telemetry 格式。
+
+5. A/B测试结果。
+
+6. 推荐最终参数组合。
+
+7. 说明为什么该组合相比原配置减少了
+“清晰 -> 模糊 -> 清晰”的周期性呼吸。
+
+8. 如果测试证明周期主要来自发送端，
+明确不要继续通过更换GAN模型修复该问题。

@@ -84,6 +84,66 @@ std::string debugPathForFrame(const std::string &pattern, uint64_t frame_id) {
         pattern.substr(position + token.size());
 }
 
+class EncoderDebugLog {
+public:
+    explicit EncoderDebugLog(const std::string &path) : handle_(NULL) {
+        if (!path.empty()) handle_ = std::fopen(path.c_str(), "a");
+    }
+    ~EncoderDebugLog() { if (handle_) std::fclose(handle_); }
+    bool requested() const { return handle_ != NULL; }
+
+    void write(const FramePacket &frame, const RoiMap &map, const EncodedAccessUnit &unit,
+               const EncoderConfig &encoder, const GanConfig &gan, unsigned int generation,
+               uint64_t gop_position, int roi_regions) {
+        if (!handle_) return;
+        int background = 0, halo = 0, core = 0, edge = 0;
+        for (size_t i = 0; i < map.cells.size(); ++i) {
+            switch (map.cells[i]) {
+            case ROI_EDGE: ++edge; break;
+            case ROI_CORE: ++core; break;
+            case ROI_HALO: ++halo; break;
+            default: ++background; break;
+            }
+        }
+        const int roi_blocks = halo + core + edge;
+        const double roi_ratio = map.cells.empty() ? 0.0 :
+            static_cast<double>(roi_blocks) / static_cast<double>(map.cells.size());
+        const bool yolo_updated = map.source_frame.frame_id == frame.meta.frame_id;
+        const char *super_triggered = encoder.super_frame_mode == 0 ? "false" : "\"UNKNOWN\"";
+        const std::string average_qp = unit.average_qp < 0 ? "null" : std::to_string(unit.average_qp);
+        const std::string start_qp = unit.start_qp < 0 ? "null" : std::to_string(unit.start_qp);
+        const std::string frame_qp = unit.frame_qp < 0 ? "null" : std::to_string(unit.frame_qp);
+        std::fprintf(handle_,
+            "{\"TYPE\":\"ENC_FRAME\",\"SEQ\":%llu,\"PTS\":%llu,\"GENERATION\":%u,"
+            "\"FRAME_TYPE\":\"%s\",\"GOP_POSITION\":%llu,\"GOP_SIZE\":%d,"
+            "\"ENCODED_BYTES\":%zu,\"ENCODED_BITS\":%zu,\"RC_MODE\":\"CBR\","
+            "\"TARGET_BITRATE_BPS\":%d,\"QP_INIT\":%d,\"QP_MIN\":%d,\"QP_MAX\":%d,"
+            "\"QP_MIN_I\":%d,\"QP_MAX_I\":%d,\"QP_IP\":%d,\"AVG_QP\":%s,"
+            "\"START_QP\":%s,\"FRAME_QP\":%s,"
+            "\"SUPER_FRAME_POLICY\":\"%s\",\"SUPER_FRAME_TRIGGERED\":%s,"
+            "\"REENCODE_COUNT\":\"UNKNOWN\",\"ROI_BLOCKS\":%d,\"ROI_REGIONS\":%d,"
+            "\"CORE_BLOCKS\":%d,\"EDGE_BLOCKS\":%d,\"BACKGROUND_BLOCKS\":%d,"
+            "\"ROI_AREA_RATIO\":%.8f,\"YOLO_UPDATED\":%s,\"DEBREATH_ENABLED\":%s,"
+            "\"DEBREATH_STRENGTH\":%d,\"GDR_ENABLED\":%s,\"GDR_MODE\":\"%s\","
+            "\"GDR_REFRESH_NUM\":%d}\n",
+            static_cast<unsigned long long>(frame.meta.frame_id),
+            static_cast<unsigned long long>(frame.meta.pts_us), generation,
+            unit.frame_type.c_str(), static_cast<unsigned long long>(gop_position), encoder.gop,
+            unit.bytes.size(), unit.bytes.size() * 8U, encoder.target_bitrate_bps,
+            encoder.qp_init, encoder.qp_min, encoder.qp_max, encoder.qp_min_i, encoder.qp_max_i,
+            encoder.qp_ip, average_qp.c_str(), start_qp.c_str(), frame_qp.c_str(),
+            gan.super_frame_policy.c_str(), super_triggered, roi_blocks, roi_regions,
+            core, edge, background, roi_ratio, yolo_updated ? "true" : "false",
+            encoder.debreath ? "true" : "false", encoder.debreath_strength,
+            encoder.intra_refresh ? "true" : "false",
+            encoder.intra_refresh_mode == 0 ? "row" : "col", encoder.intra_refresh_num);
+        std::fflush(handle_);
+    }
+
+private:
+    FILE *handle_;
+};
+
 void printUsage(const char *program) {
     std::fprintf(stderr,
         "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan]\n"
@@ -92,6 +152,10 @@ void printUsage(const char *program) {
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
         "          [--gan-link-cap-kbps=60|100|120|150 --gan-fps=8|10|12 --gan-inference-fps=0]\n"
         "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
+        "          [--gan-gop-seconds=1|2|4 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
+        "          [--gan-intra-refresh=on|off --gan-refresh-mode=row|col --gan-refresh-num=N]\n"
+        "          [--gan-qp-ip=0..8 --gan-super-frame=current|off|relaxed]\n"
+        "          [--encoder-debug-log=/tmp/encoder.jsonl]\n"
         "          [--intra-refresh=on --intra-refresh-rows=1 --max-reencode-times=3]\n"
         "          [--super-i-frame-bits=12000 --super-p-frame-bits=5500]\n"
         "          [--grayscale-encode=on|off]\n"
@@ -345,6 +409,12 @@ int main(int argc, char **argv) {
             }
             event_sender->setEnabled(true);
         }
+    }
+    EncoderDebugLog encoder_debug(config.encoder.debug_log_path);
+    if (!config.encoder.debug_log_path.empty() && !encoder_debug.requested()) {
+        std::fprintf(stderr, "configuration error: cannot open encoder debug log: %s\n",
+                     config.encoder.debug_log_path.c_str());
+        return EXIT_FAILURE;
     }
     if (config.transport.event.enabled && !gan_mode) {
         std::fprintf(stderr,
@@ -704,7 +774,11 @@ int main(int argc, char **argv) {
                 running.store(false);
                 break;
             }
-            const bool periodic_idr = encoded_frame_count > 0 &&
+            // GDR distributes recovery over P frames. Keep explicit IDR for
+            // receiver recovery, but do not layer a fixed full-IDR cadence on
+            // top of an enabled gradual refresh experiment.
+            const bool gan_gdr = live.rate_profile == RATE_PROFILE_GAN && live.encoder.intra_refresh;
+            const bool periodic_idr = !gan_gdr && encoded_frame_count > 0 &&
                 encoded_frame_count % static_cast<uint64_t>(live.encoder.gop) == 0;
             if ((!encoder || ((sender.needsKeyFrame() || periodic_idr) &&
                 !encoder->requestIdr(&encoder_error)))) {
@@ -730,6 +804,10 @@ int main(int argc, char **argv) {
                 running.store(false);
                 break;
             }
+            encoder_debug.write(*frame, map, access_unit, live.encoder, live.gan,
+                                profile_generation.load(),
+                                encoded_frame_count % static_cast<uint64_t>(live.encoder.gop),
+                                static_cast<int>(regions.size()));
             ++encoded_frame_count;
             if (!rtp_sdp_written && access_unit.key_frame) {
                 if (writeH265RtpSdp(access_unit.bytes, live.transport.udp_port,

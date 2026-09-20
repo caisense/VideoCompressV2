@@ -90,6 +90,17 @@ def _percentile(values: Deque[float], percentile: float) -> float:
     return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
 
 
+def _quality_metrics(frame: np.ndarray) -> tuple[float, float, float, float]:
+    """Cheap no-reference metrics; called only by the background debug path."""
+    luma = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    luma32 = luma.astype(np.float32)
+    laplacian_variance = float(cv2.Laplacian(luma32, cv2.CV_32F).var())
+    grad_x = cv2.Sobel(luma32, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(luma32, cv2.CV_32F, 0, 1, ksize=3)
+    edge_energy = float(np.mean(np.abs(grad_x) + np.abs(grad_y)))
+    return float(np.mean(luma32)), float(np.std(luma32)), laplacian_variance, edge_energy
+
+
 @dataclasses.dataclass(frozen=True)
 class EnhancementInput:
     frame: np.ndarray
@@ -110,6 +121,13 @@ class EnhancementDiagnostics:
     clip_low_count: int = 0
     clip_high_count: int = 0
     output_luma_mean: Optional[float] = None
+    input_luma_mean: Optional[float] = None
+    input_luma_std: Optional[float] = None
+    input_laplacian_variance: Optional[float] = None
+    input_edge_energy: Optional[float] = None
+    output_luma_std: Optional[float] = None
+    output_laplacian_variance: Optional[float] = None
+    output_edge_energy: Optional[float] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -400,9 +418,14 @@ class FullFrameEnhancer:
             )
         if (output.shape[1], output.shape[0]) != self.output_size:
             output = cv2.resize(output, self.output_size, interpolation=cv2.INTER_LANCZOS4)
-        luma = cv2.cvtColor(output, cv2.COLOR_BGR2GRAY)
+        input_metrics = _quality_metrics(frame)
+        output_metrics = _quality_metrics(output)
         diagnostics = dataclasses.replace(
-            diagnostics, output_luma_mean=float(np.mean(luma))
+            diagnostics,
+            input_luma_mean=input_metrics[0], input_luma_std=input_metrics[1],
+            input_laplacian_variance=input_metrics[2], input_edge_energy=input_metrics[3],
+            output_luma_mean=output_metrics[0], output_luma_std=output_metrics[1],
+            output_laplacian_variance=output_metrics[2], output_edge_energy=output_metrics[3],
         )
         return np.ascontiguousarray(output), diagnostics
 
@@ -576,6 +599,17 @@ class LatestOnlyEnhancerWorker:
             "OUTPUT_LUMA_MEAN": (
                 None if diagnostics is None else diagnostics.output_luma_mean
             ),
+            "INPUT_LUMA_MEAN": None if diagnostics is None else diagnostics.input_luma_mean,
+            "INPUT_LUMA_STD": None if diagnostics is None else diagnostics.input_luma_std,
+            "INPUT_LAPLACIAN_VARIANCE": (
+                None if diagnostics is None else diagnostics.input_laplacian_variance
+            ),
+            "INPUT_EDGE_ENERGY": None if diagnostics is None else diagnostics.input_edge_energy,
+            "OUTPUT_LUMA_STD": None if diagnostics is None else diagnostics.output_luma_std,
+            "OUTPUT_LAPLACIAN_VARIANCE": (
+                None if diagnostics is None else diagnostics.output_laplacian_variance
+            ),
+            "OUTPUT_EDGE_ENERGY": None if diagnostics is None else diagnostics.output_edge_energy,
         }
         self._write_debug(record)
 

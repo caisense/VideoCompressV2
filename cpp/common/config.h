@@ -135,12 +135,20 @@ struct EncoderConfig {
     int qp_init;
     int qp_min_i;
     int qp_max_i;
+    int qp_ip;
+    bool debreath;
+    int debreath_strength;
     bool intra_refresh;
-    int intra_refresh_rows;
+    // MPP GDR: 0=row, 1=column. refresh_num is rows/columns per frame.
+    int intra_refresh_mode;
+    int intra_refresh_num;
+    // 0=none, 2=re-encode (MPP_ENC_RC_SUPER_FRM_REENC).
+    int super_frame_mode;
     int max_reencode_times;
     int super_i_frame_bits;
     int super_p_frame_bits;
     bool grayscale_encode;
+    std::string debug_log_path;
 
     EncoderConfig();
 };
@@ -169,6 +177,10 @@ struct GanConfig {
     int link_cap_kbps;
     int video_bitrate_kbps;
     int max_inference_latency_ms;
+    int gop_seconds;
+    // current preserves the historical absolute thresholds; relaxed derives
+    // thresholds from target bitrate / fps; off disables super-frame handling.
+    std::string super_frame_policy;
 
     GanConfig();
 };
