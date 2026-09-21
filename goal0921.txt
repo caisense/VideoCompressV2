@@ -1,0 +1,933 @@
+/goal
+
+在 VideoCompressV2 中新增接收端模式 `gan-duo`，用于双 NVIDIA GPU 的 Real-ESRGAN TensorRT FP16 并行增强。
+
+目标硬件：
+- CPU: Intel Core Ultra 7 265K
+- GPU0: RTX 5060 Ti 16GB
+- GPU1: RTX 5060 Ti 16GB
+- Windows 接收端
+- 两张 GPU 独立显存，不假设显存合并
+
+现有模式必须保持兼容：
+- low / medium / high
+- rebuild
+- gan
+
+其中：
+- 原 `gan` 模式保持现有 ONNX Runtime + CUDAExecutionProvider 行为，不改变默认逻辑。
+- 新增 `gan-duo`：
+  - 双 GPU
+  - TensorRT FP16 为主推理后端
+  - 逐帧并行
+  - 按 sequence 重排序输出
+  - 目标用于 640x360 -> Real-ESRGAN x2 -> 1280x720 @ 15fps，后续允许测试 20fps。
+- 不修改发送端 H.265 GOP/RC/ROI 逻辑。
+- 不把本任务和当前 H.265 breathing 修复混在一起。
+
+==================================================
+1. 新增模式
+==================================================
+
+新增 CLI：
+
+--mode=gan-duo
+
+或遵循当前项目已有模式参数体系实现等价参数。
+
+启动时必须明确打印：
+
+MODE=GAN-DUO
+BACKEND=TENSORRT
+PRECISION=FP16
+GPU_COUNT=2
+GPU_IDS=0,1
+
+如果双 GPU 或 TensorRT 初始化失败，不允许静默伪装成 gan-duo。
+
+根据实际状态输出明确 warning/error。
+
+==================================================
+2. TensorRT 实现路线
+==================================================
+
+第一版优先采用：
+
+ONNX Runtime
+    ->
+TensorrtExecutionProvider
+    ->
+CUDAExecutionProvider fallback
+
+即每张 GPU 建立独立 InferenceSession：
+
+GPU0 Session:
+TensorrtExecutionProvider(device_id=0, FP16 enabled)
+CUDAExecutionProvider(device_id=0)
+
+GPU1 Session:
+TensorrtExecutionProvider(device_id=1, FP16 enabled)
+CUDAExecutionProvider(device_id=1)
+
+不要让一个 session 自动跨 GPU。
+
+必须保证：
+
+GPU0 session 只使用 GPU0
+GPU1 session 只使用 GPU1
+
+原始模型继续允许使用：
+
+RealESRGAN_x2_dynamic.onnx
+
+当前已确认模型：
+input   = FLOAT / FP32
+weights = FLOAT / FP32（702 initializer tensors）
+
+不要求永久修改原始 ONNX 为 FP16。
+
+TensorRT 构建阶段开启 FP16，使支持的 TensorRT layer 使用 FP16。
+
+如果项目环境适合直接使用 native TensorRT engine，也允许实现，但第一优先级是：
+“最小侵入地通过 ORT TensorRT EP 完成可运行版本”。
+
+==================================================
+3. TensorRT Engine Cache
+==================================================
+
+必须启用 TensorRT engine cache。
+
+缓存应至少区分：
+
+- model hash / model filename
+- GPU architecture
+- precision
+- input shape/profile
+- device
+
+例如：
+
+cache/
+  tensorrt/
+    realesrgan_x2/
+      fp16/
+        640x360/
+          gpu0/
+          gpu1/
+
+首次启动允许 build engine 较慢。
+
+后续启动应优先加载 cache，不能每次重新构建。
+
+日志输出：
+
+TRT_CACHE=MISS / HIT
+TRT_BUILD_MS=
+TRT_ENGINE_PATH=
+
+==================================================
+4. Dynamic shape / 输入尺寸
+==================================================
+
+RealESRGAN_x2_dynamic.onnx 为 dynamic model。
+
+gan-duo 至少支持：
+
+256x144
+320x180
+640x360
+
+重点优化 profile：
+
+640x360 -> 1280x720
+
+TensorRT optimization profile 应覆盖项目实际使用尺寸，不要无限制设置过大的 dynamic range 导致 engine 性能下降。
+
+建议第一版可以针对当前输入尺寸构建固定/窄范围 profile。
+
+当输入分辨率改变时：
+- 使用匹配 profile
+或
+- 创建对应 engine cache
+
+不得错误复用 shape 不匹配的 engine。
+
+==================================================
+5. 双 GPU Frame-Level Parallelism
+==================================================
+
+Real-ESRGAN 当前是逐帧独立推理，不存在前一帧 GAN 输出反馈到下一帧的问题。
+
+因此采用 frame-level parallelism：
+
+Decoded Frame N
+         |
+         +----> GPU0 Worker
+         |
+         +----> GPU1 Worker
+                 |
+                 v
+             Reorder
+                 |
+                 v
+              Display
+
+第一版允许：
+
+seq % 2
+
+即：
+
+0 -> GPU0
+1 -> GPU1
+2 -> GPU0
+3 -> GPU1
+
+但最终实现优先升级成：
+
+Earliest Available GPU Scheduling
+
+即根据：
+
+- worker 是否 idle
+- 当前 running frame age
+- 最近 inference latency
+- pending 状态
+
+选择预计最早完成的 GPU。
+
+不要简单地长期固定奇偶分配导致某张卡偶发 stall 时拖慢对应帧。
+
+==================================================
+6. 每 GPU 独立 latest-only worker
+==================================================
+
+沿用当前项目已经验证过的低延迟原则。
+
+每个 GPU worker：
+
+1 running
++
+最多 1 replaceable pending
++
+最多 1 completed output
+
+禁止建立长 FIFO：
+
+GPU0:
+frame 1
+frame 3
+frame 5
+frame 7
+...
+
+这种设计不可接受。
+
+如果新的 frame 到达，而 pending 尚未执行：
+
+用最新 frame 替换旧 pending frame。
+
+记录：
+
+REPLACED_PENDING=true
+
+目的：
+
+优先实时性，而不是保证每帧最终一定 GAN 完成。
+
+==================================================
+7. 双卡重排序
+==================================================
+
+因为：
+
+frame N+1
+
+可能比：
+
+frame N
+
+先完成，所以必须增加轻量 Reorder Buffer。
+
+按：
+
+sequence / PTS
+
+恢复正确显示顺序。
+
+但不能为了等待慢帧无限阻塞。
+
+设置明确的 reorder latency budget。
+
+如果缺失的前序帧已经超过允许等待时间：
+
+不要让整个播放链路停住。
+
+按照现有项目的实时策略处理：
+- 跳过已经无意义的迟到 GAN output
+- 或使用该帧现有实时 fallback
+- 继续显示较新的可用帧
+
+严禁：
+
+一个 GPU stall
+->
+整个视频冻结几秒。
+
+==================================================
+8. stale / late frame 判定
+==================================================
+
+保留现有 GAN 模式中已经形成的：
+
+- source age
+- queue wait
+- inference time
+- total age
+- stale-before
+- stale-after
+- fallback
+
+语义。
+
+gan-duo 必须分别记录：
+
+GPU_ID
+QUEUE_WAIT_MS
+INFER_MS
+TOTAL_MS
+OUTPUT_AGE_MS
+
+并保留预测式 stale-before：
+
+queue_wait
++
+recent inference p95
+>
+当前 frame latency budget
+
+则不要浪费 GPU 去执行一个已经注定来不及显示的帧。
+
+==================================================
+9. GPU 调度状态
+==================================================
+
+每个 GPU 独立维护：
+
+GPU0:
+- running_sequence
+- pending_sequence
+- last_infer_ms
+- infer_p50
+- infer_p95
+- infer_p99
+- completed_count
+- stale_count
+- replaced_count
+
+GPU1:
+同样字段。
+
+调度器需要知道两个 worker 的实时状态。
+
+不得通过两个线程共享同一个非线程安全 TensorRT context。
+
+每 GPU 建立自己的：
+- session / engine
+- execution context
+- CUDA context/stream（如果后端要求）
+
+==================================================
+10. FP16
+==================================================
+
+gan-duo 的默认精度：
+
+FP16
+
+启动日志必须显示：
+
+PRECISION=FP16
+
+若 TensorRT 实际没有启用 FP16：
+
+不得 HUD 仍显示 TensorRT FP16。
+
+应根据真实 backend 状态输出。
+
+如果某些 layer 必须 fallback 到 CUDA：
+允许。
+
+但是必须统计：
+
+TRT_NODE_COUNT / CUDA_FALLBACK_NODE_COUNT
+或使用当前 ORT 能获得的等价诊断信息。
+
+至少日志应能判断 TensorRT EP 是否真正生效，
+避免：
+
+配置了 TensorRT EP
+但实际上全部跑 CUDA EP
+
+这种假成功。
+
+==================================================
+11. 原 gan 模式保持 CUDA
+==================================================
+
+不要将原来的：
+
+--mode=gan
+
+偷偷改成 TensorRT。
+
+保持它作为 A/B baseline。
+
+定义语义：
+
+gan:
+ONNX Runtime
++
+CUDAExecutionProvider
++
+现有 precision/model 行为
+
+gan-duo:
+2 GPU
++
+TensorRT
++
+FP16
+
+这样后续可以直接比较：
+
+GAN CUDA
+vs
+GAN-DUO TensorRT FP16
+
+==================================================
+12. HUD 修改
+==================================================
+
+HUD 必须让用户一眼看出增强后端。
+
+原 gan 模式建议显示：
+
+MODE       GAN
+ENHANCER   Real-ESRGAN x2
+BACKEND    CUDA
+GPU        RTX xxxx
+PRECISION  FP32（只有确认实际为 FP32 时才显示）
+
+新 gan-duo 显示：
+
+MODE       GAN-DUO
+ENHANCER   Real-ESRGAN x2
+BACKEND    TensorRT
+PRECISION  FP16
+GPU        2x RTX 5060 Ti
+GPU LOAD   G0 / G1
+AI NATIVE  1280x720
+DISPLAY    1280x720
+
+或者压缩成：
+
+GAN-DUO | TensorRT FP16 | GPU 0+1
+
+要求 HUD 中必须出现明确的：
+
+TensorRT
+
+不能仅显示：
+
+GAN
+
+因为必须与 CUDA 增强模式明确区分。
+
+==================================================
+13. HUD fallback 状态
+==================================================
+
+如果 TensorRT 某次初始化失败并回退 CUDA：
+
+HUD 必须真实变成：
+
+BACKEND CUDA-FALLBACK
+
+不能继续显示：
+
+TensorRT
+
+如果只是部分 unsupported nodes 交给 CUDA EP，但主体仍运行 TensorRT，可显示：
+
+BACKEND TensorRT FP16
+FALLBACK CUDA
+
+如果整个 TensorRT session 未生效：
+
+BACKEND CUDA
+
+==================================================
+14. 双 GPU HUD 指标
+==================================================
+
+gan-duo HUD 增加精简实时指标：
+
+GPU0  xx.x ms
+GPU1  xx.x ms
+
+推荐显示 rolling p95，而不是只显示最后一帧。
+
+例如：
+
+TRT G0 68ms | G1 71ms
+P95    82ms | 84ms
+
+同时显示：
+
+AI FPS
+DISPLAY FPS
+SOURCE AGE
+FALLBACK
+DROPPED
+
+不要让 HUD 过度拥挤；
+详细 p50/p95/p99 放日志/诊断页也可以。
+
+==================================================
+15. 输出规格语义
+==================================================
+
+重点目标：
+
+SOURCE:
+640x360 @ 15fps
+
+GAN:
+Real-ESRGAN x2
+
+AI NATIVE:
+1280x720 @ 15fps
+
+第一阶段正式目标：
+
+720p15
+
+性能足够后挑战：
+
+720p20
+
+不要第一版直接以 1080p native GAN 作为验收目标。
+
+如果未来增加：
+
+1280x720
+   ->
+Lanczos
+   ->
+1920x1080
+
+HUD 要明确：
+
+AI NATIVE  1280x720
+DISPLAY    1920x1080
+
+不能把 Lanczos presentation resolution 写成 GAN native resolution。
+
+==================================================
+16. 不绑定发送端码率
+==================================================
+
+gan-duo 本次只修改接收端增强架构。
+
+不要因为新增 gan-duo 自动修改：
+
+- H265 bitrate
+- physical CAP
+- GOP
+- ROI
+- audio reservation
+- sender fps
+
+发送端仍由当前配置决定。
+
+如果收到 256x144，则 x2 native 为 512x288；
+如果收到 320x180，则 x2 native 为 640x360；
+如果收到 640x360，则 x2 native 为 1280x720。
+
+不要伪造输出信息量。
+
+==================================================
+17. CLI 参数
+==================================================
+
+新增或等价支持：
+
+--mode=gan-duo
+
+--gan-duo-gpus=0,1
+
+--gan-duo-backend=tensorrt
+
+--gan-duo-precision=fp16
+
+--gan-duo-scheduler=adaptive
+可选：
+adaptive
+round-robin
+
+--gan-duo-engine-cache=PATH
+
+--gan-duo-reorder-budget-ms=N
+
+--gan-duo-profile=auto
+或指定：
+256x144
+320x180
+640x360
+
+如果项目已有统一参数体系，应按现有风格整合，
+不要重复创建冲突参数。
+
+==================================================
+18. 自动 GPU 检查
+==================================================
+
+gan-duo 启动时：
+
+检查可见 CUDA GPU 数量 >= 2。
+
+输出：
+
+GPU0:
+name
+VRAM
+CUDA device id
+
+GPU1:
+name
+VRAM
+CUDA device id
+
+目标环境应该能看到：
+
+RTX 5060 Ti 16GB
+RTX 5060 Ti 16GB
+
+如果只有一张 GPU：
+
+gan-duo 启动失败或明确提示：
+
+GAN-DUO requires at least 2 CUDA GPUs.
+
+不要静默退化成单卡然后仍称 GAN-DUO。
+
+==================================================
+19. Benchmark 模式
+==================================================
+
+增加接收端 benchmark 输出，使以下三种方案可以公平 A/B：
+
+A:
+GAN / CUDA / 当前 FP32 ONNX
+
+B:
+单 GPU TensorRT FP16
+（如果方便，可以内部测试，不一定增加正式模式）
+
+C:
+GAN-DUO / 2 GPU / TensorRT FP16
+
+测试同一模型、同一输入视频、同一输入分辨率。
+
+至少输出：
+
+frames
+wall_time
+AI FPS
+
+per GPU:
+infer mean
+p50
+p95
+p99
+max
+
+queue wait:
+mean
+p95
+max
+
+end-to-end:
+p50
+p95
+p99
+
+VRAM GPU0
+VRAM GPU1
+
+stale count
+dropped count
+replaced pending count
+fallback count
+
+==================================================
+20. 性能验收
+==================================================
+
+正式第一目标：
+
+640x360
+->
+Real-ESRGAN x2
+->
+1280x720
+
+SOURCE FPS = 15
+
+要求：
+
+DISPLAY FPS >= 14.5
+AI effective FPS >= 14.5
+
+单 GPU worker 平均负载约：
+7.5 fps/GPU
+
+单 GPU 理论 frame budget：
+约 133 ms
+
+验收希望：
+
+GPU0 p95 < 120 ms
+GPU1 p95 < 120 ms
+
+更理想：
+
+p95 < 100 ms
+
+并满足：
+
+- 无持续 queue buildup
+- 无几秒级 source age
+- 无长时间 fallback
+- 不因 GPU0/GPU1 完成顺序不同造成画面倒序
+- 无 sequence regression
+- 无卡死
+
+==================================================
+21. 720p20 挑战测试
+==================================================
+
+在 720p15 完全稳定后测试：
+
+640x360
+->
+1280x720
+@20fps
+
+双卡平均：
+
+10 fps/GPU
+
+理论预算：
+
+100 ms/frame/GPU
+
+建议要求：
+
+p95 <= 90~95 ms
+
+若无法达到：
+
+保留 720p15 为正式稳定规格，
+不要通过大量排队伪造 20fps。
+
+==================================================
+22. 质量验收
+==================================================
+
+TensorRT FP16 必须与当前 CUDA FP32 做质量 A/B。
+
+同一组 decoded frames 分别：
+
+CUDA FP32
+TensorRT FP16
+
+输出：
+
+PSNR
+SSIM
+LPIPS（如果项目已有环境方便支持）
+
+并保存若干 A/B frame：
+
+- 人脸
+- 头发
+- 细纹理
+- 文字
+- 高对比边缘
+- H265 强压缩区域
+
+要求：
+
+不得出现明显 FP16 artifact、色偏、NaN、黑帧、花屏。
+
+视觉差异很小时优先 TensorRT FP16。
+
+==================================================
+23. 稳定性验收
+==================================================
+
+连续运行至少：
+
+30 分钟
+
+推荐：
+
+1 小时
+
+记录：
+
+- TensorRT crash
+- CUDA error
+- GPU OOM
+- engine rebuild
+- source age
+- stale frames
+- fallback
+- per-GPU inference p95/p99
+- display FPS
+- reorder drops
+
+不能只跑几十秒证明成功。
+
+==================================================
+24. 日志示例
+==================================================
+
+启动：
+
+[GAN-DUO]
+Backend: TensorRT
+Precision: FP16
+GPUs: 0,1
+GPU0: NVIDIA GeForce RTX 5060 Ti, 16GB
+GPU1: NVIDIA GeForce RTX 5060 Ti, 16GB
+Model: RealESRGAN_x2_dynamic.onnx
+Input: 640x360
+Output: 1280x720
+TensorRT Cache: HIT
+
+逐帧诊断示例：
+
+SEQ=1024
+GPU=0
+BACKEND=TRT
+QUEUE_WAIT_MS=1.8
+INFER_MS=72.4
+TOTAL_MS=75.1
+STALE=false
+
+SEQ=1025
+GPU=1
+BACKEND=TRT
+QUEUE_WAIT_MS=0.9
+INFER_MS=69.8
+TOTAL_MS=72.0
+STALE=false
+
+==================================================
+25. HUD 示例
+==================================================
+
+GAN-DUO
+TensorRT FP16
+2x RTX 5060 Ti
+
+SRC     640x360 @15
+AI      1280x720 @15
+DISPLAY 1280x720 @15
+
+TRT G0  72ms
+TRT G1  70ms
+AI FPS  15.0
+AGE     83ms
+FALLBACK OFF
+
+原 gan 则：
+
+GAN
+CUDA
+Real-ESRGAN x2
+
+不要显示 TensorRT。
+
+==================================================
+26. 兼容性
+==================================================
+
+保证：
+
+--mode=gan
+
+行为与修改前一致。
+
+没有 TensorRT 的旧机器仍能继续使用 CUDA GAN。
+
+gan-duo 是新增能力，不得成为整个接收端的强制依赖。
+
+TensorRT 相关 Python/C++ 库不能导致未启用 gan-duo 时普通模式启动失败。
+
+依赖加载应尽可能 lazy。
+
+==================================================
+27. 文档
+==================================================
+
+README 增加：
+
+GAN-DUO
+
+说明：
+
+- 需要 >=2 NVIDIA CUDA GPU
+- 推荐 RTX 5060 Ti 16GB x2
+- TensorRT FP16
+- 两卡分别运行独立 inference context
+- frame-level parallelism
+- output reorder
+- 不是显存合并
+- TensorRT 仍基于 CUDA
+- 原 GAN 模式仍为 CUDA baseline
+
+给出启动例子。
+
+==================================================
+28. 最终交付
+==================================================
+
+完成后给出：
+
+1. 修改文件列表
+2. 关键架构说明
+3. gan / gan-duo 的区别
+4. TensorRT 是否真正生效的验证方式
+5. 双 GPU 是否都工作的验证方式
+6. 实际 HUD 截图/日志对应字段
+7. 640x360 -> 720p15 benchmark
+8. CUDA FP32 vs TensorRT FP16 质量/性能 A/B
+9. 已知限制
+10. 720p20 是否达到稳定验收标准
+
+禁止仅完成参数和 HUD 字符串而没有真正实现：
+- 双 GPU inference
+- TensorRT FP16
+- reorder
+- latest-only
+- per-GPU telemetry
+
+只有当实际运行确认：
+GPU0 和 GPU1 都在执行 TensorRT inference，
+HUD 显示 TensorRT FP16，
+720p15 长时间稳定，
+才能标记 gan-duo 完成。
