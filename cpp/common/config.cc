@@ -1,5 +1,6 @@
 #include "common/config.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <sstream>
@@ -15,13 +16,16 @@ RoiConfig::RoiConfig()
 EncoderConfig::EncoderConfig()
     : width(320), height(180), fps(10), target_bitrate_bps(42000),
       gop(50), qp_min(10), qp_max(51), qp_init(38), qp_min_i(36), qp_max_i(48),
-      qp_ip(-1), debreath(false), debreath_strength(16), intra_refresh(true),
+      qp_ip(-1), max_i_prop(30), min_i_prop(10), init_ip_ratio(160),
+      fqp_min_p(-1), fqp_max_p(-1), debreath(false), debreath_strength(16), intra_refresh(true),
       intra_refresh_mode(0), intra_refresh_num(1), super_frame_mode(2), max_reencode_times(3),
+      super_priority(0),
       super_i_frame_bits(12000), super_p_frame_bits(5500), grayscale_encode(true) {}
 
 GanConfig::GanConfig()
     : fps(10), inference_fps(0), link_cap_kbps(100), video_bitrate_kbps(75),
-      max_inference_latency_ms(100), gop_seconds(2), super_frame_policy("current") {}
+      max_inference_latency_ms(100), gop_seconds(2), super_frame_policy("current"),
+      idr_roi_scale_percent(100) {}
 
 SnapshotConfig::SnapshotConfig()
     // Balanced 60 kbps evidence defaults: cap payload bytes before they enter
@@ -470,6 +474,31 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         }
         else if (key == "gan-refresh-num" && parseInt(value, &integer)) config->encoder.intra_refresh_num = integer;
         else if (key == "gan-qp-ip" && parseInt(value, &integer)) config->encoder.qp_ip = integer;
+        else if (key == "gan-max-i-prop" && parseInt(value, &integer)) config->encoder.max_i_prop = integer;
+        else if (key == "gan-min-i-prop" && parseInt(value, &integer)) config->encoder.min_i_prop = integer;
+        else if (key == "gan-init-ip-ratio" && parseInt(value, &integer)) config->encoder.init_ip_ratio = integer;
+        else if (key == "gan-qp-min-i" && parseInt(value, &integer)) config->encoder.qp_min_i = integer;
+        else if (key == "gan-fqp-min-p" && parseInt(value, &integer)) config->encoder.fqp_min_p = integer;
+        else if (key == "gan-fqp-max-p" && parseInt(value, &integer)) config->encoder.fqp_max_p = integer;
+        else if (key == "gan-qp-min-p" && parseInt(value, &integer)) {
+            config->encoder.qp_min = integer;
+            config->encoder.qp_init = std::max(config->encoder.qp_init, integer);
+            config->encoder.qp_min_i = std::max(config->encoder.qp_min_i, integer);
+            config->encoder.qp_max_i = std::max(config->encoder.qp_max_i, integer);
+        }
+        else if (key == "gan-qp-max-p" && parseInt(value, &integer)) {
+            config->encoder.qp_max = integer;
+            config->encoder.qp_init = std::min(config->encoder.qp_init, integer);
+            config->encoder.qp_min_i = std::min(config->encoder.qp_min_i, integer);
+            config->encoder.qp_max_i = std::min(config->encoder.qp_max_i, integer);
+        }
+        else if (key == "gan-idr-roi-scale-percent" && parseInt(value, &integer)) config->gan.idr_roi_scale_percent = integer;
+        else if (key == "gan-max-reencode-times" && parseInt(value, &integer)) config->encoder.max_reencode_times = integer;
+        else if (key == "gan-super-priority") {
+            if (value == "frame-size-first") config->encoder.super_priority = 0;
+            else if (value == "bitrate-first") config->encoder.super_priority = 1;
+            else { if (error) *error = "gan super priority must be frame-size-first or bitrate-first"; return false; }
+        }
         else if (key == "gan-super-frame") {
             if (value != "current" && value != "off" && value != "relaxed") {
                 if (error) *error = "gan super-frame must be current, off, or relaxed";
@@ -744,6 +773,14 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->encoder.qp_min_i < config->encoder.qp_min || config->encoder.qp_max_i > config->encoder.qp_max ||
         config->encoder.qp_min_i > config->encoder.qp_max_i || config->encoder.qp_ip < -1 ||
         config->encoder.qp_ip > 8 || config->encoder.debreath_strength < 0 ||
+        config->encoder.max_i_prop <= 0 || config->encoder.min_i_prop <= 0 ||
+        config->encoder.max_i_prop < config->encoder.min_i_prop ||
+        config->encoder.init_ip_ratio < 160 || config->encoder.init_ip_ratio > 640 ||
+        ((config->encoder.fqp_min_p < 0) != (config->encoder.fqp_max_p < 0)) ||
+        (config->encoder.fqp_min_p >= 0 && (config->encoder.fqp_min_p > config->encoder.fqp_max_p ||
+         config->encoder.fqp_max_p > 51)) || config->gan.idr_roi_scale_percent < 0 ||
+        config->gan.idr_roi_scale_percent > 100 || config->encoder.super_priority < 0 ||
+        config->encoder.super_priority > 1 ||
         config->encoder.debreath_strength > 35 || config->encoder.intra_refresh_mode < 0 ||
         config->encoder.intra_refresh_mode > 1 || config->encoder.intra_refresh_num <= 0 ||
         (config->encoder.super_frame_mode != 0 && config->encoder.super_frame_mode != 2) ||

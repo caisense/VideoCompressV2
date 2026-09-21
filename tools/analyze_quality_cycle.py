@@ -57,11 +57,21 @@ def fmt(value: float | None, digits: int = 2) -> str:
     return "UNKNOWN" if value is None else f"{value:.{digits}f}"
 
 
+def slope(points: list[tuple[float, float]]) -> float | None:
+    if len(points) < 2:
+        return None
+    mx = statistics.fmean(x for x, _ in points)
+    my = statistics.fmean(y for _, y in points)
+    denominator = sum((x - mx) ** 2 for x, _ in points)
+    return sum((x - mx) * (y - my) for x, y in points) / denominator if denominator else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("encoder", type=Path)
     parser.add_argument("gan", type=Path)
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--plot", type=Path, default=None)
     args = parser.parse_args()
 
     enc = list(records(args.encoder, "ENC_FRAME"))
@@ -122,6 +132,38 @@ def main() -> int:
         "encoded_bits_vs_decoded_sharpness": corr(merged, "ENCODED_BITS", "DEC_SHARP"),
         "roi_area_vs_decoded_sharpness": corr(merged, "ROI_AREA_RATIO", "DEC_SHARP"),
     }
+    decoded_phase = [(float(entry["position"]), entry["decoded_sharpness"])
+                     for entry in phase_output if entry["decoded_sharpness"] is not None]
+    qp_phase = [(float(entry["position"]), entry["avg_qp"])
+                for entry in phase_output if entry["avg_qp"] is not None and entry["position"] > 0]
+    decoded_values = [value for _, value in decoded_phase]
+    early_values = [entry["decoded_sharpness"] for entry in phase_output
+                    if 1 <= entry["position"] <= 3 and entry["decoded_sharpness"] is not None]
+    late_values = [entry["decoded_sharpness"] for entry in phase_output
+                   if 12 <= entry["position"] <= 15 and entry["decoded_sharpness"] is not None]
+    pos0 = next((entry["decoded_sharpness"] for entry in phase_output
+                 if entry["position"] == 0), None)
+    i_bits = [number(row.get("ENCODED_BITS")) for row in merged if row.get("FRAME_TYPE") in ("IDR", "I")]
+    p_bits = [number(row.get("ENCODED_BITS")) for row in merged if row.get("FRAME_TYPE") == "P"]
+    i_bits = [value for value in i_bits if value is not None]
+    p_bits = [value for value in p_bits if value is not None]
+    p_mean = mean(p_bits)
+    summary = {
+        "BREATH_AMPLITUDE": max(decoded_values) - min(decoded_values) if decoded_values else None,
+        "BREATH_STD": statistics.pstdev(decoded_values) if len(decoded_values) > 1 else None,
+        "EARLY_P_TROUGH": min(early_values) if early_values else None,
+        "POS0_SHARPNESS": pos0,
+        "POS1_3_AVG": mean(early_values),
+        "POS12_15_AVG": mean(late_values),
+        "QP_PHASE_STD": statistics.pstdev([value for _, value in qp_phase]) if len(qp_phase) > 1 else None,
+        "QP_PHASE_SLOPE": slope(qp_phase),
+        "IDR_AVG_BITS": mean(i_bits),
+        "P_AVG_BITS": p_mean,
+        "IDR_P_BIT_RATIO": (mean(i_bits) / p_mean) if i_bits and p_mean else None,
+    }
+    print("\nBREATH_METRICS")
+    for key, value in summary.items():
+        print(f"{key}={fmt(value, 4)}")
     print("\nCORRELATIONS")
     for key, value in correlations.items():
         print(f"{key}={fmt(value, 4)}")
@@ -130,8 +172,45 @@ def main() -> int:
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps({"phase": phase_output, "correlations": correlations,
+                                         "summary": summary,
                                          "sender_frames": len(enc), "gan_frames": len(gan)},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.plot:
+        positions = [entry["position"] for entry in phase_output]
+        series = [
+            ("Decoded sharpness", [entry["decoded_sharpness"] for entry in phase_output], "#1f77b4"),
+            ("Average QP", [entry["avg_qp"] for entry in phase_output], "#ff7f0e"),
+            ("Encoded bits", [entry["avg_bits"] for entry in phase_output], "#2ca02c"),
+        ]
+        width, height, left, plot_width, panel_height = 900, 840, 100, 750, 210
+        svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+               '<rect width="100%" height="100%" fill="white"/>',
+               f'<text x="450" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">{args.encoder.stem}</text>']
+        for panel, (label, values, color) in enumerate(series):
+            top = 55 + panel * 260
+            valid = [float(value) for value in values if value is not None]
+            low, high = min(valid), max(valid)
+            if high == low:
+                high = low + 1.0
+            points = []
+            for position, value in zip(positions, values):
+                if value is None:
+                    continue
+                x = left + plot_width * position / max(1, max(positions))
+                y = top + panel_height - panel_height * (float(value) - low) / (high - low)
+                points.append(f"{x:.1f},{y:.1f}")
+            svg += [
+                f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + panel_height}" stroke="#444"/>',
+                f'<line x1="{left}" y1="{top + panel_height}" x2="{left + plot_width}" y2="{top + panel_height}" stroke="#444"/>',
+                f'<polyline fill="none" stroke="{color}" stroke-width="3" points="{" ".join(points)}"/>',
+                f'<text x="15" y="{top + panel_height / 2:.1f}" font-family="sans-serif" font-size="14">{label}</text>',
+                f'<text x="{left - 8}" y="{top + 5}" text-anchor="end" font-family="sans-serif" font-size="12">{high:.1f}</text>',
+                f'<text x="{left - 8}" y="{top + panel_height}" text-anchor="end" font-family="sans-serif" font-size="12">{low:.1f}</text>',
+            ]
+        svg.append(f'<text x="450" y="825" text-anchor="middle" font-family="sans-serif" font-size="14">GOP position 0..{max(positions)}</text>')
+        svg.append('</svg>')
+        args.plot.parent.mkdir(parents=True, exist_ok=True)
+        args.plot.write_text("\n".join(svg), encoding="utf-8")
     return 0
 
 

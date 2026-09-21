@@ -464,6 +464,27 @@ void testCommandLineConfig() {
     CHECK(gan_experiment.encoder.super_i_frame_bits == 33750);
     CHECK(gan_experiment.encoder.debug_log_path == "/tmp/encoder.jsonl");
 
+    char gan_max_i_prop[] = "--gan-max-i-prop=24";
+    char gan_min_i_prop[] = "--gan-min-i-prop=10";
+    char gan_init_ip_ratio[] = "--gan-init-ip-ratio=160";
+    char gan_qp_min_i[] = "--gan-qp-min-i=40";
+    char gan_fqp_min_p[] = "--gan-fqp-min-p=20";
+    char gan_fqp_max_p[] = "--gan-fqp-max-p=28";
+    char gan_idr_roi_scale[] = "--gan-idr-roi-scale-percent=50";
+    char gan_max_reenc[] = "--gan-max-reencode-times=1";
+    char gan_priority[] = "--gan-super-priority=bitrate-first";
+    char *gan_allocation_argv[] = {profile_app, gan_mode, gan_cap_60, gan_max_i_prop,
+        gan_min_i_prop, gan_init_ip_ratio, gan_qp_min_i, gan_fqp_min_p,
+        gan_fqp_max_p, gan_idr_roi_scale, gan_max_reenc, gan_priority};
+    AppConfig gan_allocation;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(12, gan_allocation_argv, &gan_allocation, &error));
+    CHECK(gan_allocation.encoder.max_i_prop == 24 && gan_allocation.encoder.min_i_prop == 10);
+    CHECK(gan_allocation.encoder.init_ip_ratio == 160 && gan_allocation.encoder.qp_min_i == 40);
+    CHECK(gan_allocation.encoder.fqp_min_p == 20 && gan_allocation.encoder.fqp_max_p == 28);
+    CHECK(gan_allocation.gan.idr_roi_scale_percent == 50);
+    CHECK(gan_allocation.encoder.max_reencode_times == 1 && gan_allocation.encoder.super_priority == 1);
+
     char gan_cap_150[] = "--gan-link-cap-kbps=150";
     char *gan_150_argv[] = {profile_app, gan_mode, gan_cap_150};
     AppConfig gan_150;

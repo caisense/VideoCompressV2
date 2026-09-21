@@ -94,7 +94,8 @@ public:
 
     void write(const FramePacket &frame, const RoiMap &map, const EncodedAccessUnit &unit,
                const EncoderConfig &encoder, const GanConfig &gan, unsigned int generation,
-               uint64_t gop_position, int roi_regions) {
+               uint64_t gop_position, int roi_regions, bool expected_key_frame,
+               bool ip_allocation_supported, bool fqp_supported) {
         if (!handle_) return;
         int background = 0, halo = 0, core = 0, edge = 0;
         for (size_t i = 0; i < map.cells.size(); ++i) {
@@ -115,28 +116,41 @@ public:
         const std::string frame_qp = unit.frame_qp < 0 ? "null" : std::to_string(unit.frame_qp);
         std::fprintf(handle_,
             "{\"TYPE\":\"ENC_FRAME\",\"SEQ\":%llu,\"PTS\":%llu,\"GENERATION\":%u,"
-            "\"FRAME_TYPE\":\"%s\",\"GOP_POSITION\":%llu,\"GOP_SIZE\":%d,"
+            "\"FRAME_TYPE\":\"%s\",\"EXPECTED_KEY_FRAME\":%s,\"ACTUAL_KEY_FRAME\":%s,"
+            "\"GOP_POSITION\":%llu,\"GOP_SIZE\":%d,"
             "\"ENCODED_BYTES\":%zu,\"ENCODED_BITS\":%zu,\"RC_MODE\":\"CBR\","
             "\"TARGET_BITRATE_BPS\":%d,\"QP_INIT\":%d,\"QP_MIN\":%d,\"QP_MAX\":%d,"
             "\"QP_MIN_I\":%d,\"QP_MAX_I\":%d,\"QP_IP\":%d,\"AVG_QP\":%s,"
+            "\"MAX_I_PROP\":%d,\"MIN_I_PROP\":%d,\"INIT_IP_RATIO\":%d,"
+            "\"IP_ALLOCATION_SUPPORTED\":%s,\"FQP_MIN_P\":%d,\"FQP_MAX_P\":%d,"
+            "\"FQP_SUPPORTED\":%s,"
             "\"START_QP\":%s,\"FRAME_QP\":%s,"
-            "\"SUPER_FRAME_POLICY\":\"%s\",\"SUPER_FRAME_TRIGGERED\":%s,"
+            "\"SUPER_FRAME_POLICY\":\"%s\",\"SUPER_PRIORITY\":\"%s\","
+            "\"SUPER_P_THRESHOLD\":%d,\"MAX_REENC_TIMES\":%d,\"SUPER_FRAME_TRIGGERED\":%s,"
             "\"REENCODE_COUNT\":\"UNKNOWN\",\"ROI_BLOCKS\":%d,\"ROI_REGIONS\":%d,"
             "\"CORE_BLOCKS\":%d,\"EDGE_BLOCKS\":%d,\"BACKGROUND_BLOCKS\":%d,"
             "\"ROI_AREA_RATIO\":%.8f,\"YOLO_UPDATED\":%s,\"DEBREATH_ENABLED\":%s,"
             "\"DEBREATH_STRENGTH\":%d,\"GDR_ENABLED\":%s,\"GDR_MODE\":\"%s\","
-            "\"GDR_REFRESH_NUM\":%d}\n",
+            "\"GDR_REFRESH_NUM\":%d,\"IDR_ROI_SCALE_PERCENT\":%d}\n",
             static_cast<unsigned long long>(frame.meta.frame_id),
             static_cast<unsigned long long>(frame.meta.pts_us), generation,
-            unit.frame_type.c_str(), static_cast<unsigned long long>(gop_position), encoder.gop,
+            unit.frame_type.c_str(), expected_key_frame ? "true" : "false",
+            unit.key_frame ? "true" : "false",
+            static_cast<unsigned long long>(gop_position), encoder.gop,
             unit.bytes.size(), unit.bytes.size() * 8U, encoder.target_bitrate_bps,
             encoder.qp_init, encoder.qp_min, encoder.qp_max, encoder.qp_min_i, encoder.qp_max_i,
-            encoder.qp_ip, average_qp.c_str(), start_qp.c_str(), frame_qp.c_str(),
-            gan.super_frame_policy.c_str(), super_triggered, roi_blocks, roi_regions,
+            encoder.qp_ip, average_qp.c_str(), encoder.max_i_prop, encoder.min_i_prop,
+            encoder.init_ip_ratio, ip_allocation_supported ? "\"SUPPORTED\"" : "\"UNSUPPORTED\"",
+            encoder.fqp_min_p, encoder.fqp_max_p,
+            fqp_supported ? "\"SUPPORTED\"" : (encoder.fqp_min_p < 0 ? "\"DISABLED\"" : "\"UNSUPPORTED\""),
+            start_qp.c_str(), frame_qp.c_str(), gan.super_frame_policy.c_str(),
+            encoder.super_priority == 0 ? "FRAME_SIZE_FIRST" : "BITRATE_FIRST",
+            encoder.super_p_frame_bits, encoder.max_reencode_times, super_triggered, roi_blocks, roi_regions,
             core, edge, background, roi_ratio, yolo_updated ? "true" : "false",
             encoder.debreath ? "true" : "false", encoder.debreath_strength,
             encoder.intra_refresh ? "true" : "false",
-            encoder.intra_refresh_mode == 0 ? "row" : "col", encoder.intra_refresh_num);
+            encoder.intra_refresh_mode == 0 ? "row" : "col", encoder.intra_refresh_num,
+            gan.idr_roi_scale_percent);
         std::fflush(handle_);
     }
 
@@ -632,6 +646,7 @@ int main(int argc, char **argv) {
         std::string encoder_error;
         std::shared_ptr<FramePacket> frame;
         uint64_t encoded_frame_count = 0;
+        uint64_t key_prediction_mismatches = 0;
         while (running.load() && encoder_queue.pop(&frame)) {
             const RateProfile desired = static_cast<RateProfile>(requested_profile.load());
             const TransportMode desired_transport = static_cast<TransportMode>(
@@ -780,7 +795,9 @@ int main(int argc, char **argv) {
             const bool gan_gdr = live.rate_profile == RATE_PROFILE_GAN && live.encoder.intra_refresh;
             const bool periodic_idr = !gan_gdr && encoded_frame_count > 0 &&
                 encoded_frame_count % static_cast<uint64_t>(live.encoder.gop) == 0;
-            if ((!encoder || ((sender.needsKeyFrame() || periodic_idr) &&
+            const bool recovery_idr = sender.needsKeyFrame();
+            const bool expected_key_frame = encoded_frame_count == 0 || recovery_idr || periodic_idr;
+            if ((!encoder || ((recovery_idr || periodic_idr) &&
                 !encoder->requestIdr(&encoder_error)))) {
                 if (encoder_error.empty()) encoder_error = "H.265 encoder is unavailable in video mode";
                 std::fprintf(stderr, "MPP recovery IDR request failed: %s\n", encoder_error.c_str());
@@ -793,6 +810,15 @@ int main(int argc, char **argv) {
             if (live.mode != PIPELINE_BASELINE) {
                 const RoiRegionMerger merger(live.roi);
                 regions = merger.merge(map);
+                if (live.rate_profile == RATE_PROFILE_GAN && expected_key_frame &&
+                    live.gan.idr_roi_scale_percent < 100) {
+                    for (size_t i = 0; i < regions.size(); ++i) {
+                        if (regions[i].delta_qp < 0) {
+                            regions[i].delta_qp = regions[i].delta_qp *
+                                live.gan.idr_roi_scale_percent / 100;
+                        }
+                    }
+                }
             }
             if (config.debug_roi && !writeRoiMapPgm(map,
                 debugPathForFrame(config.debug_roi_path, frame->meta.frame_id), &encoder_error)) {
@@ -804,10 +830,19 @@ int main(int argc, char **argv) {
                 running.store(false);
                 break;
             }
+            if (expected_key_frame != access_unit.key_frame) {
+                ++key_prediction_mismatches;
+                std::fprintf(stderr,
+                    "WARNING: IDR prediction mismatch seq=%llu expected=%d actual=%d total=%llu\n",
+                    static_cast<unsigned long long>(frame->meta.frame_id),
+                    expected_key_frame ? 1 : 0, access_unit.key_frame ? 1 : 0,
+                    static_cast<unsigned long long>(key_prediction_mismatches));
+            }
             encoder_debug.write(*frame, map, access_unit, live.encoder, live.gan,
                                 profile_generation.load(),
                                 encoded_frame_count % static_cast<uint64_t>(live.encoder.gop),
-                                static_cast<int>(regions.size()));
+                                static_cast<int>(regions.size()), expected_key_frame,
+                                encoder->ipAllocationSupported(), encoder->fqpSupported());
             ++encoded_frame_count;
             if (!rtp_sdp_written && access_unit.key_frame) {
                 if (writeH265RtpSdp(access_unit.bytes, live.transport.udp_port,

@@ -1,6 +1,7 @@
 #include "encoder/mpp_h265_encoder.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #ifdef HAVE_ROCKCHIP_MPP
@@ -49,10 +50,13 @@ struct MppEncoderState {
     int ver_stride;
     size_t frame_bytes;
     size_t packet_bytes;
+    bool ip_allocation_supported;
+    bool fqp_supported;
 
     MppEncoderState()
         : context(NULL), mpi(NULL), config(NULL), buffer_group(NULL), frame_buffer(NULL),
-          packet_buffer(NULL), hor_stride(0), ver_stride(0), frame_bytes(0), packet_bytes(0) {
+          packet_buffer(NULL), hor_stride(0), ver_stride(0), frame_bytes(0), packet_bytes(0),
+          ip_allocation_supported(false), fqp_supported(false) {
         std::memset(&roi_config, 0, sizeof(roi_config));
     }
 };
@@ -101,7 +105,7 @@ bool setEncoderConfig(MppEncoderState *state, const EncoderConfig &config, std::
         mpp_enc_cfg_set_s32(state->config, "rc:bps_max", max_bps),
         mpp_enc_cfg_set_s32(state->config, "rc:gop", config.gop),
         mpp_enc_cfg_set_s32(state->config, "rc:max_reenc_times", config.max_reencode_times),
-        mpp_enc_cfg_set_s32(state->config, "rc:priority", MPP_ENC_RC_BY_FRM_SIZE_FIRST),
+        mpp_enc_cfg_set_s32(state->config, "rc:priority", config.super_priority),
         mpp_enc_cfg_set_s32(state->config, "rc:super_mode", config.super_frame_mode),
         mpp_enc_cfg_set_s32(state->config, "rc:super_i_thd", config.super_i_frame_bits),
         mpp_enc_cfg_set_s32(state->config, "rc:super_p_thd", config.super_p_frame_bits),
@@ -132,6 +136,29 @@ bool setEncoderConfig(MppEncoderState *state, const EncoderConfig &config, std::
     if (config.qp_ip >= 0 &&
         !checkMpp(mpp_enc_cfg_set_s32(state->config, "rc:qp_ip", config.qp_ip),
                   "mpp_enc_cfg_set rc:qp_ip", error)) return false;
+    const MPP_RET max_i_ret = mpp_enc_cfg_set_s32(state->config, "rc:max_i_prop", config.max_i_prop);
+    const MPP_RET min_i_ret = mpp_enc_cfg_set_s32(state->config, "rc:min_i_prop", config.min_i_prop);
+    const MPP_RET init_ip_ret = mpp_enc_cfg_set_s32(state->config, "rc:init_ip_ratio", config.init_ip_ratio);
+    state->ip_allocation_supported = max_i_ret == MPP_OK && min_i_ret == MPP_OK && init_ip_ret == MPP_OK;
+    if (!state->ip_allocation_supported) {
+        std::fprintf(stderr, "WARNING: MPP I/P allocation keys UNSUPPORTED (max=%d min=%d init=%d); continuing with runtime defaults\n",
+                     max_i_ret, min_i_ret, init_ip_ret);
+    } else {
+        std::fprintf(stderr, "MPP I/P allocation keys SUPPORTED: max_i_prop=%d min_i_prop=%d init_ip_ratio=%d\n",
+                     config.max_i_prop, config.min_i_prop, config.init_ip_ratio);
+    }
+    if (config.fqp_min_p >= 0) {
+        const MPP_RET fqp_min_ret = mpp_enc_cfg_set_s32(state->config, "rc:fqp_min_p", config.fqp_min_p);
+        const MPP_RET fqp_max_ret = mpp_enc_cfg_set_s32(state->config, "rc:fqp_max_p", config.fqp_max_p);
+        state->fqp_supported = fqp_min_ret == MPP_OK && fqp_max_ret == MPP_OK;
+        if (!state->fqp_supported) {
+            std::fprintf(stderr, "WARNING: MPP P-frame FQP keys UNSUPPORTED (min=%d max=%d); continuing without corridor\n",
+                         fqp_min_ret, fqp_max_ret);
+        } else {
+            std::fprintf(stderr, "MPP P-frame FQP keys SUPPORTED: min=%d max=%d\n",
+                         config.fqp_min_p, config.fqp_max_p);
+        }
+    }
     if (!checkMpp(state->mpi->control(state->context, MPP_ENC_SET_CFG, state->config),
                   "MPP_ENC_SET_CFG", error)) return false;
     MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
@@ -150,6 +177,24 @@ MppH265Encoder::~MppH265Encoder() { shutdown(); }
 bool MppH265Encoder::available() const {
 #ifdef HAVE_ROCKCHIP_MPP
     return true;
+#else
+    return false;
+#endif
+}
+
+bool MppH265Encoder::ipAllocationSupported() const {
+#ifdef HAVE_ROCKCHIP_MPP
+    const MppEncoderState *state = static_cast<const MppEncoderState *>(state_);
+    return state && state->ip_allocation_supported;
+#else
+    return false;
+#endif
+}
+
+bool MppH265Encoder::fqpSupported() const {
+#ifdef HAVE_ROCKCHIP_MPP
+    const MppEncoderState *state = static_cast<const MppEncoderState *>(state_);
+    return state && state->fqp_supported;
 #else
     return false;
 #endif

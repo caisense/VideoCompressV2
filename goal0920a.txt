@@ -1,0 +1,815 @@
+/goal
+
+基于 VideoCompressV2 当前最新代码和实机测试结果，继续修复 CAP60 / 8fps GAN 模式下严重的 H.265 GOP 呼吸效应。
+
+========================
+一、已确认事实
+========================
+
+不要重新调查已经确认的问题：
+
+1. 周期性“清晰 -> 模糊 -> 逐渐清晰”主要来自发送端 H.265 GOP/RC/QP。
+2. baseline GOP16：
+   - GOP pos0 decoded sharpness ≈660
+   - pos2 ≈392
+   - pos15 ≈641
+3. QP 同一 GOP 内约从29逐渐降到18。
+4. GOP改成8/32后，画质周期同步变成约1秒/4秒。
+5. ROI波动不是主因。
+6. ESRGAN只是放大 decoded input 已存在的变化。
+7. debreath 在CAP60产生不可接受码率膨胀。
+8. GDR在CAP60产生超大帧并使接收端下降到约1~2fps。
+9. qp_ip=2没有显著改善GOP内sharpness曲线。
+10. super-frame relaxed目前尚未证明能够解决呼吸。
+
+因此本目标：
+
+- debreath保持关闭
+- GDR保持关闭
+- 不修改Real-ESRGAN
+- 不增加GAN时序滤波
+- 不通过缩短GOP掩盖问题
+- 重点解决“IDR码率过度集中 -> early-P RC debt -> QP高 -> 后续逐渐恢复”的问题
+
+========================
+二、首先增加 I/P bit allocation 控制
+========================
+
+当前 MPP 官方支持：
+
+rc:max_i_prop
+rc:min_i_prop
+rc:init_ip_ratio
+
+把它们加入 EncoderConfig，并允许 GAN 模式配置。
+
+新增参数：
+
+--gan-max-i-prop=N
+--gan-min-i-prop=N
+--gan-init-ip-ratio=N
+
+默认保持MPP默认行为：
+
+max_i_prop = 30
+min_i_prop = 10
+init_ip_ratio = 160
+
+校验：
+- max_i_prop > 0
+- min_i_prop > 0
+- max_i_prop >= min_i_prop
+- init_ip_ratio ∈ [160,640]
+
+在 mpp_h265_encoder.cc 中实际设置：
+
+rc:max_i_prop
+rc:min_i_prop
+rc:init_ip_ratio
+
+如果当前板端MPP版本不支持某key：
+- 输出明确 warning
+- 日志记录 UNSUPPORTED
+- 不静默假装生效
+
+不要因为实验key不支持导致整个程序崩溃。
+
+========================
+三、max_i_prop 作为第一优先实验
+========================
+
+官方MPP语义：
+
+减小 max_i_prop
+→ 限制I帧相对P帧的bit占比
+→ I帧适当变差
+→ 给P帧释放更多bits
+
+这与本项目问题完全对应。
+
+保持：
+
+min_i_prop = 10
+init_ip_ratio = 160
+qp_ip = 当前baseline值
+debreath = off
+GDR = off
+
+分别测试：
+
+max_i_prop = 30   # baseline
+max_i_prop = 24
+max_i_prop = 20
+max_i_prop = 16
+
+如果16仍稳定，可以追加12，但不能直接作为默认。
+
+核心目标：
+
+不是提高平均峰值清晰度，
+
+而是把：
+
+pos0 = 很清晰
+pos1~3 = 突然很糊
+pos15 = 又很清晰
+
+变成：
+
+整个GOP质量较均匀。
+
+允许pos0清晰度适度下降，
+前提是early-P明显改善。
+
+========================
+四、不要提高 min_i_prop
+========================
+
+当前阶段固定：
+
+min_i_prop = 10
+
+不要测试更大的min_i_prop作为优化方向。
+
+MPP官方语义是：
+
+min_i_prop增大
+→ I帧更清晰
+→ P帧更模糊
+
+这与当前目标相反。
+
+init_ip_ratio暂时固定160。
+
+160已经是官方允许范围下限，
+第一轮不要通过提高它改变系统。
+
+========================
+五、第二阶段：限制 I 帧过度优待
+========================
+
+在选出较优 max_i_prop 后，
+测试 I frame QP floor。
+
+支持GAN专用override：
+
+--gan-qp-min-i=N
+
+不要依赖通用profile override破坏GAN atomic profile。
+
+测试：
+
+qp_min_i = 当前baseline
+qp_min_i = 38
+qp_min_i = 40
+
+必要时再试42。
+
+目标：
+
+降低IDR峰值质量/峰值bits，
+把bit预算留给IDR之后的P帧。
+
+注意：
+
+不能只根据I帧QP判断是否成功。
+
+必须观察：
+
+IDR bits
+early-P QP
+early-P sharpness
+整个GOP phase std
+
+========================
+六、增加 IDR ROI interaction 实验
+========================
+
+当前ROI为 relative QP。
+
+GAN典型ROI delta：
+
+background = +14
+core       = -7
+edge       = -11
+
+因此IDR上的core/edge可能被过度保护，
+使IDR产生额外bit消耗。
+
+新增实验参数：
+
+--gan-idr-roi-scale-percent=N
+
+默认：
+
+100
+
+含义：
+
+100：
+保持当前行为
+
+50：
+只在“确定将编码成IDR”的帧上，
+将负ROI delta缩小50%
+
+例如：
+
+core -7  -> 约 -3/-4
+edge -11 -> 约 -5/-6
+
+0：
+IDR帧取消负ROI优待
+
+P帧ROI保持原样。
+
+IMPORTANT：
+
+只缩放负 delta：
+
+core / edge
+
+background正delta继续保持，
+不要因为IDR把背景也提升质量。
+
+========================
+七、必须可靠识别即将编码的IDR
+========================
+
+IDR ROI scale 必须在 encode 前确定。
+
+不能：
+
+编码完发现是IDR
+→ 下一帧才修改ROI
+
+要维护发送端预编码状态：
+
+- GOP position
+- scheduled IDR
+- explicit requestIdr pending
+- generation/recovery IDR
+
+只有确定当前帧将成为IDR时，
+才应用 idr_roi_scale。
+
+编码完成后再使用实际：
+
+output.key_frame
+
+校验预测结果。
+
+日志记录：
+
+EXPECTED_KEY_FRAME
+ACTUAL_KEY_FRAME
+
+若不一致要计数并报警。
+
+========================
+八、第三阶段：约束 P-frame QP 轨迹
+========================
+
+本项目当前最大问题不是单帧平均QP，
+而是：
+
+early P ≈高QP
+↓
+后续逐渐下降
+↓
+late P过度清晰
+
+所以最终目标是压平P帧QP曲线。
+
+优先尝试MPP frame-level base QP：
+
+rc:fqp_min_p
+rc:fqp_max_p
+
+新增：
+
+--gan-fqp-min-p=N
+--gan-fqp-max-p=N
+
+默认：
+disabled
+
+IMPORTANT：
+
+当前项目板端MPP较旧，
+不要假设这些key一定支持。
+
+初始化时做runtime capability probe。
+
+如果支持：
+实际启用并记录 SUPPORTED。
+
+如果不支持：
+记录 UNSUPPORTED，
+继续运行，
+不得启动失败。
+
+========================
+九、fqp实验
+========================
+
+只有runtime确认支持后才执行。
+
+根据baseline实测P QP范围约：
+
+29 -> 18
+
+尝试限制base QP变化范围。
+
+初始实验候选：
+
+A：
+无fqp限制
+
+B：
+fqp_min_p = 18
+fqp_max_p = 28
+
+C：
+fqp_min_p = 20
+fqp_max_p = 28
+
+D：
+fqp_min_p = 20
+fqp_max_p = 26
+
+目的：
+
+限制：
+early-P不能过度升QP
+late-P不能过度降QP
+
+把bit从GOP后半段重新分配到前半段。
+
+不能只看QP是否变平，
+还必须确认：
+
+- frame bits可控
+- pacing queue不增长
+- CAP60不被破坏
+- receiver仍≈8fps
+
+========================
+十、fqp不支持时的fallback方案
+========================
+
+如果RK3588当前MPP不支持：
+
+rc:fqp_min_p/max_p
+
+则使用已经支持的：
+
+rc:qp_min
+rc:qp_max
+
+作为实验性P-frame QP corridor。
+
+新增GAN专用参数：
+
+--gan-qp-min-p=N
+--gan-qp-max-p=N
+
+先根据实测QP而不是硬编码默认值进行A/B。
+
+不要使用：
+
+rc:qp_step
+
+因为当前RK3588不能假定支持该能力。
+
+========================
+十一、重新处理 super-frame
+========================
+
+当前super-frame路径需要继续隔离测试。
+
+至少保留：
+
+current
+off
+relaxed
+
+同时增加/确认：
+
+max_reencode_times
+
+可以独立控制。
+
+比较：
+
+A：
+current
+FRAME_SIZE_FIRST
+现有max_reencode_times
+
+B：
+super-frame off
+
+C：
+relaxed
+max_reencode_times=1
+
+D：
+如果MPP支持：
+super reencode
+BITRATE_FIRST
+max_reencode_times=1
+
+目标是验证：
+
+early-P是否因为：
+
+super threshold
+→ reencode
+→ QP进一步提高
+
+而被二次压缩。
+
+如果关闭super-frame改善sharpness，
+但造成pacing queue / latency明显增加，
+则不能作为最终方案。
+
+========================
+十二、第一阶段不要放宽CBR窗口
+========================
+
+保持当前：
+
+CBR
+bps_min
+bps_max
+
+暂时不改。
+
+不要同时改变：
+
+max_i_prop
++
+CBR窗口
++
+QP
++
+super-frame
+
+否则无法识别真正有效的变量。
+
+目前优先通过减少IDR消耗和重新分配I/P bit
+解决RC debt。
+
+只有上述方案仍无法压平GOP后，
+才进入第二轮研究CBR窗口。
+
+========================
+十三、增强编码遥测
+========================
+
+每个frame记录：
+
+SEQ
+PTS
+
+FRAME_TYPE
+EXPECTED_KEY_FRAME
+ACTUAL_KEY_FRAME
+
+GOP_POSITION
+
+ENCODED_BITS
+ENCODED_BYTES
+
+AVERAGE_QP
+
+TARGET_BITRATE
+
+MAX_I_PROP
+MIN_I_PROP
+INIT_IP_RATIO
+
+QP_IP
+QP_MIN
+QP_MAX
+QP_MIN_I
+QP_MAX_I
+
+FQP_MIN_P
+FQP_MAX_P
+FQP_SUPPORTED
+
+SUPER_MODE
+SUPER_PRIORITY
+SUPER_P_THRESHOLD
+MAX_REENC_TIMES
+
+REENCODE_COUNT
+如果MPP无法获取则 UNKNOWN
+
+ROI_AREA_RATIO
+ROI_BLOCKS
+CORE_BLOCKS
+EDGE_BLOCKS
+BACKGROUND_BLOCKS
+
+IDR_ROI_SCALE_PERCENT
+
+如果可以计算：
+
+实际：
+I_FRAME_BITS / P_FRAME_BITS_MEAN
+
+也写入每个GOP summary。
+
+========================
+十四、分析器重点修改
+========================
+
+扩展 analyze_quality_cycle.py。
+
+每个实验输出：
+
+GOP_POSITION
+FRAME_TYPE
+AVG_BITS
+AVG_QP
+DECODED_SHARPNESS
+ROI_AREA
+
+重点计算：
+
+1. GOP phase sharpness mean
+2. GOP phase sharpness std
+3. peak-to-trough amplitude
+4. early-P minimum sharpness
+5. pos0 sharpness
+6. pos1~3 average
+7. pos12~15 average
+8. QP phase std
+9. QP slope
+10. IDR/P average bit ratio
+
+baseline已知类似：
+
+pos0 ≈660
+pos2 ≈392
+pos15≈641
+
+peak-trough≈268
+
+要直接输出：
+
+BREATH_AMPLITUDE
+BREATH_STD
+EARLY_P_TROUGH
+QP_PHASE_SLOPE
+
+========================
+十五、实验顺序
+========================
+
+固定：
+
+CAP = 60 kbps
+FPS = 8
+gan-inference-fps = 0
+GOP = 16
+debreath = off
+GDR = off
+
+优先用：
+
+--gan-enhancer=none
+
+测 decoded input。
+
+不要先用ESRGAN评价，
+因为已经证明ESRGAN跟随输入周期。
+
+最好使用完全相同的录制源输入。
+如果只能用camera：
+固定机位、人物、背景、光照。
+
+------------------------
+PHASE 1：I/P bit allocation
+------------------------
+
+max_i_prop：
+
+30
+24
+20
+16
+
+min_i_prop=10
+init_ip_ratio=160
+
+找出：
+
+GOP phase std最低
++
+网络稳定
+
+的一档。
+
+------------------------
+PHASE 2：I QP floor
+------------------------
+
+使用PHASE1最佳max_i_prop。
+
+qp_min_i：
+
+baseline
+38
+40
+
+比较：
+
+IDR bits是否下降
+early-P QP是否下降
+early-P sharpness是否上升。
+
+------------------------
+PHASE 3：super-frame
+------------------------
+
+在PHASE1+2最佳组合上：
+
+current
+off
+relaxed/max_reenc=1
+bitrate-first/max_reenc=1（若支持）
+
+------------------------
+PHASE 4：P QP corridor
+------------------------
+
+若fqp支持：
+
+baseline
+18~28
+20~28
+20~26
+
+如果不支持，
+用rc:qp_min/max进行等效实验。
+
+------------------------
+PHASE 5：IDR ROI
+------------------------
+
+在前面最佳组合上：
+
+idr_roi_scale：
+
+100
+50
+0
+
+确认是否进一步减少：
+
+IDR bit spike
+early-P RC debt
+
+但不能显著损伤人物IDR质量。
+
+========================
+十六、验收指标
+========================
+
+主指标：
+
+decoded sharpness 的 GOP-phase 时间稳定性。
+
+不是平均sharpness最高者获胜。
+
+相对baseline：
+
+BREATH_AMPLITUDE
+至少降低 40%
+
+即如果baseline约268，
+目标优先达到约160以下。
+
+同时：
+
+early-P trough明显提高。
+
+平均decoded sharpness：
+相对baseline下降不超过约10%。
+
+网络：
+
+physical wire <= 60 kbps持续约束
+
+receiver：
+>=7.5 fps
+
+不得出现：
+持续pacing backlog
+持续sender stale
+新的decoder stall
+新的GAN fallback
+
+如果某配置：
+
+pos0从660降到580
+pos2从392提高到520
+pos15从641降到590
+
+这种结果应优于：
+
+660 / 392 / 641
+
+因为本目标优化的是时间稳定性，
+不是单帧峰值。
+
+========================
+十七、最终候选组合
+========================
+
+预期优先寻找类似：
+
+CBR保持
+GOP16保持
+debreath off
+GDR off
+
++
+max_i_prop降低
++
+适度提高I-frame QP floor
++
+P-frame base-QP corridor
++
+super-frame轻量/单次重编码
++
+必要时IDR ROI负delta减弱
+
+的组合。
+
+不要预先硬编码具体最终值。
+
+所有默认值在未通过实机验收前
+保持当前部署行为。
+
+========================
+十八、禁止事项
+========================
+
+本目标不要：
+
+- 更换Real-ESRGAN
+- 引入BasicVSR/TecoGAN
+- 改GAN latency
+- 增加temporal blur
+- 用Lanczos掩盖问题
+- 开启debreath
+- 开启GDR
+- 增大物理CAP
+- 改source FPS
+- 使用qp_step
+- 使用大VBV
+- 改VBR
+- 缩短GOP作为最终修复
+- 降低接收端fps隐藏呼吸
+
+========================
+十九、最终输出
+========================
+
+完成后给出：
+
+1. max_i_prop是否被当前RK3588 MPP实际支持。
+2. fqp_min/max_p是否实际支持。
+3. 每个实验的完整phase表。
+4. baseline和最佳结果的：
+
+   sharpness phase曲线
+   QP phase曲线
+   bits phase曲线
+
+5. IDR平均bits变化。
+6. early-P平均QP变化。
+7. early-P sharpness变化。
+8. GOP sharpness std和peak-trough变化。
+9. physical wire / receive fps / pacing latency。
+10. 最终推荐配置。
+
+只有同时满足：
+
+呼吸幅度显著降低
++
+CAP60稳定
++
+8fps基本保持
++
+平均质量没有明显崩坏
+
+才能声明“呼吸效应已修复”。
+
+否则只能报告下一轮实验结论，
+不得把“增加了参数开关”描述为修复完成。

@@ -136,6 +136,12 @@ struct EncoderConfig {
     int qp_min_i;
     int qp_max_i;
     int qp_ip;
+    int max_i_prop;
+    int min_i_prop;
+    int init_ip_ratio;
+    // Negative values disable the optional frame-level P-QP corridor.
+    int fqp_min_p;
+    int fqp_max_p;
     bool debreath;
     int debreath_strength;
     bool intra_refresh;
@@ -145,6 +151,8 @@ struct EncoderConfig {
     // 0=none, 2=re-encode (MPP_ENC_RC_SUPER_FRM_REENC).
     int super_frame_mode;
     int max_reencode_times;
+    // 0=frame-size first, 1=bitrate first.
+    int super_priority;
     int super_i_frame_bits;
     int super_p_frame_bits;
     bool grayscale_encode;
@@ -181,6 +189,7 @@ struct GanConfig {
     // current preserves the historical absolute thresholds; relaxed derives
     // thresholds from target bitrate / fps; off disables super-frame handling.
     std::string super_frame_policy;
+    int idr_roi_scale_percent;
 
     GanConfig();
 };

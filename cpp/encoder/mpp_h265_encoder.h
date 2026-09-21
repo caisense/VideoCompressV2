@@ -35,6 +35,8 @@ public:
     bool encode(const FramePacket &frame, const std::vector<RoiRegion> &regions,
                 EncodedAccessUnit *output, std::string *error);
     bool requestIdr(std::string *error);
+    bool ipAllocationSupported() const;
+    bool fqpSupported() const;
     void shutdown();
     bool available() const;
 
