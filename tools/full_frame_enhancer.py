@@ -2,10 +2,10 @@
 """PC-side full-frame enhancement for the H.265-only GAN profile.
 
 The module deliberately has no knowledge of RB/1, semantic masks, reference
-JPEGs, registration, or ROI compositing.  Every backend consumes the same
-decoded BGR frame and produces an x2 native frame.  The receiver selects the
-input size from RTP profile metadata, then only resizes at presentation when
-the x2 native frame is not already the shared 640x360 output.
+JPEGs, registration, or ROI compositing.  Every model consumes the same
+decoded BGR frame and produces an x2 native frame.  Lower input profiles are
+presented at the shared 640x360 size; 640x360 input is kept at its x2 native
+1280x720 size.
 """
 
 from __future__ import annotations
@@ -52,6 +52,13 @@ def _prepare_cuda_runtime_paths() -> None:
     for root in roots:
         for library in libraries:
             directory = Path(root) / "nvidia" / library / "bin"
+            if directory.is_dir():
+                directories.append(directory)
+        for directory in (
+            Path(root) / "tensorrt_libs",
+            Path(root) / "nvidia" / "tensorrt" / "lib",
+            Path(root) / "nvidia" / "tensorrt" / "bin",
+        ):
             if directory.is_dir():
                 directories.append(directory)
     if not directories:
@@ -150,6 +157,7 @@ class FullFrameEnhancer:
     """Common preprocessing/postprocessing wrapper for none/ESRNet/ESRGAN."""
 
     VALID_BACKENDS = ("none", "esrnet", "esrgan")
+    VALID_EXECUTION_PROVIDERS = ("auto", "cuda", "tensorrt-fp16")
     OUTPUT_MODE_ZERO_TO_ONE = "ZERO_TO_ONE"
     OUTPUT_MODE_LANCZOS4 = "LANCZOS4"
     OUTPUT_MODE_BY_BACKEND = {
@@ -165,12 +173,24 @@ class FullFrameEnhancer:
         native_size: Size = (512, 288),
         output_size: Size = (640, 360),
         require_cuda: bool = False,
+        execution_provider: str = "auto",
+        tensorrt_cache_dir: Optional[str | Path] = None,
         threads: int = 2,
         warmup: int = 4,
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
         if backend not in self.VALID_BACKENDS:
             raise ValueError(f"unknown full-frame enhancer: {backend}")
+        if execution_provider not in self.VALID_EXECUTION_PROVIDERS:
+            raise ValueError(
+                f"execution provider must be one of {self.VALID_EXECUTION_PROVIDERS}"
+            )
+        if require_cuda and execution_provider == "tensorrt-fp16":
+            raise ValueError("--gan-require-cuda conflicts with TensorRT FP16 execution")
+        if require_cuda and execution_provider == "auto":
+            execution_provider = "cuda"
+        if backend == "none" and execution_provider != "auto":
+            raise ValueError("an execution provider requires an ESRNet or ESRGAN model")
         if any(int(value) <= 0 for value in (*input_size, *native_size, *output_size)):
             raise ValueError("enhancer dimensions must be positive")
         if threads < 0 or warmup < 0:
@@ -180,6 +200,18 @@ class FullFrameEnhancer:
         self.native_size = (int(native_size[0]), int(native_size[1]))
         self.output_size = (int(output_size[0]), int(output_size[1]))
         self.require_cuda = bool(require_cuda)
+        self.execution_mode = execution_provider
+        self.tensorrt_cache_dir = (
+            None if tensorrt_cache_dir is None else Path(tensorrt_cache_dir).expanduser()
+        )
+        self.execution_precision = {
+            "cuda": "FP32 (TF32 disabled; CPU fallback available)",
+            "tensorrt-fp16": "TensorRT FP16 with CUDA/CPU fallback",
+        }.get(execution_provider, "ONNX Runtime default")
+        if backend == "none":
+            self.execution_mode = "none"
+            self.execution_precision = "No model inference"
+        self.model_input_type = "unknown"
         self.session = None
         self.input_name: Optional[str] = None
         self.output_name: Optional[str] = None
@@ -208,11 +240,20 @@ class FullFrameEnhancer:
 
         _prepare_cuda_runtime_paths()
         available = tuple(ort.get_available_providers())
-        if self.require_cuda and "CUDAExecutionProvider" not in available:
+        if self.execution_mode == "cuda" and "CUDAExecutionProvider" not in available:
             raise RuntimeError(
-                "--gan-require-cuda requested, but CUDAExecutionProvider is unavailable; "
+                "CUDA execution was requested, but CUDAExecutionProvider is unavailable; "
                 f"available={list(available)}"
             )
+        if self.execution_mode == "tensorrt-fp16":
+            missing = [name for name in (
+                "TensorrtExecutionProvider", "CUDAExecutionProvider"
+            ) if name not in available]
+            if missing:
+                raise RuntimeError(
+                    "TensorRT FP16 execution requires TensorRT and CUDA providers; "
+                    f"missing={missing}, available={list(available)}"
+                )
         if "CUDAExecutionProvider" in available:
             preload = getattr(ort, "preload_dlls", None)
             if callable(preload):
@@ -220,24 +261,78 @@ class FullFrameEnhancer:
                     preload(directory="")
                 except Exception as error:
                     self._logger(f"GAN CUDA DLL preload unavailable: {error}")
-        cuda_requested = "CUDAExecutionProvider" in available
-        # Probe CUDA in an EP-only session.  If CPU is listed in the same
-        # session, ORT can silently retry a failed CUDA kernel on CPU while
-        # still reporting CUDA first in get_providers().
-        requested = ["CUDAExecutionProvider"] if cuda_requested else ["CPUExecutionProvider"]
+        cuda_requested = (
+            self.execution_mode in ("auto", "cuda") and
+            "CUDAExecutionProvider" in available
+        )
+        # Keep CPU last so graph operations unsupported by the GPU providers
+        # have an explicit, observable fallback route.  Strict modes still
+        # fail if the requested GPU provider cannot initialize or run a probe.
+        session_providers = ["CPUExecutionProvider"]
+        if self.execution_mode == "cuda":
+            session_providers = [
+                ("CUDAExecutionProvider", {"use_tf32": 0}),
+                "CPUExecutionProvider",
+            ]
+        elif self.execution_mode == "tensorrt-fp16":
+            # Resolve the model's input name through ORT so exported ESRNet
+            # models need not share a hard-coded tensor name.  These static
+            # min/opt/max shapes match the live RTP-selected profile geometry.
+            inspect_options = ort.SessionOptions()
+            inspect_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            try:
+                inspector = ort.InferenceSession(
+                    str(self.model_path), sess_options=inspect_options,
+                    providers=["CPUExecutionProvider"],
+                )
+                model_inputs = inspector.get_inputs()
+                if len(model_inputs) != 1:
+                    raise ValueError("full-frame ONNX enhancer must have one input")
+                tensor_shape = (
+                    f"1x3x{self.input_size[1]}x{self.input_size[0]}"
+                )
+                shape_option = f"{model_inputs[0].name}:{tensor_shape}"
+                del inspector
+            except Exception as error:
+                raise RuntimeError(
+                    f"could not inspect model input for TensorRT profiles: {error}"
+                ) from error
+            cache_dir = self.tensorrt_cache_dir or (
+                Path("runs") / "tensorrt_cache"
+            )
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            provider_options = {
+                "device_id": 0,
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache_dir.resolve()),
+                "trt_engine_cache_prefix": (
+                    f"{self.model_path.stem}_{self.input_size[0]}x{self.input_size[1]}"
+                ),
+                "trt_profile_min_shapes": shape_option,
+                "trt_profile_opt_shapes": shape_option,
+                "trt_profile_max_shapes": shape_option,
+            }
+            session_providers = [
+                ("TensorrtExecutionProvider", provider_options),
+                ("CUDAExecutionProvider", {"use_tf32": 0}),
+                "CPUExecutionProvider",
+            ]
+        elif self.execution_mode == "auto" and cuda_requested:
+            session_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
         options = ort.SessionOptions()
         if threads > 0:
             options.intra_op_num_threads = int(threads)
             options.inter_op_num_threads = 1
         try:
             self.session = ort.InferenceSession(
-                str(self.model_path), sess_options=options, providers=requested
+                str(self.model_path), sess_options=options, providers=session_providers
             )
         except Exception as error:
-            if self.require_cuda and cuda_requested:
+            if self.execution_mode != "auto":
                 raise RuntimeError(
-                    "--gan-require-cuda requested, but CUDA session creation failed: "
-                    f"{error}"
+                    f"{self.execution_mode} session creation failed: {error}"
                 ) from error
             if not cuda_requested:
                 raise RuntimeError(f"full-frame enhancer session creation failed: {error}") from error
@@ -248,23 +343,34 @@ class FullFrameEnhancer:
                 str(self.model_path), sess_options=options, providers=["CPUExecutionProvider"]
             )
         active = tuple(self.session.get_providers())
-        if self.require_cuda and "CUDAExecutionProvider" not in active:
+        if self.execution_mode == "cuda" and "CUDAExecutionProvider" not in active:
             raise RuntimeError(
-                "--gan-require-cuda requested, but ONNX Runtime did not activate CUDA; "
+                "CUDA execution was requested, but ONNX Runtime did not activate CUDA; "
                 f"active={list(active)}"
             )
+        if (self.execution_mode == "tensorrt-fp16" and
+                "TensorrtExecutionProvider" not in active):
+            raise RuntimeError(
+                "TensorRT FP16 execution was requested, but ONNX Runtime did not "
+                f"register TensorRT; active={list(active)}"
+            )
         self.providers = active
-        self.provider = (
-            "CUDAExecutionProvider"
-            if "CUDAExecutionProvider" in active
-            else "CPUExecutionProvider"
-        )
+        self.provider = "+".join(active) if active else "unknown"
+        if self.execution_mode == "auto":
+            self.execution_precision = (
+                "ONNX Runtime default; CPU fallback available"
+                if "CUDAExecutionProvider" in active and "CPUExecutionProvider" in active
+                else "ONNX Runtime default (CUDA)"
+                if "CUDAExecutionProvider" in active
+                else "FP32 CPU fallback"
+            )
         inputs = self.session.get_inputs()
         outputs = self.session.get_outputs()
         if len(inputs) != 1 or len(outputs) != 1:
             raise ValueError("full-frame ONNX enhancer must have one input and one output")
         input_info = inputs[0]
         output_info = outputs[0]
+        self.model_input_type = str(getattr(input_info, "type", "unknown"))
         if getattr(input_info, "type", None) != "tensor(float)":
             raise ValueError(
                 f"full-frame enhancer input must be float32, got {getattr(input_info, 'type', None)}"
@@ -294,10 +400,9 @@ class FullFrameEnhancer:
             probe_output = self.session.run([self.output_name], {self.input_name: probe})[0]
             self._postprocess_native(probe_output)
         except Exception as error:
-            if self.require_cuda and "CUDAExecutionProvider" in active:
+            if self.execution_mode != "auto":
                 raise RuntimeError(
-                    "--gan-require-cuda requested, but CUDA inference probe failed: "
-                    f"{error}"
+                    f"{self.execution_mode} inference probe failed: {error}"
                 ) from error
             if "CUDAExecutionProvider" not in active:
                 raise RuntimeError(f"full-frame enhancer inference probe failed: {error}") from error
@@ -316,12 +421,16 @@ class FullFrameEnhancer:
             probe_output = self.session.run([self.output_name], {self.input_name: probe})[0]
             self._postprocess_native(probe_output)
             self.providers = active
-            self.provider = "CPUExecutionProvider"
+            self.provider = "+".join(active) if active else "unknown"
+            self.execution_precision = "FP32 CPU fallback"
 
         self._logger(
             f"GAN enhancer provider selected: {self.provider}; backend={self.backend}; "
             f"model={self.model_path}; input={input_info.name}:{input_info.type}{input_info.shape}; "
             f"output={output_info.name}:{output_info.type}{output_info.shape}; "
+            f"model_input_dtype={self.model_input_type}; "
+            f"execution_mode={self.execution_mode}; "
+            f"execution_precision={self.execution_precision}; "
             f"active_providers={list(active)}"
         )
 
@@ -450,12 +559,19 @@ class FullFrameEnhancer:
         return {
             "backend": self.backend,
             "provider": self.provider,
+            "providers": list(self.providers),
+            "execution_mode": self.execution_mode,
+            "execution_precision": self.execution_precision,
+            "model_input_dtype": self.model_input_type,
+            "model": None if self.model_path is None else str(self.model_path),
             "warmup": warmup,
             "measured": measured,
             "p50_ms": _percentile(values, 50),
             "p95_ms": _percentile(values, 95),
             "p99_ms": _percentile(values, 99),
+            "max_ms": max(samples),
             "mean_ms": statistics.fmean(samples),
+            "mean_fps": 1000.0 / statistics.fmean(samples),
             "input": list(self.input_size),
             "native": list(self.native_size),
             "output": list(self.output_size),
@@ -496,6 +612,9 @@ class LatestOnlyEnhancerWorker:
         self.logger = logger or (lambda message: print(message, flush=True))
         self.provider = getattr(enhancer, "provider", "unknown")
         self.backend = getattr(enhancer, "backend", "unknown")
+        self.execution_mode = getattr(enhancer, "execution_mode", "unknown")
+        self.execution_precision = getattr(
+            enhancer, "execution_precision", "unknown")
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.pending: Optional[EnhancementInput] = None
@@ -577,6 +696,8 @@ class LatestOnlyEnhancerWorker:
             "EFFECTIVE_BUDGET_MS": self.max_latency_ms,
             "ENHANCER": self.backend,
             "PROVIDER": self.provider,
+            "EXECUTION_MODE": self.execution_mode,
+            "EXECUTION_PRECISION": self.execution_precision,
             "QUEUE_WAIT": queue_wait_ms,
             "INFER_MS": infer_ms,
             "TOTAL_PC_MS": total_pc_ms,
@@ -884,6 +1005,8 @@ class LatestOnlyEnhancerWorker:
             return {
                 "backend": self.backend,
                 "provider": self.provider,
+                "execution_mode": self.execution_mode,
+                "execution_precision": self.execution_precision,
                 "submitted": self.submitted,
                 "inference_completed": self.inference_completed,
                 "completed": self.completed,

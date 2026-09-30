@@ -497,6 +497,18 @@ void testCommandLineConfig() {
     CHECK(gan_150.encoder.target_bitrate_bps == 110000);
     CHECK(gan_150.transport.pacing_bitrate_bps == 150000);
 
+    char gan_cap_300[] = "--gan-link-cap-kbps=300";
+    char *gan_300_argv[] = {profile_app, gan_mode, gan_cap_300};
+    AppConfig gan_300;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(3, gan_300_argv, &gan_300, &error));
+    CHECK(gan_300.gan.link_cap_kbps == 300);
+    CHECK(gan_300.encoder.width == 640 && gan_300.encoder.height == 360);
+    CHECK(gan_300.encoder.fps == 10 && gan_300.encoder.gop == 20);
+    CHECK(gan_300.gan.video_bitrate_kbps == 240);
+    CHECK(gan_300.encoder.target_bitrate_bps == 240000);
+    CHECK(gan_300.transport.pacing_bitrate_bps == 300000);
+
     // The dedicated knobs may override a preset's defaults, but only inside
     // its cap-specific validation range and without changing its geometry.
     char gan_fps_12[] = "--gan-fps=12";

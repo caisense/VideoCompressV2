@@ -105,6 +105,17 @@ class FullFrameEnhancerTests(unittest.TestCase):
         self.assertEqual(resize.call_count, 1)
         self.assertEqual(resize.call_args.args[1], (640, 360))
 
+    def test_640x360_source_uses_native_1280x720_output(self) -> None:
+        enhancer = FullFrameEnhancer(
+            "none", input_size=(640, 360), native_size=(1280, 720),
+            output_size=(1280, 720), warmup=0)
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        native = enhancer.enhance_native(frame)
+        output = enhancer.enhance(frame)
+        self.assertEqual(native.shape, (720, 1280, 3))
+        self.assertEqual(output.shape, (720, 1280, 3))
+        self.assertEqual(enhancer.provider, "Lanczos4")
+
     def test_model_postprocess_converts_rgb_to_bgr(self) -> None:
         enhancer = self._esrgan_without_loading_model()
         rgb = np.zeros((1, 3, 288, 512), dtype=np.float32)

@@ -250,6 +250,14 @@ class HudTests(unittest.TestCase):
         self.assertEqual(HUD.gan_profile_sizes(profile),
                          ((256, 144), (512, 288), (640, 360)))
 
+    def test_gan_360p_source_keeps_native_720p_output(self):
+        profile = {
+            "name": "gan", "width": 640, "height": 360,
+            "fps": 10, "generation": 1,
+        }
+        self.assertEqual(HUD.gan_profile_sizes(profile),
+                         ((640, 360), (1280, 720), (1280, 720)))
+
     def test_current_gan_target_tail_with_zero_cap_falls_back_to_100(self):
         stats = HUD.RtpStats()
         stats.on_packet(rtp_profile_packet(34, 4, 256, 144, 8, 7,
@@ -403,6 +411,10 @@ class HudTests(unittest.TestCase):
         self.assertTrue(HUD.should_use_gan_fallback(
             frame, 2, 1, 10.01, True, 10.02, 10.0, 100.0))
         self.assertEqual(HUD.gan_lanczos_fallback(frame, "none").shape, (360, 640, 3))
+        self.assertEqual(
+            HUD.gan_lanczos_fallback(frame, "none", (1280, 720)).shape,
+            (720, 1280, 3),
+        )
 
     def test_gan_auto_budget_is_fps_aware(self):
         self.assertAlmostEqual(HUD.gan_effective_output_budget_ms(8), 143.75)

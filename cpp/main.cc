@@ -164,7 +164,7 @@ void printUsage(const char *program) {
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
-        "          [--gan-link-cap-kbps=60|100|120|150 --gan-fps=8|10|12 --gan-inference-fps=0]\n"
+        "          [--gan-link-cap-kbps=60|100|120|150|300 --gan-fps=8|10|12 --gan-inference-fps=0]\n"
         "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
         "          [--gan-gop-seconds=1|2|4 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
         "          [--gan-intra-refresh=on|off --gan-refresh-mode=row|col --gan-refresh-num=N]\n"

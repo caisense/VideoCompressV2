@@ -181,7 +181,7 @@ struct GanConfig {
     // latest-map reuse between less frequent inference passes.
     int inference_fps;
     // Shared video + optional Codec2 physical-wire cap selected by
-    // --gan-link-cap-kbps=60|100|120|150.
+    // --gan-link-cap-kbps=60|100|120|150|300.
     int link_cap_kbps;
     int video_bitrate_kbps;
     int max_inference_latency_ms;

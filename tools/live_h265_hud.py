@@ -30,12 +30,14 @@ DEFAULT_VIDEO_PORT = 5004
 
 
 def gan_profile_sizes(profile: dict) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    """Return RTP-selected source, x2-native, and fixed presentation sizes."""
+    """Return source, x2-native, and presentation sizes for the GAN profile."""
     width = int(profile.get("width", 0))
     height = int(profile.get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError(f"GAN profile has invalid input size {width}x{height}")
-    return (width, height), (width * 2, height * 2), (640, 360)
+    native_size = (width * 2, height * 2)
+    output_size = native_size if (width, height) == (640, 360) else (640, 360)
+    return (width, height), native_size, output_size
 
 
 def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int]:
@@ -79,6 +81,8 @@ def gan_waiting_worker_snapshot() -> dict:
     return {
         "backend": "warming",
         "provider": "--",
+        "execution_mode": "--",
+        "execution_precision": "--",
         "rolling_1s_fps": 0.0,
         "max_latency_ms": 0.0,
         "infer_all_p50_ms": 0.0,
@@ -1146,9 +1150,11 @@ def should_use_gan_fallback(frame: Optional[np.ndarray], source_sequence: Option
         source_fps, max_latency_ms)
 
 
-def gan_lanczos_fallback(frame: np.ndarray, rotation: str) -> np.ndarray:
+def gan_lanczos_fallback(
+    frame: np.ndarray, rotation: str, output_size: Tuple[int, int] = (640, 360)
+) -> np.ndarray:
     """Keep GAN video live while an asynchronous neural enhancer is stalled."""
-    output = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LANCZOS4)
+    output = cv2.resize(frame, output_size, interpolation=cv2.INTER_LANCZOS4)
     return postprocess_frame(output, rotation, False)
 
 
@@ -1202,7 +1208,16 @@ def main() -> int:
         help="Real-ESRGAN x2 ONNX model; used with --gan-enhancer=esrgan",
     )
     parser.add_argument("--gan-require-cuda", action="store_true",
-                        help="fail instead of falling back to CPU for a GAN model")
+                        help="compatibility alias for --gan-execution-provider=cuda")
+    parser.add_argument(
+        "--gan-execution-provider", choices=("auto", "cuda", "tensorrt-fp16"),
+        default="auto",
+        help="inference provider; TensorRT FP16 keeps CUDA for unsupported model nodes",
+    )
+    parser.add_argument(
+        "--gan-trt-cache-dir", default="runs/tensorrt_cache",
+        help="TensorRT engine cache directory (device/model/version specific)",
+    )
     parser.add_argument("--gan-threads", type=int, default=2)
     parser.add_argument("--gan-warmup", type=int, default=4,
                         help="live-shape model warmup frames before output")
@@ -1252,6 +1267,8 @@ def main() -> int:
             args.gan_recovery_max_sequence_lag < 0 or
             args.gan_display_fps < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
+    if args.gan_require_cuda and args.gan_execution_provider == "tensorrt-fp16":
+        parser.error("--gan-require-cuda conflicts with --gan-execution-provider=tensorrt-fp16")
 
     try:
         listen_port = resolve_video_port(args.sdp, args.video_port)
@@ -1414,6 +1431,8 @@ def main() -> int:
                 native_size=native_size,
                 output_size=output_size,
                 require_cuda=args.gan_require_cuda,
+                execution_provider=args.gan_execution_provider,
+                tensorrt_cache_dir=args.gan_trt_cache_dir,
                 threads=args.gan_threads,
                 warmup=args.gan_warmup,
             )
@@ -1443,7 +1462,8 @@ def main() -> int:
         )
         print(
             f"GAN READY: full-frame enhancer ready: backend={worker.backend} "
-            f"provider={worker.provider} input={input_size[0]}x{input_size[1]} "
+            f"provider={worker.provider} precision={worker.execution_precision} "
+            f"input={input_size[0]}x{input_size[1]} "
             f"native={native_size[0]}x{native_size[1]} "
             f"output={output_size[0]}x{output_size[1]} "
             f"output_budget_ms={output_budget_ms:.1f} ({budget_mode}) "
@@ -1552,10 +1572,14 @@ def main() -> int:
             process = decoder_state["process"]
             if process is None or process.poll() is not None or process.stdin is None:
                 return
-            try:
-                process.stdin.write(data)
-            except (BrokenPipeError, OSError):
-                pass
+        # A pipe write can block while FFmpeg waits for stdout to be drained.
+        # The decode thread needs decoder_lock after reading each frame, so
+        # holding it during this write can deadlock both pipe directions.
+        try:
+            process.stdin.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            # A concurrent decoder restart can close the captured old pipe.
+            pass
 
     def proxy_loop() -> None:
         while not stopping.is_set():
@@ -1768,7 +1792,8 @@ def main() -> int:
                     if (current_canvas is None or
                             source_sequence != current_source_sequence or
                             fallback_entered_this_tick):
-                        current_canvas = gan_lanczos_fallback(frame, args.rotate)
+                        current_canvas = gan_lanczos_fallback(
+                            frame, args.rotate, gan_profile_sizes(profile)[2])
                         current_updated = updated
                         current_source_sequence = source_sequence
                         gan_display_fallback = True
@@ -1777,7 +1802,8 @@ def main() -> int:
                       source_sequence is not None):
                     # Warmup has no last good GAN output yet.  This is a
                     # display-only Lanczos path, not a soft-fallback entry.
-                    current_canvas = gan_lanczos_fallback(frame, args.rotate)
+                    current_canvas = gan_lanczos_fallback(
+                        frame, args.rotate, gan_profile_sizes(profile)[2])
                     current_updated = updated
                     current_source_sequence = source_sequence
                     gan_display_fallback = True
@@ -2021,7 +2047,8 @@ def main() -> int:
                 input_size, native_size, output_size = gan_profile_sizes(profile)
                 output_backend = (
                     "FALLBACK / Lanczos4" if gan_display_fallback else
-                    f"{gan_values['backend'].upper()} / {gan_values['provider']}"
+                    f"{gan_values['backend'].upper()} / {gan_values['provider']} / "
+                    f"{gan_values['execution_precision']}"
                 )
                 drop_counts = gan_values["drop_reason_counts"]
                 decode_age_ms = (

@@ -23,6 +23,16 @@ def main() -> int:
                         help="warmup calls excluded from the measured statistics")
     parser.add_argument("--measured", type=int, default=200)
     parser.add_argument("--require-cuda", action="store_true")
+    parser.add_argument(
+        "--execution-provider", choices=("auto", "cuda", "tensorrt-fp16"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--input-size", choices=("256x144", "320x180", "640x360"),
+        default="256x144",
+        help="decoded source profile; 640x360 benchmarks native 1280x720 output",
+    )
+    parser.add_argument("--trt-cache-dir", default="runs/tensorrt_cache")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
@@ -30,11 +40,27 @@ def main() -> int:
         parser.error("warmup must be non-negative, measured must be positive, threads non-negative")
     if args.backend != "none" and args.model is None:
         parser.error("--model is required for esrnet/esrgan")
+    if args.backend == "none" and args.execution_provider != "auto":
+        parser.error("--execution-provider requires --backend=esrnet or esrgan")
+    if args.require_cuda and args.execution_provider == "tensorrt-fp16":
+        parser.error("--require-cuda conflicts with --execution-provider=tensorrt-fp16")
+    input_size = tuple(int(part) for part in args.input_size.split("x"))
+    native_size = (input_size[0] * 2, input_size[1] * 2)
+    output_size = native_size if input_size == (640, 360) else (640, 360)
+    execution_provider = (
+        "cuda" if args.require_cuda and args.execution_provider == "auto"
+        else args.execution_provider
+    )
     try:
         enhancer = FullFrameEnhancer(
             args.backend,
             model_path=args.model,
+            input_size=input_size,
+            native_size=native_size,
+            output_size=output_size,
             require_cuda=args.require_cuda,
+            execution_provider=execution_provider,
+            tensorrt_cache_dir=args.trt_cache_dir,
             threads=args.threads,
             warmup=0,
         )
@@ -45,6 +71,15 @@ def main() -> int:
             "status": "NOT RUN",
             "backend": args.backend,
             "model": None if args.model is None else str(args.model),
+            "execution_mode": execution_provider,
+            "execution_precision": (
+                "TensorRT FP16 requested" if execution_provider == "tensorrt-fp16"
+                else "CUDA requested" if execution_provider == "cuda"
+                else "ONNX Runtime auto"
+            ),
+            "input": list(input_size),
+            "native": list(native_size),
+            "output": list(output_size),
             "reason": str(error),
         }
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)

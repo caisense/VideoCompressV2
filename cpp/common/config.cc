@@ -96,6 +96,8 @@ bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset) {
         {100, 256, 144, 10, 75, 85},
         {120, 320, 180, 8, 90, 100},
         {150, 320, 180, 10, 110, 125},
+        // 360p wire input maps to the Real-ESRGAN x2 native 720p output.
+        {300, 640, 360, 10, 240, 260},
     };
     if (!preset) return false;
     for (std::size_t index = 0; index < sizeof(kPresets) / sizeof(kPresets[0]); ++index) {
@@ -438,7 +440,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "gan-link-cap-kbps") {
             GanBandwidthPreset preset;
             if (!parseInt(value, &integer) || !ganBandwidthPreset(integer, &preset)) {
-                if (error) *error = "gan link cap must be 60, 100, 120, or 150 kbps";
+                if (error) *error = "gan link cap must be 60, 100, 120, 150, or 300 kbps";
                 return false;
             }
             config->gan.link_cap_kbps = integer;
@@ -635,7 +637,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
          config->transport.pacing_bitrate_bps != gan_preset.link_cap_kbps * 1000 ||
          config->encoder.grayscale_encode)) {
         if (error) {
-            *error = "gan is an atomic 60|100|120|150 kbps H.265-only profile; "
+            *error = "gan is an atomic 60|100|120|150|300 kbps H.265-only profile; "
                      "use --gan-link-cap-kbps/--gan-fps/--gan-video-bitrate-kbps "
                      "instead of generic encoder or pacing overrides";
         }

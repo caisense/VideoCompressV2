@@ -15,7 +15,7 @@ Options written after an ordinary `rateNN` profile
 can override individual values. `rebuild` is deliberately atomic: its wire size,
 FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
 options from another profile. `gan` is also atomic: it is H.265-only on the wire,
-selects one shared physical A/V ceiling through `--gan-link-cap-kbps=60|100|120|150`,
+selects one shared physical A/V ceiling through `--gan-link-cap-kbps=60|100|120|150|300`,
 and never starts the rebuild side channels. Generic encoder geometry and
 `--pacing-bitrate` overrides are rejected for GAN.
 
@@ -34,6 +34,7 @@ and never starts the rebuild side channels. Generic encoder geometry and
 | `gan` CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
 | `gan` CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x2 native 640×360 |
 | `gan` CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360, recommended |
+| `gan` CAP 300 | 640×360 / **10 fps** default | 240 kbps | **300 kbps** | x2 native 1280×720 |
 
 The ordinary rate presets use the following encoder details. `I QP` is the
 inclusive I-frame QP range; frame limits are bits.
@@ -88,11 +89,14 @@ its sender telemetry remains `RB/1=0 PATCH=0 STATE=0`.
 | `100` | 256×144 / 10 fps | 75 kbps | 1–85 kbps |
 | `120` | 320×180 / 8 fps | 90 kbps | 1–100 kbps |
 | `150` | 320×180 / 10 fps | 110 kbps | 1–125 kbps |
+| `300` | 640×360 / 10 fps | 240 kbps | 1–260 kbps |
 
 `--gan-fps=8|10|12` and `--gan-video-bitrate-kbps=N` may override the default
 within the selected row's allowed range. CAP 60 deliberately preserves the proven
 `256×144 @ 8 fps` CUDA inference geometry; its lower 45 kbps TARGET leaves physical
-wire headroom under the 60 kbps CAP. `150` is the recommended quality preset.
+wire headroom under the 60 kbps CAP. `150` is the recommended low-bandwidth
+preset. CAP 300 sends 640×360 and presents the x2 Real-ESRGAN output at its
+native 1280×720 size.
 The cap is the combined physical wire budget for video plus optional Codec2 audio:
 the existing audio reserve is subtracted first, and only the remainder becomes the
 video child bucket.
@@ -109,6 +113,8 @@ preset default is used):
 --mode=gan --gan-link-cap-kbps=120 --gan-fps=8
 # Recommended quality: 320x180, 10 fps, TARGET 110, CAP 150
 --mode=gan --gan-link-cap-kbps=150 --gan-fps=10
+# Native 720p enhancement: 640x360, 10 fps, TARGET 240, CAP 300
+--mode=gan --gan-link-cap-kbps=300 --gan-fps=10
 ```
 
 The PC path is independent of rebuild state and semantic side data:
@@ -116,9 +122,11 @@ The PC path is independent of rebuild state and semantic side data:
 ```text
 CAP 60/100: decoded H.265 256×144 -> x2 native 512×288 -> Lanczos4 -> 640×360
 CAP 120/150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 output
+CAP 300: decoded H.265 640×360 -> x2 native 1280×720 -> direct 1280×720 output
 ```
 
-`tools/full_frame_enhancer.py` owns the three full-frame backends. Its worker has
+`tools/full_frame_enhancer.py` owns full-frame model and execution-provider
+selection. Its worker has
 one running item and one replaceable pending item, copies decoded input before
 background processing, drops stale results, and records queue/inference/total
 latency, completed/dropped counts, and provider. After eight successful
@@ -183,15 +191,19 @@ Port `5004` is the default, so `--udp-port=5004` may also be omitted. Use
 `--headless` only for a no-window metrics run. When the receiver starts after
 the sender, it waits for the next complete IDR before displaying video.
 
-For ESRGAN, pass the real model explicitly and require CUDA when the host is
-configured for it:
+For ESRGAN, pass the real model explicitly. Select
+`--gan-execution-provider=cuda` for CUDA with FP32 math (TF32 disabled), or
+`--gan-execution-provider=tensorrt-fp16` for TensorRT with FP16 enabled. TensorRT
+keeps CUDA as the provider for unsupported nodes. Both explicit modes fail clearly
+if the requested GPU provider cannot initialize; neither silently changes the
+whole run to CPU.
 
 ```powershell
 Set-Location D:\workspace\videoCompressV2
 & D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
   --gan-enhancer=esrgan `
   --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
-  --gan-require-cuda `
+  --gan-execution-provider=cuda `
   --gan-output-latency-budget-ms=0 `
   --gan-output-latency-factor=1.15 `
   --gan-hard-stall-ms=500 `
@@ -203,9 +215,28 @@ Set-Location D:\workspace\videoCompressV2
 `model/RealESRGAN_x2_dynamic.onnx` is the existing x2 model. ESRNet is a separate
 model and must be exported from its actual checkpoint with
 `tools/export_esrnet_onnx.py`; the exporter refuses to copy or rename an ESRGAN
-model. The benchmark uses at least 10 warmup and 200 measured frames. If CUDA is
-requested but ONNX Runtime does not activate `CUDAExecutionProvider`, the result
-is `NOT RUN` rather than a CPU result labelled as CUDA.
+model. The benchmark uses at least 10 warmup and 200 measured frames. Compare both
+providers at the 640×360 source geometry with the commands below:
+
+```powershell
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x2_dynamic.onnx --execution-provider=cuda `
+  --input-size=640x360 --warmup=20 --measured=200 `
+  --output=runs\gan\gan720_cuda.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x2_dynamic.onnx --execution-provider=tensorrt-fp16 `
+  --input-size=640x360 --warmup=20 --measured=200 `
+  --trt-cache-dir=runs\gan\trt_cache `
+  --output=runs\gan\gan720_tensorrt_fp16.json
+```
+
+Each JSON result records model input dtype, requested execution mode, registered
+providers, precision configuration, 640×360 input and 1280×720 output, plus
+p50/p95/p99/max latency and mean inference FPS. The first TensorRT run builds the
+engine; repeat it after cache creation to measure steady state. The cache depends
+on the model, ONNX Runtime/TensorRT versions, GPU and profile shape. If a requested
+provider cannot initialize or complete its live-shape probe, the benchmark reports
+`NOT RUN` with the reason rather than labeling a fallback run.
 
 On a second Windows receiver with an RTX 4060 at `192.168.0.99`, change the
 board's `--udp-host` to `192.168.0.99` and run the receiver from the conda
@@ -217,7 +248,7 @@ conda run -n videocompress --no-capture-output python -c 'import cv2, numpy, onn
 conda run -n videocompress --no-capture-output ffmpeg -version
 conda run -n videocompress --no-capture-output python tools\live_h265_hud.py --udp-port=5004 `
   --rotate=ccw90 --gan-enhancer=esrgan `
-  --gan-esrgan-model=model\RealESRGAN_x2_dynamic.onnx --gan-require-cuda `
+  --gan-esrgan-model=model\RealESRGAN_x2_dynamic.onnx --gan-execution-provider=cuda `
   --gan-output-latency-budget-ms=0 --gan-output-latency-factor=1.15 `
   --gan-debug-log=runs\gan\f8_i4_b75_4060.jsonl
 ```
@@ -234,7 +265,7 @@ The receiver probes the selected FFmpeg before launching its decoder and uses
 `-fps_mode passthrough` on newer builds, `-vsync 0` on older builds, or no
 optional pacing flag when neither is available.
 
-The sender scenario knobs are `--gan-link-cap-kbps=60|100|120|150`,
+The sender scenario knobs are `--gan-link-cap-kbps=60|100|120|150|300`,
 `--gan-fps=8|10|12`, `--gan-inference-fps=0..30` (zero means every source
 frame), and the cap-specific `--gan-video-bitrate-kbps` range in the table
 above. Keep `--mode=gan` and `--profile-control=""`; do not mix generic
@@ -626,7 +657,7 @@ flowchart TD
     SNAPQ --> CROP["相关目标联合框 + 25% 上下文\nfull 可回退全景"]
     CROP --> JPEG["最大 1280×720 → 逆时针 90° JPEG"]
     JPEG --> SREL["RSNP 可靠分块\nSTART / DATA / ACK / RESUME / END"]
-    RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild 100 / gan 60|100|120|150 kbps"]
+    RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild 100 / gan 60|100|120|150|300 kbps"]
     SREL --> PACER
     EVENT --> PACER
     MIC["板载麦克风 / 当前新板 card 3"] --> ARECORD["arecord 采集\nhw:3,0 44.1 kHz 双声道"]
