@@ -1,5 +1,14 @@
 # RK3588 YOLOv8-Seg ROI H.265 sender
 
+## gan4 temporal quality configuration
+
+For 180p → native 720p at 8fps, use the measured CAP120 configuration in
+`tools/start_gan4_stable.sh` or the full command in `启动.md`.
+It bounds base I/P QP to 28–32 using the existing configuration flags,
+keeps GOP at two seconds, and leaves MPP debreath off.
+The original CAP60 throughput test did not qualify temporal quality.
+Comparison evidence is in `runs/gan/gan4_debreath_sweep_20261009/REPORT.md`.
+
 ## 网络拓扑
 ```
 192.168.0.100 Windows PC 本机：视频 HUD、音频和图片接收端
@@ -9,13 +18,13 @@
 ```
 ## Rate profiles
 
-Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan`
+Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4`
 (or the shorter `--profile=`) to select a complete synchronized sender profile.
 Options written after an ordinary `rateNN` profile
 can override individual values. `rebuild` is deliberately atomic: its wire size,
 FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
-options from another profile. `gan` is also atomic: it is H.265-only on the wire,
-selects one shared physical A/V ceiling through `--gan-link-cap-kbps=60|100|120|150|300`,
+options from another profile. `gan2` and `gan4` are also atomic: they are H.265-only on the wire,
+select one shared physical A/V ceiling through `--gan-link-cap-kbps`,
 and never starts the rebuild side channels. Generic encoder geometry and
 `--pacing-bitrate` overrides are rejected for GAN.
 
@@ -30,11 +39,18 @@ and never starts the rebuild side channels. Generic encoder geometry and
 | `rate200` (ID 9) | 512×288 / 18 fps | 150 kbps | 200 kbps | decoded color video |
 | `rate300` (ID 2, former high) | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
 | `rebuild` | 256×144 / 6 fps | 28 kbps | **100 kbps** | reconstructed 640×360 / 12 fps |
-| `gan` CAP 60 | 256×144 / **8 fps** default | 45 kbps | **60 kbps** | x2 512×288, then Lanczos4 640×360 |
-| `gan` CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
-| `gan` CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x2 native 640×360 |
-| `gan` CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360, recommended |
-| `gan` CAP 300 | 640×360 / **10 fps** default | 240 kbps | **300 kbps** | x2 native 1280×720 |
+| `gan2` ID 4 CAP 60 | 256×144 / **8 fps** default | 45 kbps | **60 kbps** | x2 512×288, then Lanczos4 640×360 |
+| `gan2` ID 4 CAP 70 | 640×360 / **8 fps** default | 50 kbps | **70 kbps** | x2 native 1280×720 |
+| `gan2` ID 4 CAP 80 | 640×360 / **8 fps** default | 57 kbps | **80 kbps** | x2 native 1280×720 |
+| `gan2` ID 4 CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
+| `gan2` ID 4 CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x2 native 640×360 |
+| `gan2` ID 4 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360 |
+| `gan2` ID 4 CAP 300 | 640×360 / **10 fps** default | 240 kbps | **300 kbps** | x2 native 1280×720 |
+| `gan4` ID 10 CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x4 Real-ESRGAN native 1280×720 |
+| `gan4` ID 10 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x4 Real-ESRGAN native 1280×720 |
+
+The legacy name `gan` continues to select `gan2`. By default, `gan4` only accepts the
+120/150 kbps presets so the 320×180 input maps to 1280×720 with the x4 model.
 
 The ordinary rate presets use the following encoder details. `I QP` is the
 inclusive I-frame QP range; frame limits are bits.
@@ -73,11 +89,14 @@ Examples:
   --gan-inference-fps=4 --model=model/yolov8_seg.rknn \
   --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
   --audio=off --preview=off --profile-control=""
+./rknn_yolov8_seg_cam --rate-profile=gan4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off
 ```
 
-## `gan`：H.265-only full-frame enhancement
+## `gan2` / `gan4`: H.265-only full-frame enhancement
 
-`gan` keeps the board path small and deterministic: camera input is processed by
+Both tiers keep the board path small and deterministic: camera input is processed by
 YOLOv8-Seg only to produce the encoder ROI/QP map, then MPP emits colour H.265 at
 the geometry selected by its atomic link preset. The PC receives only H.265 (plus
 optional audio), so GAN mode does not open or parse `RB/1`, `RSNP`, or `ROEV` and
@@ -91,8 +110,10 @@ its sender telemetry remains `RB/1=0 PATCH=0 STATE=0`.
 | `150` | 320×180 / 10 fps | 110 kbps | 1–125 kbps |
 | `300` | 640×360 / 10 fps | 240 kbps | 1–260 kbps |
 
-`--gan-fps=8|10|12` and `--gan-video-bitrate-kbps=N` may override the default
-within the selected row's allowed range. CAP 60 deliberately preserves the proven
+`--gan-fps=6|8|10|12` and `--gan-video-bitrate-kbps=N` may override the default
+within the selected row's allowed range. `gan2` is the x2 Real-ESRGAN tier;
+`gan4` is the x4 tier and by default accepts CAP 120 or 150, both at 320×180 input.
+CAP 60 deliberately preserves the proven
 `256×144 @ 8 fps` CUDA inference geometry; its lower 45 kbps TARGET leaves physical
 wire headroom under the 60 kbps CAP. `150` is the recommended low-bandwidth
 preset. CAP 300 sends 640×360 and presents the x2 Real-ESRGAN output at its
@@ -115,6 +136,8 @@ preset default is used):
 --mode=gan --gan-link-cap-kbps=150 --gan-fps=10
 # Native 720p enhancement: 640x360, 10 fps, TARGET 240, CAP 300
 --mode=gan --gan-link-cap-kbps=300 --gan-fps=10
+# Native 720p x4 enhancement: 320x180, 8 fps, TARGET 90, CAP 120
+--rate-profile=gan4
 ```
 
 The PC path is independent of rebuild state and semantic side data:
@@ -123,6 +146,28 @@ The PC path is independent of rebuild state and semantic side data:
 CAP 60/100: decoded H.265 256×144 -> x2 native 512×288 -> Lanczos4 -> 640×360
 CAP 120/150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 output
 CAP 300: decoded H.265 640×360 -> x2 native 1280×720 -> direct 1280×720 output
+GAN4 CAP 120/150: decoded H.265 320×180 -> x4 native 1280×720 -> direct 1280×720 output
+```
+
+For `gan4`, the receiver selects `model/RealESRGAN_x4plus_dynamic.onnx` from
+the profile ID and requires `--gan-enhancer=esrgan`:
+
+```powershell
+python .\tools\live_h265_hud.py --udp-port=5004 --gan-enhancer=esrgan `
+  --gan-esrgan-x4-model=.\model\RealESRGAN_x4plus_dynamic.onnx `
+  --gan-execution-provider=tensorrt-fp16 --rotate=none
+```
+
+For native 720p comparisons at lower link caps, explicitly enable
+`--gan-native-720p=on`. This selects 640×360 source frames for `gan2` and
+320×180 for `gan4`, independently of CAP 60/70/80/100/120/150/300. CAP 70 and
+80 have default TARGET 50 and 57 kbps, respectively, and default 8 fps.
+The explicit option preserves the original source sizes when it is omitted.
+Use 6 or 8 fps and the same video target/GOP when comparing both routes:
+
+```bash
+--gan-native-720p=on --rate-profile=gan2 --gan-link-cap-kbps=70 --gan-fps=8 --gan-video-bitrate-kbps=50
+--gan-native-720p=on --rate-profile=gan4 --gan-link-cap-kbps=70 --gan-fps=8 --gan-video-bitrate-kbps=50
 ```
 
 `tools/full_frame_enhancer.py` owns full-frame model and execution-provider
@@ -228,10 +273,19 @@ python tools\benchmark_gan_enhancers.py --backend=esrgan `
   --input-size=640x360 --warmup=20 --measured=200 `
   --trt-cache-dir=runs\gan\trt_cache `
   --output=runs\gan\gan720_tensorrt_fp16.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x4plus_dynamic.onnx --execution-provider=cuda `
+  --input-size=320x180 --scale-factor=4 --warmup=20 --measured=200 `
+  --output=runs\gan\gan4_cuda.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x4plus_dynamic.onnx --execution-provider=tensorrt-fp16 `
+  --input-size=320x180 --scale-factor=4 --warmup=20 --measured=200 `
+  --trt-cache-dir=runs\gan\trt_cache `
+  --output=runs\gan\gan4_tensorrt_fp16.json
 ```
 
 Each JSON result records model input dtype, requested execution mode, registered
-providers, precision configuration, 640×360 input and 1280×720 output, plus
+providers, precision configuration, input/output geometry, plus
 p50/p95/p99/max latency and mean inference FPS. The first TensorRT run builds the
 engine; repeat it after cache creation to measure steady state. The cache depends
 on the model, ONNX Runtime/TensorRT versions, GPU and profile shape. If a requested
@@ -265,8 +319,8 @@ The receiver probes the selected FFmpeg before launching its decoder and uses
 `-fps_mode passthrough` on newer builds, `-vsync 0` on older builds, or no
 optional pacing flag when neither is available.
 
-The sender scenario knobs are `--gan-link-cap-kbps=60|100|120|150|300`,
-`--gan-fps=8|10|12`, `--gan-inference-fps=0..30` (zero means every source
+The sender scenario knobs are `--gan-link-cap-kbps=60|70|80|100|120|150|300`,
+`--gan-fps=6|8|10|12`, `--gan-native-720p=on|off`, `--gan-inference-fps=0..30` (zero means every source
 frame), and the cap-specific `--gan-video-bitrate-kbps` range in the table
 above. Keep `--mode=gan` and `--profile-control=""`; do not mix generic
 `--fps`, `--gop`, encoder-size, or `--pacing-bitrate` overrides into the
@@ -337,14 +391,16 @@ echo rate180 > /tmp/roi-rate-profile
 echo rate200 > /tmp/roi-rate-profile
 echo rate300 > /tmp/roi-rate-profile
 echo rebuild > /tmp/roi-rate-profile
-echo gan > /tmp/roi-rate-profile
+echo gan2 > /tmp/roi-rate-profile
+echo gan4 > /tmp/roi-rate-profile
+echo gan > /tmp/roi-rate-profile  # legacy alias for gan2
 echo image > /tmp/roi-rate-profile
 echo video > /tmp/roi-rate-profile
 ```
 
 Use `--profile-control=/another/path` to move the FIFO, or
 `--profile-control=` to disable runtime control. Ordinary `rateNN` profiles and `rebuild` enter
-video mode; `gan` enters the H.265-only full-frame path and keeps RB/1, RSNP and
+video mode; `gan2` and `gan4` enter the H.265-only full-frame path and keep RB/1, RSNP and
 ROEV disabled. `image` (or `snapshot`) drains the H.265 access unit currently on
 the wire, drops queued dependency frames, shuts down MPP, and keeps camera plus
 RKNN running. `video` cancels any in-flight JPEG transfer, rebuilds MPP, and

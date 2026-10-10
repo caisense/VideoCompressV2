@@ -13,6 +13,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import json
+import multiprocessing
 import os
 import site
 import statistics
@@ -280,6 +281,10 @@ class FullFrameEnhancer:
             # min/opt/max shapes match the live RTP-selected profile geometry.
             inspect_options = ort.SessionOptions()
             inspect_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            # This metadata-only session must not start ORT's default pool on
+            # every CPU core before the actual GPU session is constructed.
+            inspect_options.intra_op_num_threads = threads if threads > 0 else 2
+            inspect_options.inter_op_num_threads = 1
             try:
                 inspector = ort.InferenceSession(
                     str(self.model_path), sess_options=inspect_options,
@@ -576,6 +581,86 @@ class FullFrameEnhancer:
             "native": list(self.native_size),
             "output": list(self.output_size),
         }
+
+
+def _enhancer_process(connection, options):
+    """Isolate ORT/TensorRT's native initialization and its GIL from the UI."""
+    try:
+        enhancer = FullFrameEnhancer(**options)
+        metadata = {name: getattr(enhancer, name) for name in (
+            "backend", "provider", "providers", "execution_mode",
+            "execution_precision", "input_size", "native_size", "output_size")}
+        connection.send(("ready", metadata))
+        while True:
+            frame = connection.recv()
+            if frame is None:
+                break
+            try:
+                connection.send(("output", enhancer.enhance_with_diagnostics(frame)))
+            except Exception as error:
+                connection.send(("error", str(error)))
+    except (EOFError, BrokenPipeError, OSError):
+        pass
+    except Exception as error:
+        try:
+            connection.send(("error", str(error)))
+        except (EOFError, BrokenPipeError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+class ProcessFullFrameEnhancer:
+    """Single-call proxy; the existing worker retains latest-only buffering."""
+
+    def __init__(self, **options):
+        context = multiprocessing.get_context("spawn")
+        self._connection, child = context.Pipe()
+        self._process = context.Process(
+            target=_enhancer_process, args=(child, options),
+            name="gan-runtime", daemon=True)
+        self._closed = False
+        self._process.start()
+        child.close()
+        try:
+            while not self._connection.poll(0.2):
+                if not self._process.is_alive():
+                    raise RuntimeError("GAN runtime process exited during initialization")
+            kind, metadata = self._connection.recv()
+            if kind != "ready":
+                raise RuntimeError(f"GAN runtime initialization failed: {metadata}")
+            for name, value in metadata.items():
+                setattr(self, name, value)
+        except Exception:
+            self.close()
+            raise
+
+    def enhance(self, frame):
+        """Support the worker's normal path when debug logging is disabled."""
+        enhanced, _ = self.enhance_with_diagnostics(frame)
+        return enhanced
+
+    def enhance_with_diagnostics(self, frame):
+        try:
+            self._connection.send(frame)
+            while not self._connection.poll(0.2):
+                if not self._process.is_alive():
+                    raise RuntimeError("GAN runtime process exited during inference")
+            kind, result = self._connection.recv()
+        except (EOFError, BrokenPipeError, OSError) as error:
+            raise RuntimeError("GAN runtime process stopped") from error
+        if kind != "output":
+            raise RuntimeError(f"GAN runtime inference failed: {result}")
+        return result
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.is_alive():
+            self._process.terminate()
+        self._process.join(timeout=2.0)
+        self._connection.close()
 
 
 class LatestOnlyEnhancerWorker:
@@ -1090,6 +1175,9 @@ class LatestOnlyEnhancerWorker:
                 self.pending = None
                 self.condition.notify_all()
                 thread = self.thread
+        close_enhancer = getattr(self.enhancer, "close", None)
+        if callable(close_enhancer):
+            close_enhancer()
         if thread.is_alive():
             thread.join(timeout=max(2.0, self.max_latency_ms / 1000.0 + 2.0))
         with self.debug_lock:

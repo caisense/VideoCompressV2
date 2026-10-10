@@ -25,12 +25,14 @@ enum RateProfile {
     // references.  The PC reconstructs a 640x360@12 display from this stream.
     RATE_PROFILE_REBUILD = 3,
     // Full-frame enhancement is a PC-side presentation path over H.265 only.
-    RATE_PROFILE_GAN = 4,
+    RATE_PROFILE_GAN2 = 4,
+    RATE_PROFILE_GAN = RATE_PROFILE_GAN2,
     RATE_PROFILE_RATE80 = 5,
     RATE_PROFILE_RATE100 = 6,
     RATE_PROFILE_RATE120 = 7,
     RATE_PROFILE_RATE180 = 8,
     RATE_PROFILE_RATE200 = 9,
+    RATE_PROFILE_GAN4 = 10,
 };
 
 // Video is the normal H.265/RTP path.  Image mode leaves capture and YOLO
@@ -175,13 +177,13 @@ struct GanBandwidthPreset {
 };
 
 struct GanConfig {
-    // The board source/encoder cadence is one of the three acceptance rates.
+    // The board source/encoder cadence is 6, 8, 10 or 12 fps.
     int fps;
     // Zero means run YOLO at the source cadence; a positive value enables
     // latest-map reuse between less frequent inference passes.
     int inference_fps;
     // Shared video + optional Codec2 physical-wire cap selected by
-    // --gan-link-cap-kbps=60|100|120|150|300.
+    // --gan-link-cap-kbps=60|70|80|100|120|150|300.
     int link_cap_kbps;
     int video_bitrate_kbps;
     int max_inference_latency_ms;
@@ -190,6 +192,9 @@ struct GanConfig {
     // thresholds from target bitrate / fps; off disables super-frame handling.
     std::string super_frame_policy;
     int idr_roi_scale_percent;
+    // Explicitly select source geometry that produces native 1280x720:
+    // gan2 sends 640x360; gan4 sends 320x180. Legacy presets stay unchanged.
+    bool native_720p;
 
     GanConfig();
 };
@@ -204,7 +209,7 @@ struct TransportConfig {
     // Optional receiver SDP emitted from the first IDR access unit.  It carries
     // the H.265 VPS/SPS/PPS required by FFmpeg to determine frame dimensions.
     std::string rtp_sdp_path;
-    // Runtime profile commands are written as rate60/.../rate300/rebuild/gan lines to this
+    // Runtime profile commands are written as rate60/.../rate300/rebuild/gan2/gan4 lines to this
     // FIFO. image/snapshot switches to detection-triggered JPEG transfer;
     // video returns to H.265. Empty disables live switching.
     std::string profile_control_path;
@@ -319,6 +324,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
 const char *pipelineModeName(PipelineMode mode);
 const char *rateProfileName(RateProfile profile);
 bool parseRateProfile(const std::string &name, RateProfile *profile);
+bool isGanRateProfile(RateProfile profile);
 void applyRateProfile(RateProfile profile, AppConfig *config);
 bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset);
 const char *transportModeName(TransportMode mode);

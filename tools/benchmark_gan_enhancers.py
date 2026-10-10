@@ -30,8 +30,10 @@ def main() -> int:
     parser.add_argument(
         "--input-size", choices=("256x144", "320x180", "640x360"),
         default="256x144",
-        help="decoded source profile; 640x360 benchmarks native 1280x720 output",
+        help="decoded source size; use 320x180 with scale-factor=4 for native 720p",
     )
+    parser.add_argument("--scale-factor", type=int, choices=(2, 4), default=2,
+                        help="model's native spatial scale (2 for x2, 4 for x4)")
     parser.add_argument("--trt-cache-dir", default="runs/tensorrt_cache")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--output", type=Path, default=None)
@@ -45,8 +47,9 @@ def main() -> int:
     if args.require_cuda and args.execution_provider == "tensorrt-fp16":
         parser.error("--require-cuda conflicts with --execution-provider=tensorrt-fp16")
     input_size = tuple(int(part) for part in args.input_size.split("x"))
-    native_size = (input_size[0] * 2, input_size[1] * 2)
-    output_size = native_size if input_size == (640, 360) else (640, 360)
+    native_size = (input_size[0] * args.scale_factor,
+                   input_size[1] * args.scale_factor)
+    output_size = native_size if native_size == (1280, 720) else (640, 360)
     execution_provider = (
         "cuda" if args.require_cuda and args.execution_provider == "auto"
         else args.execution_provider
@@ -65,6 +68,7 @@ def main() -> int:
             warmup=0,
         )
         result = enhancer.benchmark(args.warmup, args.measured)
+        result["scale_factor"] = args.scale_factor
         result["status"] = "PASS"
     except (OSError, RuntimeError, ValueError) as error:
         result = {

@@ -12,6 +12,10 @@ cpp/install/
 *.h265
 *.sdp
 
+# Downloaded model binaries are local assets.
+model/*.onnx
+model/*.rknn
+
 # ============================================================
 # cpp/3rdparty - unused platforms for RK3588 Buildroot Linux
 # ============================================================

@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -207,7 +208,7 @@ class HudTests(unittest.TestCase):
                                     target_bitrate_kbps=110, link_cap_kbps=150)
         stats.on_packet(packet)
         profile = stats.snapshot()["profile"]
-        self.assertEqual(profile["name"], "gan")
+        self.assertEqual(profile["name"], "gan2")
         self.assertEqual(profile["width"], 320)
         self.assertEqual(profile["height"], 180)
         self.assertEqual(profile["fps"], 10)
@@ -226,7 +227,7 @@ class HudTests(unittest.TestCase):
                 (120, 90, 320, 180), (150, 110, 320, 180)):
             with self.subTest(cap=cap):
                 profile = {
-                    "name": "gan", "width": width, "height": height,
+                    "name": "gan2", "width": width, "height": height,
                     "fps": 10, "generation": cap,
                     "target_bitrate_kbps": target, "link_cap_kbps": cap,
                 }
@@ -241,7 +242,7 @@ class HudTests(unittest.TestCase):
             35, 4, 256, 144, 8, 6,
             target_bitrate_kbps=45, link_cap_kbps=60))
         profile = stats.snapshot()["profile"]
-        self.assertEqual(profile["name"], "gan")
+        self.assertEqual(profile["name"], "gan2")
         self.assertEqual(profile["width"], 256)
         self.assertEqual(profile["height"], 144)
         self.assertEqual(profile["fps"], 8)
@@ -252,7 +253,7 @@ class HudTests(unittest.TestCase):
 
     def test_gan_360p_source_keeps_native_720p_output(self):
         profile = {
-            "name": "gan", "width": 640, "height": 360,
+            "name": "gan2", "width": 640, "height": 360,
             "fps": 10, "generation": 1,
         }
         self.assertEqual(HUD.gan_profile_sizes(profile),
@@ -312,15 +313,15 @@ class HudTests(unittest.TestCase):
     def test_gan_generation_switches_both_input_directions(self):
         gate = HUD.ProfileSwitchGate()
         gan_256 = {
-            "name": "gan", "width": 256, "height": 144,
+            "name": "gan2", "width": 256, "height": 144,
             "fps": 10, "generation": 8,
         }
         gan_320 = {
-            "name": "gan", "width": 320, "height": 180,
+            "name": "gan2", "width": 320, "height": 180,
             "fps": 8, "generation": 9,
         }
         gan_256_again = {
-            "name": "gan", "width": 256, "height": 144,
+            "name": "gan2", "width": 256, "height": 144,
             "fps": 10, "generation": 10,
         }
         self.assertEqual(HUD.gan_profile_sizes(gan_256),
@@ -329,7 +330,6 @@ class HudTests(unittest.TestCase):
                          ((320, 180), (640, 360), (640, 360)))
         self.assertNotEqual(HUD.gan_profile_signature(gan_256),
                             HUD.gan_profile_signature(gan_320))
-
         first_idr = rtp_profile_packet(60, 4, 256, 144, 10, 8)
         self.assertEqual(gate.feed(first_idr, gan_256), (8, [first_idr]))
         pending_320 = rtp_profile_packet(61, 4, 320, 180, 8, 9, nal_type=1)
@@ -338,6 +338,19 @@ class HudTests(unittest.TestCase):
         self.assertEqual(gate.feed(idr_320, gan_320), (9, [idr_320]))
         idr_256 = rtp_profile_packet(63, 4, 256, 144, 10, 10)
         self.assertEqual(gate.feed(idr_256, gan_256_again), (10, [idr_256]))
+
+    def test_gan4_profile_uses_native_x4_720p_output(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(
+            64, 10, 320, 180, 8, 3,
+            target_bitrate_kbps=90, link_cap_kbps=120))
+        profile = stats.snapshot()["profile"]
+        self.assertEqual(profile["name"], "gan4")
+        self.assertEqual(HUD.gan_profile_sizes(profile),
+                         ((320, 180), (1280, 720), (1280, 720)))
+        gan2 = dict(profile, name="gan2")
+        self.assertNotEqual(HUD.gan_profile_signature(profile),
+                            HUD.gan_profile_signature(gan2))
 
     def test_profile_gate_restarts_on_geometry_change_after_sender_restart(self):
         gate = HUD.ProfileSwitchGate()
@@ -652,6 +665,57 @@ class HudTests(unittest.TestCase):
     def test_window_dimensions_follow_rotation(self):
         self.assertEqual(HUD.display_dimensions(320, 180, "ccw90", 3), (540, 960))
         self.assertEqual(HUD.display_dimensions(320, 180, "none", 3), (960, 540))
+
+
+class AsyncInitializationTests(unittest.TestCase):
+    def test_slow_initialization_does_not_block_request(self):
+        gate = threading.Event()
+        disposed = []
+        loader = HUD.LatestOnlyInitializer(disposed.append)
+        before = time.monotonic()
+        loader.request("a", lambda: (gate.wait(2), "value")[1])
+        self.assertLess(time.monotonic() - before, 0.1)
+        self.assertIsNone(loader.poll("a"))
+        gate.set()
+        self.assertTrue(wait_for(lambda: loader._result is not None))
+        self.assertEqual(loader.poll("a"), ("a", "value", None))
+        loader.close()
+
+    def test_changed_profile_discards_old_result_without_parallel_build(self):
+        gate = threading.Event()
+        disposed, calls = [], []
+        loader = HUD.LatestOnlyInitializer(disposed.append)
+        loader.request("a", lambda: (calls.append("a"), gate.wait(2), "old")[2])
+        self.assertTrue(wait_for(lambda: calls == ["a"]))
+        loader.request("b", lambda: calls.append("b"))
+        self.assertEqual(calls, ["a"])
+        gate.set()
+        self.assertTrue(wait_for(lambda: disposed == ["old"]))
+        self.assertIsNone(loader.poll("b"))
+        self.assertTrue(wait_for(lambda: not loader._thread.is_alive()))
+        loader.request("b", lambda: "new")
+        self.assertTrue(wait_for(lambda: loader._result is not None))
+        self.assertEqual(loader.poll("b"), ("b", "new", None))
+        loader.close()
+
+    def test_failure_is_delivered_explicitly(self):
+        def fail():
+            raise RuntimeError("missing model")
+        loader = HUD.LatestOnlyInitializer(lambda result: None)
+        loader.request("a", fail)
+        self.assertTrue(wait_for(lambda: loader._result is not None))
+        self.assertIsInstance(loader.poll("a")[2], RuntimeError)
+        loader.close()
+
+    def test_exit_during_initialization_discards_result(self):
+        gate = threading.Event()
+        disposed = []
+        loader = HUD.LatestOnlyInitializer(disposed.append)
+        loader.request("a", lambda: (gate.wait(2), "old")[1])
+        loader.close()
+        gate.set()
+        self.assertTrue(wait_for(lambda: disposed == ["old"]))
+        self.assertIsNone(loader.poll("a"))
 
 
 if __name__ == "__main__":

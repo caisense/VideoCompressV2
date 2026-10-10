@@ -18,6 +18,7 @@ from tools.full_frame_enhancer import (
     EnhancementDiagnostics,
     FullFrameEnhancer,
     LatestOnlyEnhancerWorker,
+    ProcessFullFrameEnhancer,
 )
 
 
@@ -76,6 +77,42 @@ def wait_for(predicate, timeout: float = 2.0) -> bool:
 
 
 class FullFrameEnhancerTests(unittest.TestCase):
+    def test_process_enhancer_runs_and_closes(self):
+        enhancer = ProcessFullFrameEnhancer(
+            backend="none", input_size=(8, 8), native_size=(16, 16),
+            output_size=(16, 16), warmup=0)
+        try:
+            output, diagnostics = enhancer.enhance_with_diagnostics(
+                np.zeros((8, 8, 3), dtype=np.uint8))
+            self.assertEqual(output.shape, (16, 16, 3))
+            self.assertEqual(enhancer.provider, "Lanczos4")
+            self.assertEqual(diagnostics.postprocess_mode, "LANCZOS4")
+        finally:
+            enhancer.close()
+        self.assertFalse(enhancer._process.is_alive())
+
+    def test_process_initialization_error_is_explicit(self):
+        with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+            ProcessFullFrameEnhancer(backend="invalid")
+
+    def test_process_worker_without_debug_log(self):
+        enhancer = ProcessFullFrameEnhancer(
+            backend="none", input_size=(8, 8), native_size=(16, 16),
+            output_size=(16, 16), warmup=0)
+        worker = LatestOnlyEnhancerWorker(enhancer, max_latency_ms=1000)
+        try:
+            self.assertIsNone(worker.debug_handle)
+            self.assertTrue(worker.submit(
+                np.zeros((8, 8, 3), dtype=np.uint8), 1))
+            self.assertTrue(wait_for(lambda: worker.snapshot()["completed"] == 1))
+            output = worker.poll_output()
+            self.assertIsNotNone(output)
+            self.assertEqual(output.frame.shape, (16, 16, 3))
+            self.assertEqual(worker.snapshot()["inference_errors"], 0)
+        finally:
+            worker.stop()
+        self.assertFalse(enhancer._process.is_alive())
+
     @staticmethod
     def _esrgan_without_loading_model() -> FullFrameEnhancer:
         enhancer = object.__new__(FullFrameEnhancer)

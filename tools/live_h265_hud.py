@@ -22,25 +22,87 @@ import numpy as np
 _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from full_frame_enhancer import FullFrameEnhancer, LatestOnlyEnhancerWorker
+from full_frame_enhancer import LatestOnlyEnhancerWorker, ProcessFullFrameEnhancer
 from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
 DEFAULT_VIDEO_PORT = 5004
 
 
+class LatestOnlyInitializer:
+    """One background initialization; discard resources for obsolete profiles."""
+
+    def __init__(self, dispose):
+        self._dispose = dispose
+        self._lock = threading.Lock()
+        self._thread = None
+        self._desired = None
+        self._result = None
+        self._closed = False
+
+    def request(self, key, factory):
+        with self._lock:
+            if self._closed:
+                return
+            self._desired = key
+            if self._thread is not None and self._thread.is_alive():
+                return
+            if self._result is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._run, args=(key, factory),
+                name="gan-initialize", daemon=True)
+            self._thread.start()
+
+    def _run(self, key, factory):
+        value, error = None, None
+        try:
+            value = factory()
+        except Exception as caught:
+            error = caught
+        with self._lock:
+            accepted = not self._closed and self._desired == key
+            if accepted:
+                self._result = (key, value, error)
+        if not accepted and value is not None:
+            self._dispose(value)
+
+    def poll(self, key):
+        with self._lock:
+            result = self._result
+            self._result = None
+        if result is not None and result[0] != key:
+            if result[1] is not None:
+                self._dispose(result[1])
+            return None
+        return result
+
+    def cancel(self):
+        with self._lock:
+            self._desired = None
+            result, self._result = self._result, None
+        if result is not None and result[1] is not None:
+            self._dispose(result[1])
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+        self.cancel()
+
+
 def gan_profile_sizes(profile: dict) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    """Return source, x2-native, and presentation sizes for the GAN profile."""
+    """Return source, AI-native, and presentation sizes for a GAN profile."""
     width = int(profile.get("width", 0))
     height = int(profile.get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError(f"GAN profile has invalid input size {width}x{height}")
-    native_size = (width * 2, height * 2)
-    output_size = native_size if (width, height) == (640, 360) else (640, 360)
+    scale = 4 if profile.get("name") == "gan4" else 2
+    native_size = (width * scale, height * scale)
+    output_size = native_size if native_size == (1280, 720) else (640, 360)
     return (width, height), native_size, output_size
 
 
-def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int]:
+def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int, int]:
     """Identity of an enhancer/decoder generation, including its cadence."""
     input_size, _, _ = gan_profile_sizes(profile)
     return (
@@ -48,6 +110,7 @@ def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int]:
         input_size[0],
         input_size[1],
         int(profile.get("fps", 0)),
+        4 if profile.get("name") == "gan4" else 2,
     )
 
 
@@ -162,8 +225,9 @@ class RtpStats:
         if len(payload) < 8 or payload[0] != 1:
             return None
         names = {
-            0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan",
+            0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan2",
             5: "rate80", 6: "rate100", 7: "rate120", 8: "rate180", 9: "rate200",
+            10: "gan4",
         }
         name = names.get(payload[1], "unknown")
         target_bitrate_kbps = None
@@ -171,7 +235,7 @@ class RtpStats:
         # GAN v1 originally had an eight-byte core.  The current sender then
         # appended TARGET plus two reserved bytes; new senders reuse those
         # final two bytes as CAP without increasing the 12-byte tail layout.
-        if name == "gan":
+        if name in ("gan2", "gan4"):
             if len(payload) >= 10:
                 advertised_target = int.from_bytes(payload[8:10], "big")
                 if advertised_target > 0:
@@ -1207,6 +1271,11 @@ def main() -> int:
         default=str(Path(__file__).resolve().parents[1] / "model" / "RealESRGAN_x2_dynamic.onnx"),
         help="Real-ESRGAN x2 ONNX model; used with --gan-enhancer=esrgan",
     )
+    parser.add_argument(
+        "--gan-esrgan-x4-model",
+        default=str(Path(__file__).resolve().parents[1] / "model" / "RealESRGAN_x4plus_dynamic.onnx"),
+        help="Real-ESRGAN x4 ONNX model; selected automatically for profile gan4",
+    )
     parser.add_argument("--gan-require-cuda", action="store_true",
                         help="compatibility alias for --gan-execution-provider=cuda")
     parser.add_argument(
@@ -1360,7 +1429,7 @@ def main() -> int:
 
     def set_gan_worker(
         worker: Optional[LatestOnlyEnhancerWorker],
-        signature: Optional[Tuple[int, int, int, int]] = None,
+        signature: Optional[Tuple[int, int, int, int, int]] = None,
     ) -> None:
         with gan_worker_lock:
             gan_worker_holder["worker"] = worker
@@ -1390,7 +1459,8 @@ def main() -> int:
                     decoder_state["profile_key"] == profile_switch_key(profile))
 
     gan_worker: Optional[LatestOnlyEnhancerWorker] = None
-    gan_worker_signature: Optional[Tuple[int, int, int, int]] = None
+    gan_worker_signature: Optional[Tuple[int, int, int, int, int]] = None
+    gan_initializer = LatestOnlyInitializer(lambda result: result["worker"].stop())
 
     def ensure_gan_worker(profile: dict) -> bool:
         nonlocal gan_worker, gan_worker_signature, gan_controller
@@ -1402,9 +1472,14 @@ def main() -> int:
             return False
         if gan_worker is not None:
             return gan_worker_signature == signature
+        if profile.get("name") == "gan4" and args.gan_enhancer != "esrgan":
+            print("GAN4 requires --gan-enhancer=esrgan and a native x4 model", file=sys.stderr)
+            return False
         model_path = (
             args.gan_esrnet_model
             if args.gan_enhancer == "esrnet"
+            else args.gan_esrgan_x4_model
+            if profile.get("name") == "gan4"
             else args.gan_esrgan_model
         )
         try:
@@ -1417,15 +1492,16 @@ def main() -> int:
         except ValueError as error:
             print(f"GAN latency budget invalid: {error}", file=sys.stderr)
             return False
-        try:
+        def build_worker():
+            init_started = time.perf_counter()
             print(
                 f"GAN WARMING: backend={args.gan_enhancer} "
                 f"input={input_size[0]}x{input_size[1]} "
                 f"warmup={args.gan_warmup}",
                 flush=True,
             )
-            enhancer = FullFrameEnhancer(
-                args.gan_enhancer,
+            enhancer = ProcessFullFrameEnhancer(
+                backend=args.gan_enhancer,
                 model_path=model_path,
                 input_size=input_size,
                 native_size=native_size,
@@ -1436,14 +1512,27 @@ def main() -> int:
                 threads=args.gan_threads,
                 warmup=args.gan_warmup,
             )
-            worker = LatestOnlyEnhancerWorker(
-                enhancer,
-                max_latency_ms=output_budget_ms,
-                debug_log=args.gan_debug_log,
-            )
-        except (OSError, RuntimeError, ValueError) as error:
+            try:
+                worker = LatestOnlyEnhancerWorker(
+                    enhancer,
+                    max_latency_ms=output_budget_ms,
+                    debug_log=args.gan_debug_log,
+                )
+            except Exception:
+                enhancer.close()
+                raise
+            return {"worker": worker,
+                    "startup_ms": (time.perf_counter() - init_started) * 1000.0}
+
+        initialized = gan_initializer.poll(signature)
+        if initialized is None:
+            gan_initializer.request(signature, build_worker)
+            return True
+        _, result, error = initialized
+        if error is not None:
             print(f"GAN enhancer initialization failed: {error}", file=sys.stderr)
             return False
+        worker = result["worker"]
         gan_worker = worker
         gan_worker_signature = signature
         gan_controller = GanFallbackController(
@@ -1462,6 +1551,7 @@ def main() -> int:
         )
         print(
             f"GAN READY: full-frame enhancer ready: backend={worker.backend} "
+            f"startup_ms={result['startup_ms']:.0f} "
             f"provider={worker.provider} precision={worker.execution_precision} "
             f"input={input_size[0]}x{input_size[1]} "
             f"native={native_size[0]}x{native_size[1]} "
@@ -1478,6 +1568,7 @@ def main() -> int:
         nonlocal gan_worker, gan_worker_signature, gan_controller
         worker = gan_worker
         controller = gan_controller
+        gan_initializer.cancel()
         gan_worker = None
         gan_worker_signature = None
         gan_controller = None
@@ -1628,6 +1719,9 @@ def main() -> int:
     current_source_sequence: Optional[int] = None
     current_mode = "normal"
     gan_display_fallback = False
+    gan_display_signature = None
+    first_video_logged = False
+    exit_code = 0
     try:
         while not stopping.is_set():
             now = time.monotonic()
@@ -1638,7 +1732,7 @@ def main() -> int:
             values = stats.snapshot()
             profile = values["profile"]
             is_rebuild = profile is not None and profile["name"] == "rebuild"
-            is_gan = profile is not None and profile["name"] == "gan"
+            is_gan = profile is not None and profile["name"] in ("gan2", "gan4")
             requested_mode = "gan" if is_gan else ("rebuild" if is_rebuild else "normal")
             if current_mode != requested_mode:
                 previous_mode = current_mode
@@ -1648,6 +1742,7 @@ def main() -> int:
                 next_gan_present = now
                 current_mode = requested_mode
                 gan_display_fallback = False
+                gan_display_signature = None
                 if previous_mode == "rebuild" and not is_rebuild:
                     disable_rebuild_components()
                 if previous_mode == "gan" and not is_gan:
@@ -1673,7 +1768,9 @@ def main() -> int:
                 needs_gan_worker = (
                     gan_worker is None or gan_worker_signature != wanted_gan_signature
                 )
-                if gan_worker_signature != wanted_gan_signature:
+                if gan_display_signature != wanted_gan_signature:
+                    gan_initializer.cancel()
+                    gan_display_signature = wanted_gan_signature
                     current_canvas = None
                     current_source_sequence = None
                     next_gan_present = now
@@ -1682,6 +1779,7 @@ def main() -> int:
                     if gan_worker is not None:
                         disable_gan_worker()
                     if not ensure_gan_worker(profile):
+                        exit_code = 1
                         stopping.set()
                         break
 
@@ -1820,6 +1918,23 @@ def main() -> int:
                             int(profile["generation"]),
                             now,
                         )
+            elif (is_gan and frame is not None and source_sequence is not None and
+                  gan_profile_decoder_ready(profile) and
+                  (frame.shape[1], frame.shape[0]) ==
+                  (int(profile["width"]), int(profile["height"]))):
+                # Model construction/engine building runs off the UI thread.
+                # Present only the latest decoded frame while it is pending.
+                if current_canvas is None or current_source_sequence != source_sequence:
+                    current_canvas = gan_lanczos_fallback(
+                        frame, args.rotate, gan_profile_sizes(profile)[2])
+                    current_updated = updated
+                    current_source_sequence = source_sequence
+                    gan_display_fallback = True
+                if now >= next_gan_present:
+                    interval = 1.0 / (args.gan_display_fps or float(profile["fps"]))
+                    next_gan_present = now + interval
+                    presentation.present(source_sequence, "GAN-WARMING-LANCZOS",
+                                         int(profile["generation"]), now)
             elif is_rebuild and now >= next_rebuild_present:
                 interval = 1.0 / args.rebuild_fps
                 skipped = max(0, int((now - next_rebuild_present) / interval))
@@ -1870,6 +1985,16 @@ def main() -> int:
                 else {}
             )
             presentation_values = presentation.snapshot()
+            if current_canvas is not None and not first_video_logged:
+                print(
+                    f"VIDEO FIRST FRAME: startup_ms="
+                    f"{(time.monotonic() - started_at) * 1000.0:.0f} "
+                    f"display={current_canvas.shape[1]}x{current_canvas.shape[0]} "
+                    f"rotate={args.rotate} "
+                    f"stage={'GAN-WARMING-LANCZOS' if is_gan and worker is None else current_mode}",
+                    flush=True,
+                )
+                first_video_logged = True
             if args.headless:
                 # A headless report can fall between two rebuild presentation
                 # ticks (12 fps).  Refresh the synchronized PTS here so the
@@ -1919,6 +2044,7 @@ def main() -> int:
                             f" source_fps={profile['fps']}"
                             f" target_kbps={gan_target_kbps_text(profile)}"
                             f" enhanced_fps={gan_values['rolling_1s_fps']:.1f}"
+                            f" stage={'GAN-WARMING-LANCZOS' if worker is None else 'GAN'}"
                             f" display_fps={presentation_values['fps']:.1f}"
                             f" enhancer={gan_values['backend']}"
                             f" provider={gan_values['provider']}"
@@ -2046,6 +2172,7 @@ def main() -> int:
             elif is_gan:
                 input_size, native_size, output_size = gan_profile_sizes(profile)
                 output_backend = (
+                    "GAN WARMING / Lanczos4 (not AI output)" if worker is None else
                     "FALLBACK / Lanczos4" if gan_display_fallback else
                     f"{gan_values['backend'].upper()} / {gan_values['provider']} / "
                     f"{gan_values['execution_precision']}"
@@ -2139,6 +2266,7 @@ def main() -> int:
                 break
     finally:
         stopping.set()
+        gan_initializer.close()
         receiver.close()
         disable_rebuild_components()
         disable_gan_worker()
@@ -2146,7 +2274,7 @@ def main() -> int:
             stop_decoder_locked()
         if not args.headless:
             cv2.destroyAllWindows()
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

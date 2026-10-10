@@ -160,11 +160,12 @@ private:
 
 void printUsage(const char *program) {
     std::fprintf(stderr,
-        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan]\n"
+        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan2|gan4]\n"
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
-        "          [--gan-link-cap-kbps=60|100|120|150|300 --gan-fps=8|10|12 --gan-inference-fps=0]\n"
+        "          [--gan-link-cap-kbps=60|70|80|100|120|150|300 --gan-fps=6|8|10|12 --gan-inference-fps=0]\n"
+        "          [--gan-native-720p=on|off (gan2:640x360, gan4:320x180)]\n"
         "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
         "          [--gan-gop-seconds=1|2|4 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
         "          [--gan-intra-refresh=on|off --gan-refresh-mode=row|col --gan-refresh-num=N]\n"
@@ -230,7 +231,7 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
         return;
     }
     std::fprintf(stderr,
-        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan|image|video > %s\n",
+        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|image|video > %s\n",
         path.c_str());
     std::string pending;
     while (running->load()) {
@@ -395,7 +396,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<RebuildSender> rebuild_sender;
     std::unique_ptr<DetectionEventSender> event_sender;
     const bool gan_mode = config.mode == PIPELINE_GAN ||
-                          config.rate_profile == RATE_PROFILE_GAN;
+                          isGanRateProfile(config.rate_profile);
     if (!gan_mode) {
         snapshot_sender.reset(new SnapshotSender(config.transport.snapshot,
             config.transport.udp_host, config.transport.mtu, video_pacer));
@@ -545,8 +546,8 @@ int main(int argc, char **argv) {
             uint64_t next_gan_inference_pts_us = 0;
             while (running.load() && inference_queue.pop(&frame)) {
                 const AppConfig live = runtimeConfig();
-                const bool gan_active = static_cast<RateProfile>(active_profile.load()) ==
-                                        RATE_PROFILE_GAN;
+                const bool gan_active = isGanRateProfile(
+                    static_cast<RateProfile>(active_profile.load()));
                 if (gan_active && live.gan.inference_fps > 0) {
                     const uint64_t interval_us = static_cast<uint64_t>(1000000 /
                         live.gan.inference_fps);
@@ -738,7 +739,7 @@ int main(int argc, char **argv) {
                 active_transport_mode.store(static_cast<int>(TRANSPORT_MODE_VIDEO));
                 const unsigned int generation = profile_generation.fetch_add(1) + 1;
                 if (rebuild_sender) rebuild_sender->setEnabled(desired == RATE_PROFILE_REBUILD);
-                if (event_sender) event_sender->setEnabled(desired != RATE_PROFILE_GAN &&
+                if (event_sender) event_sender->setEnabled(!isGanRateProfile(desired) &&
                                                             next.transport.event.enabled);
                 encoded_frame_count = 0;
                 rtp_sdp_written = next.transport.rtp_sdp_path.empty();
@@ -792,7 +793,7 @@ int main(int argc, char **argv) {
             // GDR distributes recovery over P frames. Keep explicit IDR for
             // receiver recovery, but do not layer a fixed full-IDR cadence on
             // top of an enabled gradual refresh experiment.
-            const bool gan_gdr = live.rate_profile == RATE_PROFILE_GAN && live.encoder.intra_refresh;
+            const bool gan_gdr = isGanRateProfile(live.rate_profile) && live.encoder.intra_refresh;
             const bool periodic_idr = !gan_gdr && encoded_frame_count > 0 &&
                 encoded_frame_count % static_cast<uint64_t>(live.encoder.gop) == 0;
             const bool recovery_idr = sender.needsKeyFrame();
@@ -810,7 +811,7 @@ int main(int argc, char **argv) {
             if (live.mode != PIPELINE_BASELINE) {
                 const RoiRegionMerger merger(live.roi);
                 regions = merger.merge(map);
-                if (live.rate_profile == RATE_PROFILE_GAN && expected_key_frame &&
+                if (isGanRateProfile(live.rate_profile) && expected_key_frame &&
                     live.gan.idr_roi_scale_percent < 100) {
                     for (size_t i = 0; i < regions.size(); ++i) {
                         if (regions[i].delta_qp < 0) {
@@ -871,11 +872,11 @@ int main(int argc, char **argv) {
             // Carry it in the existing RO RTP profile extension only for GAN;
             // zero keeps every other profile on its original metadata layout.
             transport_unit.stream_profile.target_bitrate_kbps =
-                live.rate_profile == RATE_PROFILE_GAN
+                isGanRateProfile(live.rate_profile)
                     ? static_cast<uint16_t>(live.gan.video_bitrate_kbps)
                     : 0U;
             transport_unit.stream_profile.link_cap_kbps =
-                live.rate_profile == RATE_PROFILE_GAN
+                isGanRateProfile(live.rate_profile)
                     ? static_cast<uint16_t>(live.gan.link_cap_kbps)
                     : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {

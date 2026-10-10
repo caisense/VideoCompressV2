@@ -25,7 +25,7 @@ EncoderConfig::EncoderConfig()
 GanConfig::GanConfig()
     : fps(10), inference_fps(0), link_cap_kbps(100), video_bitrate_kbps(75),
       max_inference_latency_ms(100), gop_seconds(2), super_frame_policy("current"),
-      idr_roi_scale_percent(100) {}
+      idr_roi_scale_percent(100), native_720p(false) {}
 
 SnapshotConfig::SnapshotConfig()
     // Balanced 60 kbps evidence defaults: cap payload bytes before they enter
@@ -93,6 +93,8 @@ AppConfig::AppConfig()
 bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset) {
     static const GanBandwidthPreset kPresets[] = {
         {60, 256, 144, 8, 45, 50},
+        {70, 640, 360, 8, 50, 59},
+        {80, 640, 360, 8, 57, 68},
         {100, 256, 144, 10, 75, 85},
         {120, 320, 180, 8, 90, 100},
         {150, 320, 180, 10, 110, 125},
@@ -257,17 +259,26 @@ void applyRateProfileValues(RateProfile profile, AppConfig *config) {
         config->transport.send_max_latency_ms = 250;
         return;
     }
-    if (profile == RATE_PROFILE_GAN) {
-        config->rate_profile = RATE_PROFILE_GAN;
+    if (isGanRateProfile(profile)) {
+        config->rate_profile = profile;
         config->mode = PIPELINE_GAN;
         config->transport.mode = TRANSPORT_MODE_VIDEO;
         GanBandwidthPreset preset;
         if (!ganBandwidthPreset(config->gan.link_cap_kbps, &preset)) return;
+        if (profile == RATE_PROFILE_GAN4 && !config->gan.native_720p &&
+            (preset.source_width != 320 || preset.source_height != 180)) {
+            config->gan.link_cap_kbps = 120;
+            config->gan.fps = 8;
+            config->gan.video_bitrate_kbps = 90;
+            if (!ganBandwidthPreset(config->gan.link_cap_kbps, &preset)) return;
+        }
         // GAN is deliberately a standards-compliant H.265 stream.  The
         // receiver may enhance the decoded full frame, but no RB/1, RSNP, or
         // ROEV packet is part of this profile.
-        config->encoder.width = preset.source_width;
-        config->encoder.height = preset.source_height;
+        config->encoder.width = config->gan.native_720p ?
+            (profile == RATE_PROFILE_GAN4 ? 320 : 640) : preset.source_width;
+        config->encoder.height = config->gan.native_720p ?
+            (profile == RATE_PROFILE_GAN4 ? 180 : 360) : preset.source_height;
         config->encoder.fps = config->gan.fps;
         config->encoder.target_bitrate_bps = config->gan.video_bitrate_kbps * 1000;
         config->encoder.gop = config->gan.fps * config->gan.gop_seconds;
@@ -312,12 +323,13 @@ const char *rateProfileName(RateProfile profile) {
     case RATE_PROFILE_RATE150: return "rate150";
     case RATE_PROFILE_RATE300: return "rate300";
     case RATE_PROFILE_REBUILD: return "rebuild";
-    case RATE_PROFILE_GAN: return "gan";
+    case RATE_PROFILE_GAN2: return "gan2";
     case RATE_PROFILE_RATE80: return "rate80";
     case RATE_PROFILE_RATE100: return "rate100";
     case RATE_PROFILE_RATE120: return "rate120";
     case RATE_PROFILE_RATE180: return "rate180";
     case RATE_PROFILE_RATE200: return "rate200";
+    case RATE_PROFILE_GAN4: return "gan4";
     }
     return "unknown";
 }
@@ -333,9 +345,14 @@ bool parseRateProfile(const std::string &name, RateProfile *profile) {
     else if (name == "rate200") *profile = RATE_PROFILE_RATE200;
     else if (name == "rate300") *profile = RATE_PROFILE_RATE300;
     else if (name == "rebuild") *profile = RATE_PROFILE_REBUILD;
-    else if (name == "gan") *profile = RATE_PROFILE_GAN;
+    else if (name == "gan" || name == "gan2") *profile = RATE_PROFILE_GAN2;
+    else if (name == "gan4") *profile = RATE_PROFILE_GAN4;
     else return false;
     return true;
+}
+
+bool isGanRateProfile(RateProfile profile) {
+    return profile == RATE_PROFILE_GAN2 || profile == RATE_PROFILE_GAN4;
 }
 
 const char *transportModeName(TransportMode mode) {
@@ -356,8 +373,28 @@ void applyRateProfile(RateProfile profile, AppConfig *config) {
 
 bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error) {
     if (!config) return false;
+    // Resolve the optional geometry contract before atomic profile application,
+    // so its position relative to --rate-profile and --gan-link-cap is immaterial.
+    for (int i = 1; i < argc; ++i) {
+        std::string key, value;
+        if (splitOption(argv[i], &key, &value) && key == "gan-native-720p") {
+            if (!parseBool(value, &config->gan.native_720p)) {
+                if (error) *error = "gan-native-720p must be on or off";
+                return false;
+            }
+        }
+    }
     bool gan_fps_explicit = false;
     bool gan_video_bitrate_explicit = false;
+    bool gan_link_cap_explicit = false;
+    const auto apply_gan_profile = [&](RateProfile profile) {
+        if (profile == RATE_PROFILE_GAN4 && !gan_link_cap_explicit) {
+            config->gan.link_cap_kbps = 120;
+            if (!gan_fps_explicit) config->gan.fps = 8;
+            if (!gan_video_bitrate_explicit) config->gan.video_bitrate_kbps = 90;
+        }
+        applyRateProfile(profile, config);
+    };
     for (int i = 1; i < argc; ++i) {
         std::string key, value;
         if (!splitOption(argv[i], &key, &value)) {
@@ -388,10 +425,20 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
             else if (value == "segmentation") config->mode = PIPELINE_SEGMENTATION_ROI;
             else if (value == "rebuild") {
                 applyRateProfile(RATE_PROFILE_REBUILD, config);
-            } else if (value == "gan") {
-                applyRateProfile(RATE_PROFILE_GAN, config);
+            } else if (value == "gan" || value == "gan2") {
+                apply_gan_profile(RATE_PROFILE_GAN2);
+            } else if (value == "gan4") {
+                GanBandwidthPreset selected_preset;
+                if (gan_link_cap_explicit && !config->gan.native_720p &&
+                    (!ganBandwidthPreset(config->gan.link_cap_kbps, &selected_preset) ||
+                     selected_preset.source_width != 320 ||
+                     selected_preset.source_height != 180)) {
+                    if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                    return false;
+                }
+                apply_gan_profile(RATE_PROFILE_GAN4);
             } else {
-                if (error) *error = "mode must be baseline, bbox, segmentation, rebuild, or gan";
+                if (error) *error = "mode must be baseline, bbox, segmentation, rebuild, gan2, or gan4";
                 return false;
             }
         } else if (key == "preview" && parseBool(value, &boolean)) config->preview = boolean;
@@ -415,21 +462,34 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
                     else if (value == "medium") *error = "medium was renamed to rate150";
                     else if (value == "high") *error = "high was renamed to rate300";
                     else *error = "rate profile must be rate60, rate80, rate100, rate120, "
-                                  "rate150, rate180, rate200, rate300, rebuild, or gan";
+                                  "rate150, rate180, rate200, rate300, rebuild, gan2, or gan4";
                 }
                 return false;
             }
-            applyRateProfile(profile, config);
+            if (profile == RATE_PROFILE_GAN4 && gan_link_cap_explicit &&
+                !config->gan.native_720p) {
+                GanBandwidthPreset selected_preset;
+                if (!ganBandwidthPreset(config->gan.link_cap_kbps, &selected_preset) ||
+                    selected_preset.source_width != 320 ||
+                    selected_preset.source_height != 180) {
+                    if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                    return false;
+                }
+            }
+            apply_gan_profile(profile);
         }
         else if (key == "encoder-width" && parseInt(value, &integer)) config->encoder.width = integer;
         else if (key == "encoder-height" && parseInt(value, &integer)) config->encoder.height = integer;
         else if (key == "fps" && parseInt(value, &integer)) config->encoder.fps = integer;
         else if (key == "target-bitrate" && parseInt(value, &integer)) config->encoder.target_bitrate_bps = integer;
         else if (key == "gop" && parseInt(value, &integer)) config->encoder.gop = integer;
+        else if (key == "gan-native-720p") {
+            // Validated and resolved in the geometry pre-pass above.
+        }
         else if (key == "gan-fps" && parseInt(value, &integer)) {
             gan_fps_explicit = true;
             config->gan.fps = integer;
-            if (config->rate_profile == RATE_PROFILE_GAN) {
+            if (isGanRateProfile(config->rate_profile)) {
                 config->encoder.fps = integer;
                 config->encoder.gop = integer * config->gan.gop_seconds;
             }
@@ -440,22 +500,28 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "gan-link-cap-kbps") {
             GanBandwidthPreset preset;
             if (!parseInt(value, &integer) || !ganBandwidthPreset(integer, &preset)) {
-                if (error) *error = "gan link cap must be 60, 100, 120, 150, or 300 kbps";
+                if (error) *error = "gan link cap must be 60, 70, 80, 100, 120, 150, or 300 kbps";
                 return false;
             }
             config->gan.link_cap_kbps = integer;
+            gan_link_cap_explicit = true;
             if (!gan_fps_explicit) config->gan.fps = preset.default_fps;
             if (!gan_video_bitrate_explicit) {
                 config->gan.video_bitrate_kbps = preset.default_video_bitrate_kbps;
             }
-            if (config->rate_profile == RATE_PROFILE_GAN) {
-                applyRateProfile(RATE_PROFILE_GAN, config);
+            if (config->rate_profile == RATE_PROFILE_GAN4 && !config->gan.native_720p &&
+                (preset.source_width != 320 || preset.source_height != 180)) {
+                if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                return false;
+            }
+            if (isGanRateProfile(config->rate_profile)) {
+                applyRateProfile(config->rate_profile, config);
             }
         }
         else if (key == "gan-video-bitrate-kbps" && parseInt(value, &integer)) {
             gan_video_bitrate_explicit = true;
             config->gan.video_bitrate_kbps = integer;
-            if (config->rate_profile == RATE_PROFILE_GAN) {
+            if (isGanRateProfile(config->rate_profile)) {
                 config->encoder.target_bitrate_bps = integer * 1000;
             }
         }
@@ -464,7 +530,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         }
         else if (key == "gan-gop-seconds" && parseInt(value, &integer)) {
             config->gan.gop_seconds = integer;
-            if (config->rate_profile == RATE_PROFILE_GAN) config->encoder.gop = config->gan.fps * integer;
+            if (isGanRateProfile(config->rate_profile)) config->encoder.gop = config->gan.fps * integer;
         }
         else if (key == "gan-debreath" && parseBool(value, &boolean)) config->encoder.debreath = boolean;
         else if (key == "gan-debreath-strength" && parseInt(value, &integer)) config->encoder.debreath_strength = integer;
@@ -626,18 +692,22 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
 
     GanBandwidthPreset gan_preset;
     const bool gan_preset_valid = ganBandwidthPreset(config->gan.link_cap_kbps, &gan_preset);
-    if (config->rate_profile == RATE_PROFILE_GAN &&
+    if (isGanRateProfile(config->rate_profile) &&
         (!gan_preset_valid || config->mode != PIPELINE_GAN ||
+         (config->rate_profile == RATE_PROFILE_GAN4 && !config->gan.native_720p &&
+          (gan_preset.source_width != 320 || gan_preset.source_height != 180)) ||
          config->transport.mode != TRANSPORT_MODE_VIDEO ||
-         config->encoder.width != gan_preset.source_width ||
-         config->encoder.height != gan_preset.source_height ||
+         config->encoder.width != (config->gan.native_720p ?
+             (config->rate_profile == RATE_PROFILE_GAN4 ? 320 : 640) : gan_preset.source_width) ||
+         config->encoder.height != (config->gan.native_720p ?
+             (config->rate_profile == RATE_PROFILE_GAN4 ? 180 : 360) : gan_preset.source_height) ||
          config->encoder.fps != config->gan.fps ||
          config->encoder.target_bitrate_bps != config->gan.video_bitrate_kbps * 1000 ||
          config->encoder.gop != config->gan.fps * config->gan.gop_seconds ||
          config->transport.pacing_bitrate_bps != gan_preset.link_cap_kbps * 1000 ||
          config->encoder.grayscale_encode)) {
         if (error) {
-            *error = "gan is an atomic 60|100|120|150|300 kbps H.265-only profile; "
+            *error = "gan2/gan4 are atomic H.265-only profiles (gan4 requires 320x180 input); "
                      "use --gan-link-cap-kbps/--gan-fps/--gan-video-bitrate-kbps "
                      "instead of generic encoder or pacing overrides";
         }
@@ -755,8 +825,9 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         (config->transport.mode == TRANSPORT_MODE_IMAGE && config->mode == PIPELINE_BASELINE) ||
         (config->rate_profile == RATE_PROFILE_REBUILD && config->mode == PIPELINE_BASELINE) ||
         (config->mode == PIPELINE_GAN && config->transport.mode != TRANSPORT_MODE_VIDEO) ||
-        config->gan.fps < 8 || config->gan.fps > 12 ||
-        (config->gan.fps != 8 && config->gan.fps != 10 && config->gan.fps != 12) ||
+        (config->gan.native_720p && !isGanRateProfile(config->rate_profile)) ||
+        config->gan.fps < 6 || config->gan.fps > 12 ||
+        (config->gan.fps != 6 && config->gan.fps != 8 && config->gan.fps != 10 && config->gan.fps != 12) ||
         config->gan.inference_fps < 0 || config->gan.inference_fps > 30 ||
         config->gan.max_inference_latency_ms < 1 ||
         config->gan.max_inference_latency_ms > 2000 ||

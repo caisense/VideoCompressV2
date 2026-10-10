@@ -390,7 +390,66 @@ void testCommandLineConfig() {
     CHECK(!gan.transport.event.enabled);
     CHECK(!gan.encoder.grayscale_encode);
     CHECK(std::string(roi_h265::pipelineModeName(gan.mode)) == "gan");
-    CHECK(std::string(roi_h265::rateProfileName(gan.rate_profile)) == "gan");
+    CHECK(std::string(roi_h265::rateProfileName(gan.rate_profile)) == "gan2");
+
+    char gan4_profile[] = "--rate-profile=gan4";
+    char *gan4_argv[] = {profile_app, gan4_profile};
+    AppConfig gan4;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(2, gan4_argv, &gan4, &error));
+    CHECK(gan4.mode == roi_h265::PIPELINE_GAN);
+    CHECK(gan4.rate_profile == roi_h265::RATE_PROFILE_GAN4);
+    CHECK(gan4.gan.link_cap_kbps == 120);
+    CHECK(gan4.encoder.width == 320 && gan4.encoder.height == 180);
+    CHECK(gan4.encoder.fps == 8 && gan4.gan.video_bitrate_kbps == 90);
+    CHECK(gan4.transport.pacing_bitrate_bps == 120000);
+    CHECK(std::string(roi_h265::rateProfileName(gan4.rate_profile)) == "gan4");
+
+    roi_h265::RateProfile parsed_gan = roi_h265::RATE_PROFILE_RATE60;
+    CHECK(roi_h265::parseRateProfile("gan", &parsed_gan));
+    CHECK(parsed_gan == roi_h265::RATE_PROFILE_GAN2);
+    CHECK(roi_h265::parseRateProfile("gan2", &parsed_gan));
+    CHECK(parsed_gan == roi_h265::RATE_PROFILE_GAN2);
+    CHECK(roi_h265::parseRateProfile("gan4", &parsed_gan));
+    CHECK(parsed_gan == roi_h265::RATE_PROFILE_GAN4);
+
+    char gan4_bad_cap_profile[] = "--rate-profile=gan4";
+    char gan4_bad_cap[] = "--gan-link-cap-kbps=100";
+    char *gan4_bad_cap_argv[] = {profile_app, gan4_bad_cap_profile, gan4_bad_cap};
+    AppConfig gan4_bad;
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, gan4_bad_cap_argv, &gan4_bad, &error));
+
+    // Native 720p source geometry is independent of cap and option order.
+    // Each comparison route must retain its selected physical cap and cadence.
+    const int native_caps[] = {60, 70, 80, 100, 120};
+    for (int scale = 2; scale <= 4; scale += 2) {
+        for (size_t index = 0; index < 5; ++index) {
+            std::string profile_option = scale == 2 ? "--rate-profile=gan2" : "--rate-profile=gan4";
+            std::string cap_option = "--gan-link-cap-kbps=" + std::to_string(native_caps[index]);
+            char native_option[] = "--gan-native-720p=on";
+            char fps_option[] = "--gan-fps=6";
+            for (int order = 0; order < 2; ++order) {
+                char *native_argv[] = {profile_app,
+                    order == 0 ? &profile_option[0] : &cap_option[0],
+                    order == 0 ? &cap_option[0] : &profile_option[0],
+                    fps_option, native_option};
+                AppConfig native;
+                error.clear();
+                CHECK(roi_h265::parseAppConfig(5, native_argv, &native, &error));
+                CHECK(native.encoder.width == (scale == 2 ? 640 : 320));
+                CHECK(native.encoder.height == (scale == 2 ? 360 : 180));
+                CHECK(native.encoder.fps == 6 && native.encoder.gop == 12);
+                CHECK(native.gan.link_cap_kbps == native_caps[index]);
+                CHECK(native.transport.pacing_bitrate_bps == native_caps[index] * 1000);
+                roi_h265::applyRateProfile(scale == 2 ? roi_h265::RATE_PROFILE_GAN4 :
+                                          roi_h265::RATE_PROFILE_GAN2, &native);
+                CHECK(native.encoder.width == (scale == 2 ? 320 : 640));
+                CHECK(native.encoder.height == (scale == 2 ? 180 : 360));
+                CHECK(native.transport.pacing_bitrate_bps == native_caps[index] * 1000);
+            }
+        }
+    }
 
     char *gan_100_default_argv[] = {profile_app, gan_mode};
     AppConfig gan_100_default;
