@@ -298,17 +298,29 @@ class FullFrameEnhancerTests(unittest.TestCase):
             worker.stop()
 
     def test_stale_result_is_dropped_after_inference(self) -> None:
-        worker = LatestOnlyEnhancerWorker(SlowFakeEnhancer(0.03), max_latency_ms=5)
-        frame = np.zeros((144, 256, 3), dtype=np.uint8)
-        try:
-            self.assertTrue(worker.submit(frame, 7, input_fps=10))
-            self.assertTrue(wait_for(lambda: worker.snapshot()["dropped"] >= 1))
-            values = worker.snapshot()
-            self.assertEqual(values["completed"], 0)
-            self.assertGreaterEqual(values["stale_after_infer"], 1)
-            self.assertIsNone(worker.poll_output())
-        finally:
-            worker.stop()
+        clock = mock.Mock(wraps=time)
+        clock.monotonic.return_value = 1000.0
+        fake = SlowFakeEnhancer(0)
+
+        def finish_after_deadline(frame):
+            clock.monotonic.return_value = 1000.03
+            return np.zeros((360, 640, 3), dtype=np.uint8)
+
+        fake.enhance = finish_after_deadline
+        # Advance age only inside inference: OS scheduling must not turn this
+        # into the separately tested stale-before-inference case.
+        with mock.patch.object(FFE, "time", clock):
+            worker = LatestOnlyEnhancerWorker(fake, max_latency_ms=5)
+            frame = np.zeros((144, 256, 3), dtype=np.uint8)
+            try:
+                self.assertTrue(worker.submit(frame, 7, input_fps=10, arrived_at=1000.0))
+                self.assertTrue(wait_for(lambda: worker.snapshot()["dropped"] >= 1))
+                values = worker.snapshot()
+                self.assertEqual(values["completed"], 0)
+                self.assertGreaterEqual(values["stale_after_infer"], 1)
+                self.assertIsNone(worker.poll_output())
+            finally:
+                worker.stop()
 
     def test_snapshot_reports_age_of_an_inflight_enhancement(self) -> None:
         fake = SlowFakeEnhancer(0.08)

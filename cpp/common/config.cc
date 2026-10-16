@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
 namespace roi_h265 {
 
 RoiConfig::RoiConfig()
-    : cell_size(16), background_delta_qp(12), halo_delta_qp(2),
+    : adaptive(false), weights{1.0f, 1.2f, 2.0f, 3.0f}, cell_size(16), background_delta_qp(12), halo_delta_qp(2),
       core_delta_qp(-6), edge_delta_qp(-10), occupancy_threshold(0.10f),
       erosion_radius(2), dilation_radius(3), hold_frames(3),
       max_age_frames(9), max_regions(64) {}
@@ -98,6 +99,7 @@ bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset) {
         {100, 256, 144, 10, 75, 85},
         {120, 320, 180, 8, 90, 100},
         {150, 320, 180, 10, 110, 125},
+        {180, 320, 180, 10, 145, 155},
         // 360p wire input maps to the Real-ESRGAN x2 native 720p output.
         {300, 640, 360, 10, 240, 260},
     };
@@ -146,6 +148,24 @@ bool parseBool(const std::string &text, bool *value) {
 }
 
 void applyRateProfileValues(RateProfile profile, AppConfig *config) {
+    if (isGanQualityProfile(profile)) {
+        const int cap = profile == RATE_PROFILE_GANQ60 ? 60 :
+            (profile == RATE_PROFILE_GANQ120 ? 120 : 180);
+        config->gan.link_cap_kbps = cap;
+        config->gan.native_720p = false;
+        config->gan.fps = cap == 180 ? 10 : 8;
+        config->gan.video_bitrate_kbps = cap == 60 ? 45 : (cap == 120 ? 86 : 145);
+        applyRateProfileValues(RATE_PROFILE_GAN2, config);
+        config->rate_profile = profile;
+        config->audio.enabled = false;
+        config->audio.reserve_wire_bitrate_bps = 0;
+        config->encoder.qp_min = 28;
+        config->encoder.qp_max = 32;
+        config->encoder.qp_init = 30;
+        config->encoder.qp_min_i = 28;
+        config->encoder.qp_max_i = 32;
+        return;
+    }
     if (profile == RATE_PROFILE_RATE60) {
         config->rate_profile = RATE_PROFILE_RATE60;
         config->encoder.width = 320; config->encoder.height = 180; config->encoder.fps = 10;
@@ -330,6 +350,9 @@ const char *rateProfileName(RateProfile profile) {
     case RATE_PROFILE_RATE180: return "rate180";
     case RATE_PROFILE_RATE200: return "rate200";
     case RATE_PROFILE_GAN4: return "gan4";
+    case RATE_PROFILE_GANQ60: return "ganq60";
+    case RATE_PROFILE_GANQ120: return "ganq120";
+    case RATE_PROFILE_GANQ180: return "ganq180";
     }
     return "unknown";
 }
@@ -347,12 +370,20 @@ bool parseRateProfile(const std::string &name, RateProfile *profile) {
     else if (name == "rebuild") *profile = RATE_PROFILE_REBUILD;
     else if (name == "gan" || name == "gan2") *profile = RATE_PROFILE_GAN2;
     else if (name == "gan4") *profile = RATE_PROFILE_GAN4;
+    else if (name == "ganq60") *profile = RATE_PROFILE_GANQ60;
+    else if (name == "ganq120") *profile = RATE_PROFILE_GANQ120;
+    else if (name == "ganq180") *profile = RATE_PROFILE_GANQ180;
     else return false;
     return true;
 }
 
 bool isGanRateProfile(RateProfile profile) {
-    return profile == RATE_PROFILE_GAN2 || profile == RATE_PROFILE_GAN4;
+    return profile == RATE_PROFILE_GAN2 || profile == RATE_PROFILE_GAN4 || isGanQualityProfile(profile);
+}
+
+bool isGanQualityProfile(RateProfile profile) {
+    return profile == RATE_PROFILE_GANQ60 || profile == RATE_PROFILE_GANQ120 ||
+        profile == RATE_PROFILE_GANQ180;
 }
 
 const char *transportModeName(TransportMode mode) {
@@ -385,6 +416,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         }
     }
     bool gan_fps_explicit = false;
+    const bool gan_native_requested = config->gan.native_720p;
     bool gan_video_bitrate_explicit = false;
     bool gan_link_cap_explicit = false;
     const auto apply_gan_profile = [&](RateProfile profile) {
@@ -433,7 +465,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
                     (!ganBandwidthPreset(config->gan.link_cap_kbps, &selected_preset) ||
                      selected_preset.source_width != 320 ||
                      selected_preset.source_height != 180)) {
-                    if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                    if (error) *error = "gan4 requires a 120, 150 or 180 kbps link cap";
                     return false;
                 }
                 apply_gan_profile(RATE_PROFILE_GAN4);
@@ -453,6 +485,11 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
             }
         }
         else if (key == "debug-roi" && parseBool(value, &boolean)) config->debug_roi = boolean;
+        else if (key == "adaptive-roi" && parseBool(value, &boolean)) config->roi.adaptive = boolean;
+        else if (key == "roi-weight-background" && parseFloat(value, &decimal)) config->roi.weights[0] = decimal;
+        else if (key == "roi-weight-halo" && parseFloat(value, &decimal)) config->roi.weights[1] = decimal;
+        else if (key == "roi-weight-core" && parseFloat(value, &decimal)) config->roi.weights[2] = decimal;
+        else if (key == "roi-weight-edge" && parseFloat(value, &decimal)) config->roi.weights[3] = decimal;
         else if (key == "audio" && parseBool(value, &boolean)) config->audio.enabled = boolean;
         else if (key == "rate-profile" || key == "profile") {
             RateProfile profile;
@@ -472,7 +509,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
                 if (!ganBandwidthPreset(config->gan.link_cap_kbps, &selected_preset) ||
                     selected_preset.source_width != 320 ||
                     selected_preset.source_height != 180) {
-                    if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                    if (error) *error = "gan4 requires a 120, 150 or 180 kbps link cap";
                     return false;
                 }
             }
@@ -500,7 +537,7 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "gan-link-cap-kbps") {
             GanBandwidthPreset preset;
             if (!parseInt(value, &integer) || !ganBandwidthPreset(integer, &preset)) {
-                if (error) *error = "gan link cap must be 60, 70, 80, 100, 120, 150, or 300 kbps";
+                if (error) *error = "gan link cap must be 60, 70, 80, 100, 120, 150, 180, or 300 kbps";
                 return false;
             }
             config->gan.link_cap_kbps = integer;
@@ -511,10 +548,10 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
             }
             if (config->rate_profile == RATE_PROFILE_GAN4 && !config->gan.native_720p &&
                 (preset.source_width != 320 || preset.source_height != 180)) {
-                if (error) *error = "gan4 requires a 120 or 150 kbps link cap";
+                if (error) *error = "gan4 requires a 120, 150 or 180 kbps link cap";
                 return false;
             }
-            if (isGanRateProfile(config->rate_profile)) {
+            if (isGanRateProfile(config->rate_profile) && !isGanQualityProfile(config->rate_profile)) {
                 applyRateProfile(config->rate_profile, config);
             }
         }
@@ -691,8 +728,33 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
     }
 
     GanBandwidthPreset gan_preset;
+    for (int level = 0; level < 4; ++level) {
+        if (!std::isfinite(config->roi.weights[level]) || config->roi.weights[level] <= 0 ||
+            config->roi.weights[level] > 16) {
+            if (error) *error = "ROI weights must be finite and in (0,16]";
+            return false;
+        }
+    }
+    if (isGanQualityProfile(config->rate_profile)) {
+        const int cap = config->rate_profile == RATE_PROFILE_GANQ60 ? 60 :
+            (config->rate_profile == RATE_PROFILE_GANQ120 ? 120 : 180);
+        const EncoderConfig &enc = config->encoder;
+        if (config->audio.enabled || config->audio.reserve_wire_bitrate_bps != 0 ||
+            gan_native_requested || config->gan.native_720p || config->gan.link_cap_kbps != cap ||
+            config->transport.pacing_bitrate_bps != cap * 1000 ||
+            config->mode != PIPELINE_GAN || config->transport.mode != TRANSPORT_MODE_VIDEO ||
+            enc.width * 9 != enc.height * 16 || enc.width % 2 || enc.height % 2 ||
+            !((enc.width == 256 && enc.height == 144) ||
+              (enc.width == 320 && enc.height == 180) ||
+              (enc.width == 384 && enc.height == 216)) ||
+            enc.fps != config->gan.fps || enc.gop != enc.fps * config->gan.gop_seconds ||
+            enc.target_bitrate_bps != config->gan.video_bitrate_kbps * 1000 || enc.grayscale_encode) {
+            if (error) *error = "ganq requires its named CAP, audio=off/zero reserve, color 16:9 256/320/384 input and consistent GAN cadence/target";
+            return false;
+        }
+    }
     const bool gan_preset_valid = ganBandwidthPreset(config->gan.link_cap_kbps, &gan_preset);
-    if (isGanRateProfile(config->rate_profile) &&
+    if (isGanRateProfile(config->rate_profile) && !isGanQualityProfile(config->rate_profile) &&
         (!gan_preset_valid || config->mode != PIPELINE_GAN ||
          (config->rate_profile == RATE_PROFILE_GAN4 && !config->gan.native_720p &&
           (gan_preset.source_width != 320 || gan_preset.source_height != 180)) ||

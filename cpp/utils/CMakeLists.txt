@@ -23,6 +23,7 @@ endif()
 
 add_library(imageutils STATIC
     image_utils.c
+    rga_core_process.cc
 )
 target_include_directories(imageutils PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

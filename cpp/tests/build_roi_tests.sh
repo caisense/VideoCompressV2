@@ -7,6 +7,12 @@ out_dir="${TMPDIR:-/tmp}/roi_h265_tests"
 mkdir -p "$out_dir"
 
 g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
+  "$cpp_dir/common/config.cc" "$cpp_dir/roi/roi_region_merger.cc" \
+  "$cpp_dir/transport/packetizer.cc" "$cpp_dir/transport/rate_pacer.cc" \
+  "$cpp_dir/tests/test_video_quality.cc" -o "$out_dir/test_video_quality"
+"$out_dir/test_video_quality"
+
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/common/config.cc" \
   "$cpp_dir/roi/roi_mapper.cc" \
   "$cpp_dir/roi/roi_temporal.cc" \
@@ -108,3 +114,18 @@ g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/tests/test_statistics.cc" \
   -o "$out_dir/test_statistics"
 "$out_dir/test_statistics"
+
+g++ -std=c++11 -Wall -Wextra -Werror -I"$cpp_dir" \
+  "$cpp_dir/tests/test_capture_conversion.cc" \
+  -o "$out_dir/test_capture_conversion"
+"$out_dir/test_capture_conversion"
+
+g++ -std=c++11 -Wall -Wextra -Werror -I"$cpp_dir" \
+  "$cpp_dir/tests/test_capture_policy.cc" \
+  -o "$out_dir/test_capture_policy"
+"$out_dir/test_capture_policy"
+
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
+  "$cpp_dir/tests/test_bounded_conversion.cc" \
+  -o "$out_dir/test_bounded_conversion"
+"$out_dir/test_bounded_conversion"

@@ -110,12 +110,28 @@ struct FramePacket {
     int source_height;
     int encoder_width;
     int encoder_height;
-    // RGB is used by RKNN. NV12 is the RGA-preprocessed input to MPP.
+    uint64_t capture_read_time_us;
+    uint64_t driver_capture_time_us;
+    uint32_t driver_sequence;
+    uint32_t driver_buffer_flags;
+    unsigned int discarded_capture_buffers;
+    bool native_capture;
+    bool file_input;
+    bool driver_timestamp_used;
+    bool bounded_conversion;
+    bool conversion_cpu_fallback;
+    int conversion_recovery_reason;
+    uint64_t conversion_wait_us;
+    // RGB is used by RKNN. NV12 feeds MPP; explicit CPU recovery is recorded.
     std::vector<uint8_t> rgb;
     std::vector<uint8_t> nv12;
 
     FramePacket()
-        : source_width(0), source_height(0), encoder_width(0), encoder_height(0) {}
+        : source_width(0), source_height(0), encoder_width(0), encoder_height(0),
+          capture_read_time_us(0), driver_capture_time_us(0), driver_sequence(0),
+          driver_buffer_flags(0), discarded_capture_buffers(0), native_capture(false), file_input(false),
+          driver_timestamp_used(false), bounded_conversion(false), conversion_cpu_fallback(false),
+          conversion_recovery_reason(0), conversion_wait_us(0) {}
 };
 
 }  // namespace roi_h265

@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "audio/codec2_audio_sender.h"
+#include "roi/adaptive_rate_controller.h"
 #include "capture/camera_capture.h"
 #include "common/config.h"
 #include "common/statistics.h"
@@ -116,6 +117,9 @@ public:
         const std::string frame_qp = unit.frame_qp < 0 ? "null" : std::to_string(unit.frame_qp);
         std::fprintf(handle_,
             "{\"TYPE\":\"ENC_FRAME\",\"SEQ\":%llu,\"PTS\":%llu,\"GENERATION\":%u,"
+            "\"CAPTURE_SOURCE\":\"%s\",\"CAPTURE_READ_US\":%llu,\"DRIVER_CAPTURE_US\":%llu,"
+            "\"DRIVER_SEQUENCE\":%u,\"DRIVER_FLAGS\":%u,\"CAPTURE_DISCARDED_BUFFERS\":%u,"
+            "\"CONVERSION_BACKEND\":\"%s\",\"CONVERSION_RECOVERY_REASON\":%d,\"CONVERSION_WAIT_US\":%llu,"
             "\"FRAME_TYPE\":\"%s\",\"EXPECTED_KEY_FRAME\":%s,\"ACTUAL_KEY_FRAME\":%s,"
             "\"GOP_POSITION\":%llu,\"GOP_SIZE\":%d,"
             "\"ENCODED_BYTES\":%zu,\"ENCODED_BITS\":%zu,\"RC_MODE\":\"CBR\","
@@ -134,6 +138,13 @@ public:
             "\"GDR_REFRESH_NUM\":%d,\"IDR_ROI_SCALE_PERCENT\":%d}\n",
             static_cast<unsigned long long>(frame.meta.frame_id),
             static_cast<unsigned long long>(frame.meta.pts_us), generation,
+            frame.driver_timestamp_used ? "V4L2_MONOTONIC" :
+                (frame.file_input ? "FILE_READ" : "CAMERA_READ"),
+            static_cast<unsigned long long>(frame.capture_read_time_us),
+            static_cast<unsigned long long>(frame.driver_capture_time_us),
+            frame.driver_sequence, frame.driver_buffer_flags, frame.discarded_capture_buffers,
+            frame.bounded_conversion ? (frame.conversion_cpu_fallback ? "OPENCV_RGB_NV12" : "RGA3_CORE0_BOUNDED") : "LEGACY",
+            frame.conversion_recovery_reason, static_cast<unsigned long long>(frame.conversion_wait_us),
             unit.frame_type.c_str(), expected_key_frame ? "true" : "false",
             unit.key_frame ? "true" : "false",
             static_cast<unsigned long long>(gop_position), encoder.gop,
@@ -160,11 +171,12 @@ private:
 
 void printUsage(const char *program) {
     std::fprintf(stderr,
-        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan2|gan4]\n"
+        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|ganq60|ganq120|ganq180] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan2|gan4]\n"
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
-        "          [--gan-link-cap-kbps=60|70|80|100|120|150|300 --gan-fps=6|8|10|12 --gan-inference-fps=0]\n"
+        "          [--gan-link-cap-kbps=60|70|80|100|120|150|180|300 --gan-fps=6|8|10|12 --gan-inference-fps=0]\n"
+        "          [--adaptive-roi=off|on --roi-weight-background=1 --roi-weight-halo=1.2 --roi-weight-core=2 --roi-weight-edge=3]\n"
         "          [--gan-native-720p=on|off (gan2:640x360, gan4:320x180)]\n"
         "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
         "          [--gan-gop-seconds=1|2|4 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
@@ -231,7 +243,7 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
         return;
     }
     std::fprintf(stderr,
-        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|image|video > %s\n",
+        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|ganq60|ganq120|ganq180|image|video > %s\n",
         path.c_str());
     std::string pending;
     while (running->load()) {
@@ -304,7 +316,7 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
     }
-    CameraCapture camera(config.camera, config.encoder);
+    CameraCapture camera(config.camera, config.encoder, isGanQualityProfile(config.rate_profile));
     if (!camera.open(&error)) {
         std::fprintf(stderr, "camera initialization failed: %s\n", error.c_str());
         return EXIT_FAILURE;
@@ -488,6 +500,11 @@ int main(int argc, char **argv) {
     RuntimeStatistics statistics;
     bool rtp_sdp_written = config.transport.rtp_sdp_path.empty();
     std::atomic<bool> running(true);
+    std::atomic<bool> pipeline_failed(false);
+    const auto failPipeline = [&]() {
+        pipeline_failed.store(true);
+        running.store(false);
+    };
     std::atomic<int> requested_profile(static_cast<int>(config.rate_profile));
     std::atomic<int> active_profile(static_cast<int>(config.rate_profile));
     std::atomic<int> requested_transport_mode(static_cast<int>(config.transport.mode));
@@ -508,8 +525,10 @@ int main(int argc, char **argv) {
 
     std::thread capture_thread([&] {
         std::string capture_error;
+        uint64_t captured_frames = 0;
         std::chrono::steady_clock::time_point next_capture = std::chrono::steady_clock::now();
-        while (running.load()) {
+        while (running.load() && (config.camera.max_frames <= 0 ||
+               captured_frames < static_cast<uint64_t>(config.camera.max_frames))) {
             std::this_thread::sleep_until(next_capture);
             // Advance from the current time rather than trying to catch up
             // after a slow V4L2/RGA read. This preserves the configured output
@@ -519,13 +538,16 @@ int main(int argc, char **argv) {
             next_capture = std::chrono::steady_clock::now() + frame_interval;
             std::shared_ptr<FramePacket> frame(new FramePacket);
             if (!camera.read(frame.get(), &capture_error)) {
-                std::fprintf(stderr, "capture error: %s\n", capture_error.c_str());
-                running.store(false);
+                const bool normal_file_eof = !config.camera.input_video.empty() &&
+                    config.camera.max_frames == 0 &&
+                    capture_error == "V4L2 frame acquisition failed";
+                std::fprintf(stderr, "%s: %s\n", normal_file_eof ? "input video ended" : "capture error",
+                             capture_error.c_str());
+                if (normal_file_eof) running.store(false);
+                else failPipeline();
                 break;
             }
-            if (config.camera.max_frames > 0 && frame->meta.frame_id >= static_cast<uint64_t>(config.camera.max_frames)) {
-                break;
-            }
+            ++captured_frames;
             if (use_inference) inference_queue.push(frame);
             else if (config.preview) {
                 PreviewItem preview_item;
@@ -586,7 +608,7 @@ int main(int argc, char **argv) {
                     !event_sender->submit(result, &event_error)) {
                     std::fprintf(stderr, "Detection event submit failed: %s\n",
                                  event_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 const bool rebuild_active =
@@ -647,11 +669,26 @@ int main(int argc, char **argv) {
         std::string encoder_error;
         std::shared_ptr<FramePacket> frame;
         uint64_t encoded_frame_count = 0;
+        AdaptiveRateController adaptive_controller;
         uint64_t key_prediction_mismatches = 0;
         while (running.load() && encoder_queue.pop(&frame)) {
             const RateProfile desired = static_cast<RateProfile>(requested_profile.load());
             const TransportMode desired_transport = static_cast<TransportMode>(
                 requested_transport_mode.load());
+            if (desired != static_cast<RateProfile>(active_profile.load()) &&
+                isGanQualityProfile(desired) != isGanQualityProfile(
+                    static_cast<RateProfile>(active_profile.load()))) {
+                std::fprintf(stderr, "ganq/legacy profile switch requires restart to preserve legacy defaults\n");
+                requested_profile.store(active_profile.load());
+                requested_transport_mode.store(active_transport_mode.load());
+                continue;
+            }
+            if (isGanQualityProfile(desired) && (audio_sender || desired_transport != TRANSPORT_MODE_VIDEO)) {
+                std::fprintf(stderr, "ganq runtime switch rejected: restart with audio=off and transport=video\n");
+                requested_profile.store(active_profile.load());
+                requested_transport_mode.store(active_transport_mode.load());
+                continue;
+            }
             const TransportMode active_transport = static_cast<TransportMode>(
                 active_transport_mode.load());
             if (desired_transport != active_transport ||
@@ -671,7 +708,7 @@ int main(int argc, char **argv) {
                         encoder_error = "audio reservation leaves no capacity in the shared media bucket";
                     }
                     std::fprintf(stderr, "Runtime transport switch failed: %s\n", encoder_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 if (desired_transport == TRANSPORT_MODE_IMAGE) {
@@ -681,7 +718,7 @@ int main(int argc, char **argv) {
                     if (!sender.switchProfile(next_video_pacing_bps, &encoder_error)) {
                         std::fprintf(stderr, "RTP image-mode switch failed: %s\n",
                                      encoder_error.c_str());
-                        running.store(false);
+                        failPipeline();
                         break;
                     }
                     video_pacer->reset(next_video_pacing_bps, video_burst_bytes);
@@ -714,7 +751,7 @@ int main(int argc, char **argv) {
                 if (rebuild_sender) rebuild_sender->setEnabled(false);
                 if (!sender.switchProfile(next_video_pacing_bps, &encoder_error)) {
                     std::fprintf(stderr, "RTP profile switch failed: %s\n", encoder_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 // switchProfile restores UdpSender's default burst. Reinstate
@@ -725,7 +762,7 @@ int main(int argc, char **argv) {
                     new MppH265Encoder(next.encoder, next.roi));
                 if (!replacement->initialize(&encoder_error)) {
                     std::fprintf(stderr, "MPP video-mode switch failed: %s\n", encoder_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 encoder.swap(replacement);
@@ -754,12 +791,12 @@ int main(int argc, char **argv) {
                 if (event_sender && event_sender->failed(&encoder_error)) {
                     std::fprintf(stderr, "Detection event transport error: %s\n",
                                  encoder_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 if (audio_sender && audio_sender->failed(&encoder_error)) {
                     std::fprintf(stderr, "Codec2 audio transport error: %s\n", encoder_error.c_str());
-                    running.store(false);
+                    failPipeline();
                     break;
                 }
                 continue;
@@ -771,23 +808,23 @@ int main(int argc, char **argv) {
             }
             if (sender.failed(&encoder_error)) {
                 std::fprintf(stderr, "UDP transport error: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             if (audio_sender && audio_sender->failed(&encoder_error)) {
                 std::fprintf(stderr, "Codec2 audio transport error: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             if (rebuild_sender && rebuild_sender->failed(&encoder_error)) {
                 std::fprintf(stderr, "Rebuild transport error: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             if (event_sender && event_sender->failed(&encoder_error)) {
                 std::fprintf(stderr, "Detection event transport error: %s\n",
                              encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             // GDR distributes recovery over P frames. Keep explicit IDR for
@@ -802,15 +839,31 @@ int main(int argc, char **argv) {
                 !encoder->requestIdr(&encoder_error)))) {
                 if (encoder_error.empty()) encoder_error = "H.265 encoder is unavailable in video mode";
                 std::fprintf(stderr, "MPP recovery IDR request failed: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             RoiMap map = roi_manager.select(frame->meta.frame_id, frame->meta.pts_us,
                                             live.encoder.width, live.encoder.height);
             std::vector<RoiRegion> regions;
+            if (encoded_frame_count == 0) adaptive_controller = AdaptiveRateController();
             if (live.mode != PIPELINE_BASELINE) {
                 const RoiRegionMerger merger(live.roi);
                 regions = merger.merge(map);
+                if (live.roi.adaptive) {
+                    adaptive_controller.apply(map, live.roi, live.encoder.target_bitrate_bps,
+                        live.encoder.fps, &regions);
+                    if (!config.encoder.debug_log_path.empty()) {
+                        std::fprintf(stderr, "ADAPTIVE_ROI seq=%llu gop_pos=%llu",
+                            static_cast<unsigned long long>(frame->meta.frame_id),
+                            static_cast<unsigned long long>(encoded_frame_count % live.encoder.gop));
+                        for (int level = 0; level < 4; ++level) {
+                            std::fprintf(stderr, " area%d=%.0f represented%d=%.0f weight%d=%.3f budget%d=%.1f offset%d=%d",
+                                level, adaptive_controller.area(level), level, adaptive_controller.representedArea(level), level, live.roi.weights[level],
+                                level, adaptive_controller.budget(level), level, adaptive_controller.offset(level));
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
                 if (isGanRateProfile(live.rate_profile) && expected_key_frame &&
                     live.gan.idr_roi_scale_percent < 100) {
                     for (size_t i = 0; i < regions.size(); ++i) {
@@ -828,7 +881,7 @@ int main(int argc, char **argv) {
             EncodedAccessUnit access_unit;
             if (!encoder->encode(*frame, regions, &access_unit, &encoder_error)) {
                 std::fprintf(stderr, "MPP encode error: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             if (expected_key_frame != access_unit.key_frame) {
@@ -881,10 +934,27 @@ int main(int argc, char **argv) {
                     : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {
                 std::fprintf(stderr, "UDP transport enqueue error: %s\n", encoder_error.c_str());
-                running.store(false);
+                failPipeline();
                 break;
             }
             const AsyncRtpSenderSnapshot tx = sender.snapshot();
+            if (isGanQualityProfile(live.rate_profile)) {
+                std::printf("QUALITY_TX pts_us=%llu wire_bytes=%llu rtp_payload_bytes=%llu "
+                    "queue=%zu queue_bytes=%zu queue_delay_us=%llu oldest_queue_age_us=%llu send_age_us=%llu drop_p=%llu drop_idr=%llu\n",
+                    static_cast<unsigned long long>(frame->meta.pts_us),
+                    static_cast<unsigned long long>(tx.sent_wire_bytes),
+                    static_cast<unsigned long long>(tx.sent_rtp_payload_bytes), tx.queued_frames, tx.queued_bytes,
+                    static_cast<unsigned long long>(tx.last_queue_delay_us),
+                    static_cast<unsigned long long>(tx.oldest_queue_age_us),
+                    static_cast<unsigned long long>(tx.last_capture_to_send_us),
+                    static_cast<unsigned long long>(tx.dropped_p_frames),
+                    static_cast<unsigned long long>(tx.dropped_key_frames));
+            }
+            if (live.roi.adaptive) adaptive_controller.observe(encoded_bytes, access_unit.key_frame,
+                live.encoder.target_bitrate_bps, live.encoder.fps, live.encoder.gop,
+                access_unit.average_qp, tx.queued_frames,
+                static_cast<double>(tx.tx_wire_bps) / live.transport.pacing_bitrate_bps,
+                static_cast<int>((encoded_frame_count - 1) % live.encoder.gop));
             statistics.recordRoi(map, frame->meta.frame_id, static_cast<int>(regions.size()));
             statistics.recordEncoded(frame->meta, access_unit.key_frame, encoded_bytes,
                                      access_unit.average_qp, access_unit.realtime_bitrate_bps,
@@ -998,5 +1068,5 @@ int main(int argc, char **argv) {
         release_yolov8_seg_model(&rknn_context);
         deinit_post_process();
     }
-    return EXIT_SUCCESS;
+    return pipeline_failed.load() ? EXIT_FAILURE : EXIT_SUCCESS;
 }

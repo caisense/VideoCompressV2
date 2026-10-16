@@ -28,7 +28,7 @@ def main() -> int:
         default="auto",
     )
     parser.add_argument(
-        "--input-size", choices=("256x144", "320x180", "640x360"),
+        "--input-size", choices=("256x144", "320x180", "384x216", "640x360"),
         default="256x144",
         help="decoded source size; use 320x180 with scale-factor=4 for native 720p",
     )
@@ -37,6 +37,7 @@ def main() -> int:
     parser.add_argument("--trt-cache-dir", default="runs/tensorrt_cache")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--presentation-size", choices=("legacy", "1280x720"), default="legacy")
     args = parser.parse_args()
     if args.warmup < 0 or args.measured <= 0 or args.threads < 0:
         parser.error("warmup must be non-negative, measured must be positive, threads non-negative")
@@ -50,6 +51,10 @@ def main() -> int:
     native_size = (input_size[0] * args.scale_factor,
                    input_size[1] * args.scale_factor)
     output_size = native_size if native_size == (1280, 720) else (640, 360)
+    if args.presentation_size == "1280x720":
+        output_size = (1280, 720)
+        if args.backend == "none":
+            native_size = output_size
     execution_provider = (
         "cuda" if args.require_cuda and args.execution_provider == "auto"
         else args.execution_provider

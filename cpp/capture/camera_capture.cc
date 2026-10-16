@@ -5,8 +5,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -17,6 +19,10 @@
 #include <opencv2/opencv.hpp>
 
 #include "image_utils.h"
+#include "im2d.h"
+#include "capture/capture_policy.h"
+#include "capture/bounded_conversion.h"
+#include "capture/planar_to_nv12.h"
 
 namespace roi_h265 {
 
@@ -52,10 +58,19 @@ struct CameraCapture::Impl {
     int v4l2_height;
     int v4l2_stride;
     std::vector<V4l2MappedBuffer> v4l2_buffers;
+    uint64_t driver_capture_us;
+    uint32_t driver_sequence;
+    uint32_t driver_flags;
+    unsigned int discarded_buffers;
+    bool warned_timestamp_fallback;
+    std::unique_ptr<BoundedConversion> converter;
+    uint64_t conversion_degraded_since_us;
 
     Impl()
         : next_frame_id(0), v4l2_fd(-1), v4l2_streaming(false),
-          v4l2_width(0), v4l2_height(0), v4l2_stride(0) {}
+          v4l2_width(0), v4l2_height(0), v4l2_stride(0), driver_capture_us(0),
+          driver_sequence(0), driver_flags(0), discarded_buffers(0),
+          warned_timestamp_fallback(false), conversion_degraded_since_us(0) {}
 
     bool queueV4l2Buffer(unsigned int index, std::string *error) {
         if (index >= v4l2_buffers.size()) {
@@ -99,9 +114,9 @@ struct CameraCapture::Impl {
     }
 
     bool openV4l2(const std::string &path, int requested_width, int requested_height,
-                  std::string *error) {
+                  bool latest_only, std::string *error) {
         closeV4l2();
-        v4l2_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        v4l2_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | (latest_only ? O_NONBLOCK : 0));
         if (v4l2_fd < 0) {
             if (error) *error = errnoMessage("open " + path);
             return false;
@@ -142,7 +157,9 @@ struct CameraCapture::Impl {
         std::memset(&request, 0, sizeof(request));
         request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         request.memory = V4L2_MEMORY_MMAP;
-        request.count = 3;
+        // Cover one 6fps sampling period of the 30fps camera, while remaining
+        // bounded and selecting the latest completed buffer on each read.
+        request.count = latest_only ? 8 : 3;
         if (ioctlRetry(v4l2_fd, VIDIOC_REQBUFS, &request) < 0 || request.count < 2) {
             if (error) *error = errnoMessage("VIDIOC_REQBUFS");
             closeV4l2();
@@ -184,10 +201,12 @@ struct CameraCapture::Impl {
             return false;
         }
         v4l2_streaming = true;
+        std::fprintf(stderr, "CAPTURE_CONFIG native=1 buffers=%zu latest_only=%d\n",
+                     v4l2_buffers.size(), latest_only ? 1 : 0);
         return true;
     }
 
-    bool readV4l2(cv::Mat *bgr, std::string *error) {
+    bool readV4l2(cv::Mat *bgr, bool latest_only, std::string *error) {
         pollfd descriptor;
         std::memset(&descriptor, 0, sizeof(descriptor));
         descriptor.fd = v4l2_fd;
@@ -212,8 +231,61 @@ struct CameraCapture::Impl {
         if (buffer.index >= v4l2_buffers.size() ||
             plane.bytesused < static_cast<unsigned int>(v4l2_stride * v4l2_height * 3 / 2)) {
             if (error) *error = "V4L2 returned an incomplete NV12 frame";
-            queueV4l2Buffer(buffer.index, NULL);
+            if (buffer.index < v4l2_buffers.size()) queueV4l2Buffer(buffer.index, NULL);
             return false;
+        }
+        discarded_buffers = 0;
+        if (latest_only) {
+            const CaptureDrainResult drained = drainReadyCaptureFrames(
+                static_cast<unsigned int>(v4l2_buffers.size() - 1), [&]() {
+                    v4l2_buffer next;
+                    v4l2_plane next_plane;
+                    std::memset(&next, 0, sizeof(next));
+                    std::memset(&next_plane, 0, sizeof(next_plane));
+                    next.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                    next.memory = V4L2_MEMORY_MMAP;
+                    next.length = 1;
+                    next.m.planes = &next_plane;
+                    if (ioctlRetry(v4l2_fd, VIDIOC_DQBUF, &next) < 0) {
+                        if (errno == EAGAIN) return 0;
+                        if (error) *error = errnoMessage("VIDIOC_DQBUF latest");
+                        return -1;
+                    }
+                    if (next.index >= v4l2_buffers.size() ||
+                        next_plane.bytesused < static_cast<unsigned int>(
+                            v4l2_stride * v4l2_height * 3 / 2)) {
+                        if (error) *error = "V4L2 returned an incomplete latest NV12 frame";
+                        if (next.index < v4l2_buffers.size()) queueV4l2Buffer(next.index, NULL);
+                        return -1;
+                    }
+                    if (!queueV4l2Buffer(buffer.index, error)) {
+                        queueV4l2Buffer(next.index, NULL);
+                        return -1;
+                    }
+                    buffer = next;
+                    plane = next_plane;
+                    buffer.m.planes = &plane;
+                    return 1;
+                });
+            discarded_buffers = drained.discarded;
+            if (!drained.ok) {
+                queueV4l2Buffer(buffer.index, NULL);
+                return false;
+            }
+        }
+        const uint64_t read_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        driver_capture_us = monotonicCaptureTimestamp(buffer.timestamp.tv_sec,
+            buffer.timestamp.tv_usec, (buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+                V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, read_us);
+        driver_sequence = buffer.sequence;
+        driver_flags = buffer.flags;
+        if (latest_only && !driver_capture_us && !warned_timestamp_fallback) {
+            std::fprintf(stderr,
+                "CAPTURE_TIMESTAMP_FALLBACK source=camera_read driver_flags=%u; "
+                "driver queue age cannot be verified\n", buffer.flags);
+            warned_timestamp_fallback = true;
         }
         const uint8_t *source = static_cast<const uint8_t *>(v4l2_buffers[buffer.index].address);
         cv::Mat tightly_packed(v4l2_height * 3 / 2, v4l2_width, CV_8UC1);
@@ -251,8 +323,9 @@ bool numericDevice(const std::string &device, int *index) {
 
 }  // namespace
 
-CameraCapture::CameraCapture(const CameraConfig &camera, const EncoderConfig &encoder)
-    : camera_(camera), encoder_(encoder), impl_(NULL) {}
+CameraCapture::CameraCapture(const CameraConfig &camera, const EncoderConfig &encoder,
+                             bool quality_capture)
+    : camera_(camera), encoder_(encoder), quality_capture_(quality_capture), impl_(NULL) {}
 
 CameraCapture::~CameraCapture() { close(); }
 
@@ -266,8 +339,13 @@ bool CameraCapture::open(std::string *error) {
     // backend rejects them even though they stream correctly, so try the
     // native NV12 capture path first.  Files remain on the OpenCV path.
     if (camera_.input_video.empty() &&
-        impl_->openV4l2(v4l2_path, camera_.width, camera_.height, error)) {
+        impl_->openV4l2(v4l2_path, camera_.width, camera_.height, quality_capture_, error)) {
         return true;
+    }
+    if (camera_.input_video.empty() && quality_capture_) {
+        if (error) *error = "quality capture requires native NV12 V4L2: " + *error;
+        close();
+        return false;
     }
     const bool opened = !camera_.input_video.empty()
         ? impl_->device.open(camera_.input_video)
@@ -302,7 +380,7 @@ bool CameraCapture::read(FramePacket *frame, std::string *error) {
     }
     cv::Mat bgr;
     const bool read_ok = impl_->v4l2_fd >= 0
-        ? impl_->readV4l2(&bgr, error)
+        ? impl_->readV4l2(&bgr, quality_capture_, error)
         : impl_->device.read(bgr);
     if (!read_ok || bgr.empty()) {
         if (error) *error = "V4L2 frame acquisition failed";
@@ -315,6 +393,17 @@ bool CameraCapture::read(FramePacket *frame, std::string *error) {
     FramePacket converted;
     converted.meta.frame_id = impl_->next_frame_id++;
     converted.meta.pts_us = nowMicros();
+    converted.capture_read_time_us = converted.meta.pts_us;
+    converted.native_capture = impl_->v4l2_fd >= 0;
+    converted.file_input = !camera_.input_video.empty();
+    if (converted.native_capture) {
+        converted.driver_capture_time_us = impl_->driver_capture_us;
+        converted.driver_sequence = impl_->driver_sequence;
+        converted.driver_buffer_flags = impl_->driver_flags;
+        converted.discarded_capture_buffers = impl_->discarded_buffers;
+        converted.driver_timestamp_used = quality_capture_ && impl_->driver_capture_us > 0;
+        if (converted.driver_timestamp_used) converted.meta.pts_us = impl_->driver_capture_us;
+    }
     converted.meta.capture_time_us = converted.meta.pts_us;
     converted.source_width = rgb.cols;
     converted.source_height = rgb.rows;
@@ -353,7 +442,69 @@ bool CameraCapture::read(FramePacket *frame, std::string *error) {
     destination_rect.top = 0;
     destination_rect.right = destination.width - 1;
     destination_rect.bottom = destination.height - 1;
-    if (convert_image(&source, &destination, &source_rect, &destination_rect, 0) != 0) {
+    if (quality_capture_ && converted.meta.frame_id == 0) {
+        std::fprintf(stderr, "CAPTURE_RGA_CORE requested=RGA3_CORE0 mask=%d\n",
+                     IM_SCHEDULER_RGA3_CORE0);
+        std::fprintf(stderr, "CAPTURE_CONVERT_POLICY rga_budget_ms=20 recovery=OPENCV_RGB_NV12 max_recovery_ms=5000 max_inflight=1\n");
+    }
+    if (quality_capture_) {
+        if (!impl_->converter) impl_->converter.reset(new BoundedConversion);
+        converted.bounded_conversion = true;
+        const uint64_t wait_start = nowMicros();
+        BoundedConversion::Result result = {BoundedConversion::BUSY, -1};
+        std::shared_ptr<FramePacket> job;
+        if (!impl_->converter->busy()) {
+            // The driver may continue DMA after the frame deadline. Never
+            // borrow the caller's RGB/NV12 storage for that operation.
+            job.reset(new FramePacket(converted));
+            result = impl_->converter->run([job, source, destination, source_rect, destination_rect]() {
+                static thread_local bool named = false;
+                if (!named) {
+                    pthread_setname_np(pthread_self(), "capture-rga");
+                    named = true;
+                }
+                image_buffer_t src = source, dst = destination;
+                image_rect_t src_rect = source_rect, dst_rect = destination_rect;
+                src.virt_addr = job->rgb.data();
+                dst.virt_addr = job->nv12.data();
+                return convert_image_rga_core(&src, &dst, &src_rect, &dst_rect, 0,
+                                              IM_SCHEDULER_RGA3_CORE0);
+            }, std::chrono::milliseconds(20));
+        }
+        converted.conversion_wait_us = nowMicros() - wait_start;
+        if (result.outcome == BoundedConversion::COMPLETE && result.status == 0) {
+            converted.nv12.swap(job->nv12);
+            if (impl_->conversion_degraded_since_us) {
+                std::fprintf(stderr, "CAPTURE_CONVERT_RECOVERED seq=%llu degraded_us=%llu\n",
+                    static_cast<unsigned long long>(converted.meta.frame_id),
+                    static_cast<unsigned long long>(nowMicros() - impl_->conversion_degraded_since_us));
+                impl_->conversion_degraded_since_us = 0;
+            }
+        } else {
+            converted.conversion_cpu_fallback = true;
+            converted.conversion_recovery_reason = result.outcome == BoundedConversion::BUSY ? 1 :
+                (result.outcome == BoundedConversion::DEADLINE ? 2 : 3);
+            if (!impl_->conversion_degraded_since_us) {
+                impl_->conversion_degraded_since_us = nowMicros();
+                std::fprintf(stderr, "CAPTURE_CONVERT_RECOVERY seq=%llu backend=OPENCV_RGB_NV12 reason=%d wait_us=%llu\n",
+                    static_cast<unsigned long long>(converted.meta.frame_id), converted.conversion_recovery_reason,
+                    static_cast<unsigned long long>(converted.conversion_wait_us));
+            }
+            if (nowMicros() - impl_->conversion_degraded_since_us > 5000000) {
+                if (error) *error = "RGA unavailable for over 5s; refusing permanent CPU conversion recovery";
+                return false;
+            }
+            cv::Mat resized, planar;
+            cv::resize(rgb, resized, cv::Size(encoder.width, encoder.height), 0, 0, cv::INTER_LINEAR);
+            cv::cvtColor(resized, planar, cv::COLOR_RGB2YUV_I420);
+            if (!planar.isContinuous()) planar = planar.clone();
+            if (!planarI420ToNv12(planar.data, planar.total() * planar.elemSize(),
+                                  encoder.width, encoder.height, &converted.nv12)) {
+                if (error) *error = "CPU conversion recovery produced invalid I420 storage";
+                return false;
+            }
+        }
+    } else if (convert_image(&source, &destination, &source_rect, &destination_rect, 0) != 0) {
         if (error) *error = "RGA RGB-to-NV12 scale failed";
         return false;
     }

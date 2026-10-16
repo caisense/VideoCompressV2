@@ -107,6 +107,41 @@ void testRuntimeProfileSwitchRequiresFreshIdr() {
     close(receiver);
 }
 
+void testOlderInflightIdrCannotClearNewRecoveryRequest() {
+    uint16_t port = 0;
+    const int receiver = makeLoopbackReceiver(&port);
+    CHECK(receiver >= 0);
+    roi_h265::AsyncRtpSender sender("127.0.0.1", port, 8000, 128, 2, 1000);
+    std::string error;
+    CHECK(sender.start(&error));
+    CHECK(sender.enqueue(makeUnit(0, true, 400), &error));
+    for (int attempt = 0; attempt < 200 && !sender.snapshot().sending; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(sender.snapshot().sending);
+    CHECK(sender.enqueue(makeUnit(1, false, 20), &error));
+    CHECK(sender.enqueue(makeUnit(2, false, 20), &error));
+    CHECK(sender.enqueue(makeUnit(3, false, 20), &error));
+    CHECK(sender.needsKeyFrame());
+    for (int attempt = 0; attempt < 300 && sender.snapshot().sent_frames < 1; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(sender.snapshot().sent_frames == 1);
+    CHECK(sender.needsKeyFrame());
+    const uint64_t dropped = sender.snapshot().dropped_p_frames;
+    CHECK(sender.enqueue(makeUnit(4, false, 20), &error));
+    CHECK(sender.snapshot().dropped_p_frames == dropped + 1);
+    CHECK(sender.needsKeyFrame());
+    CHECK(sender.enqueue(makeUnit(5, true, 20), &error));
+    CHECK(!sender.needsKeyFrame());
+    for (int attempt = 0; attempt < 300 && sender.snapshot().last_sent_frame_id != 5; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(sender.snapshot().last_sent_frame_id == 5);
+    sender.stop();
+    close(receiver);
+}
+
 void testSenderReportsPhysicalWireRate() {
     uint16_t port = 0;
     const int receiver = makeLoopbackReceiver(&port);
@@ -133,6 +168,7 @@ int main() {
     testEnqueueDoesNotWaitForPacer();
     testBacklogDropsPAndRequestsRecoveryIdr();
     testRuntimeProfileSwitchRequiresFreshIdr();
+    testOlderInflightIdrCannotClearNewRecoveryRequest();
     testSenderReportsPhysicalWireRate();
     if (failures) return EXIT_FAILURE;
     std::cout << "asynchronous RTP sender tests passed\n";

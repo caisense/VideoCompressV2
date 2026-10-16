@@ -33,6 +33,9 @@ enum RateProfile {
     RATE_PROFILE_RATE180 = 8,
     RATE_PROFILE_RATE200 = 9,
     RATE_PROFILE_GAN4 = 10,
+    RATE_PROFILE_GANQ60 = 11,
+    RATE_PROFILE_GANQ120 = 12,
+    RATE_PROFILE_GANQ180 = 13,
 };
 
 // Video is the normal H.265/RTP path.  Image mode leaves capture and YOLO
@@ -111,6 +114,8 @@ struct DetectionEventConfig {
 };
 
 struct RoiConfig {
+    bool adaptive;
+    float weights[4]; // background, halo, core, edge; disjoint map-cell budgets
     int cell_size;
     int background_delta_qp;
     int halo_delta_qp;
@@ -183,7 +188,7 @@ struct GanConfig {
     // latest-map reuse between less frequent inference passes.
     int inference_fps;
     // Shared video + optional Codec2 physical-wire cap selected by
-    // --gan-link-cap-kbps=60|70|80|100|120|150|300.
+    // --gan-link-cap-kbps=60|70|80|100|120|150|180|300.
     int link_cap_kbps;
     int video_bitrate_kbps;
     int max_inference_latency_ms;
@@ -325,6 +330,7 @@ const char *pipelineModeName(PipelineMode mode);
 const char *rateProfileName(RateProfile profile);
 bool parseRateProfile(const std::string &name, RateProfile *profile);
 bool isGanRateProfile(RateProfile profile);
+bool isGanQualityProfile(RateProfile profile);
 void applyRateProfile(RateProfile profile, AppConfig *config);
 bool ganBandwidthPreset(int link_cap_kbps, GanBandwidthPreset *preset);
 const char *transportModeName(TransportMode mode);

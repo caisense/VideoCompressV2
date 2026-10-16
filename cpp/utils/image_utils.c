@@ -19,6 +19,7 @@
 #include "turbojpeg.h"
 
 #include "image_utils.h"
+#include "rga_core_process.h"
 #include "file_utils.h"
 
 static const char* filter_image_names[] = {
@@ -487,7 +488,7 @@ int get_image_size(image_buffer_t* image)
     }
 }
 
-static int convert_image_rga(image_buffer_t* src_img, image_buffer_t* dst_img, image_rect_t* src_box, image_rect_t* dst_box, char color)
+static int convert_image_rga(image_buffer_t* src_img, image_buffer_t* dst_img, image_rect_t* src_box, image_rect_t* dst_box, char color, int core_mask)
 {
     int ret = 0;
 
@@ -642,7 +643,9 @@ static int convert_image_rga(image_buffer_t* src_img, image_buffer_t* dst_img, i
     }
 
     // rga process
-    ret_rga = improcess(rga_buf_src, rga_buf_dst, pat, srect, drect, prect, usage);
+    ret_rga = core_mask ? process_image_rga_core(rga_buf_src, rga_buf_dst, pat,
+        srect, drect, prect, usage, core_mask) :
+        improcess(rga_buf_src, rga_buf_dst, pat, srect, drect, prect, usage);
     if (ret_rga <= 0) {
         printf("Error on improcess STATUS=%d\n", ret_rga);
         printf("RGA error message: %s\n", imStrError((IM_STATUS)ret_rga));
@@ -678,12 +681,20 @@ int convert_image(image_buffer_t* src_img, image_buffer_t* dst_img, image_rect_t
     }
     printf("color=0x%x\n", color);
 
-    ret = convert_image_rga(src_img, dst_img, src_box, dst_box, color);
+    ret = convert_image_rga(src_img, dst_img, src_box, dst_box, color, 0);
     if (ret != 0) {
         printf("try convert image use cpu\n");
         ret = convert_image_cpu(src_img, dst_img, src_box, dst_box, color);
     }
     return ret;
+}
+
+int convert_image_rga_core(image_buffer_t* src_img, image_buffer_t* dst_img,
+                          image_rect_t* src_box, image_rect_t* dst_box, char color,
+                          int core_mask)
+{
+    if (core_mask <= 0 || (core_mask & ~IM_SCHEDULER_MASK)) return -1;
+    return convert_image_rga(src_img, dst_img, src_box, dst_box, color, core_mask);
 }
 
 int convert_image_with_letterbox(image_buffer_t* src_image, image_buffer_t* dst_image, letterbox_t* letterbox, char color)

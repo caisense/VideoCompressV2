@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -27,6 +29,23 @@ from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 
 DEFAULT_VIDEO_PORT = 5004
+GAN_PROFILES = ("gan2", "gan4", "ganq60", "ganq120", "ganq180")
+
+
+def receiver_gan_profile(profile: dict, scale: int, baseline: bool) -> dict:
+    """Apply PC-only choices to every profile snapshot, including decode threads."""
+    if str(profile.get('name', '')).startswith('ganq'):
+        return dict(profile, gan_scale=scale, gan_baseline=baseline)
+    return profile
+
+
+def gan_scale(profile: dict) -> int:
+    return int(profile.get("gan_scale", 4 if profile.get("name") in
+                           ("gan4", "ganq60", "ganq120", "ganq180") else 2))
+
+
+def gan_native_size_text(profile: dict, native_size: tuple) -> str:
+    return "none(Lanczos)" if profile.get("gan_baseline") else f"{native_size[0]}x{native_size[1]}"
 
 
 class LatestOnlyInitializer:
@@ -96,9 +115,10 @@ def gan_profile_sizes(profile: dict) -> Tuple[Tuple[int, int], Tuple[int, int], 
     height = int(profile.get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError(f"GAN profile has invalid input size {width}x{height}")
-    scale = 4 if profile.get("name") == "gan4" else 2
+    scale = gan_scale(profile)
     native_size = (width * scale, height * scale)
-    output_size = native_size if native_size == (1280, 720) else (640, 360)
+    output_size = (1280, 720) if str(profile.get("name", "")).startswith("ganq") else (
+        native_size if native_size == (1280, 720) else (640, 360))
     return (width, height), native_size, output_size
 
 
@@ -110,7 +130,7 @@ def gan_profile_signature(profile: dict) -> Tuple[int, int, int, int, int]:
         input_size[0],
         input_size[1],
         int(profile.get("fps", 0)),
-        4 if profile.get("name") == "gan4" else 2,
+        gan_scale(profile),
     )
 
 
@@ -228,6 +248,7 @@ class RtpStats:
             0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan2",
             5: "rate80", 6: "rate100", 7: "rate120", 8: "rate180", 9: "rate200",
             10: "gan4",
+            11: "ganq60", 12: "ganq120", 13: "ganq180",
         }
         name = names.get(payload[1], "unknown")
         target_bitrate_kbps = None
@@ -235,7 +256,7 @@ class RtpStats:
         # GAN v1 originally had an eight-byte core.  The current sender then
         # appended TARGET plus two reserved bytes; new senders reuse those
         # final two bytes as CAP without increasing the 12-byte tail layout.
-        if name in ("gan2", "gan4"):
+        if name in GAN_PROFILES:
             if len(payload) >= 10:
                 advertised_target = int.from_bytes(payload[8:10], "big")
                 if advertised_target > 0:
@@ -628,6 +649,21 @@ class DecodedPtsQueue:
     def clear(self) -> None:
         with self.lock:
             self.items.clear()
+
+
+class WindowFrameTracker:
+    """Track actual image versions handed to the window, including GAN upgrades."""
+
+    def __init__(self):
+        self.last_key = None
+
+    def submit(self, sequence, pts, version, spatial, generation, now):
+        key = (generation, sequence, pts, version, spatial)
+        temporal = 'DECODED' if key != self.last_key else 'HOLD'
+        self.last_key = key
+        return dict(TYPE='GAN_DISPLAY_SUBMIT', AT=now, SEQ=sequence, PTS=pts,
+                    GENERATION=generation, PROVENANCE=f'{temporal}+{spatial}',
+                    HEADLESS=False, DISPLAY_BOUNDARY='opencv_imshow_waitkey_return')
 
 
 class PresentationStats:
@@ -1322,6 +1358,12 @@ def main() -> int:
                         help="diagnostic target rectangles; off avoids display overlays")
     parser.add_argument("--headless", action="store_true", help="print HUD metrics without opening a window")
     parser.add_argument("--duration", type=float, default=0.0, help="optional run duration in seconds")
+    parser.add_argument("--ganq-scale", type=int, choices=(2, 4), default=4,
+                        help="native model scale for ganq experiments; display remains 1280x720")
+    parser.add_argument("--quality-packet-log", type=Path, default=None,
+                        help="optional received RTP packet JSONL for physical-wire windows")
+    parser.add_argument("--quality-video-log", type=Path, default=None,
+                        help="optional received H.265 Annex-B stream for same-source comparison")
     args = parser.parse_args()
     if (args.width <= 0 or args.height <= 0 or args.scale < 0 or
             args.rebuild_width <= 0 or args.rebuild_height <= 0 or
@@ -1349,6 +1391,21 @@ def main() -> int:
         flush=True,
     )
     stats = RtpStats()
+    video_log = None
+    if args.quality_video_log is not None:
+        args.quality_video_log.parent.mkdir(parents=True, exist_ok=True)
+        video_log = args.quality_video_log.open("wb")
+        source_files = [Path(__file__), Path(sys.modules['full_frame_enhancer'].__file__)]
+        args.quality_video_log.with_suffix('.runtime.json').write_text(json.dumps(dict(
+            python=sys.executable, python_version=sys.version, platform=sys.platform,
+            opencv_version=cv2.__version__, numpy_version=np.__version__,
+            headless=args.headless,
+            source_sha256={str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+                           for path in source_files}), indent=2), encoding='utf-8')
+    packet_log = None
+    if args.quality_packet_log is not None:
+        args.quality_packet_log.parent.mkdir(parents=True, exist_ok=True)
+        packet_log = args.quality_packet_log.open("w", encoding="utf-8")
     switch_gate = ProfileSwitchGate()
     depacketizer = HevcRtpDepacketizer()
     latest = LatestFrame()
@@ -1442,6 +1499,7 @@ def main() -> int:
         if worker is None or profile is None:
             return None
         try:
+            profile = receiver_gan_profile(profile, args.ganq_scale, args.gan_enhancer == 'none')
             return worker if signature == gan_profile_signature(profile) else None
         except (TypeError, ValueError):
             return None
@@ -1464,9 +1522,12 @@ def main() -> int:
 
     def ensure_gan_worker(profile: dict) -> bool:
         nonlocal gan_worker, gan_worker_signature, gan_controller
+        profile = receiver_gan_profile(profile, args.ganq_scale, args.gan_enhancer == 'none')
         try:
             signature = gan_profile_signature(profile)
             input_size, native_size, output_size = gan_profile_sizes(profile)
+            if profile.get("gan_baseline"):
+                native_size = output_size  # a single conventional scale for the baseline
         except (TypeError, ValueError) as error:
             print(f"GAN enhancer profile invalid: {error}", file=sys.stderr)
             return False
@@ -1475,11 +1536,14 @@ def main() -> int:
         if profile.get("name") == "gan4" and args.gan_enhancer != "esrgan":
             print("GAN4 requires --gan-enhancer=esrgan and a native x4 model", file=sys.stderr)
             return False
+        if gan_scale(profile) == 4 and args.gan_enhancer == "esrnet":
+            print("Native x4 requires the x4 ESRGAN model", file=sys.stderr)
+            return False
         model_path = (
             args.gan_esrnet_model
             if args.gan_enhancer == "esrnet"
             else args.gan_esrgan_x4_model
-            if profile.get("name") == "gan4"
+            if gan_scale(profile) == 4
             else args.gan_esrgan_model
         )
         try:
@@ -1554,7 +1618,7 @@ def main() -> int:
             f"startup_ms={result['startup_ms']:.0f} "
             f"provider={worker.provider} precision={worker.execution_precision} "
             f"input={input_size[0]}x{input_size[1]} "
-            f"native={native_size[0]}x{native_size[1]} "
+            f"native={gan_native_size_text(profile, native_size)} "
             f"output={output_size[0]}x{output_size[1]} "
             f"output_budget_ms={output_budget_ms:.1f} ({budget_mode}) "
             f"hard_stall_ms={args.gan_hard_stall_ms:.0f} "
@@ -1681,6 +1745,14 @@ def main() -> int:
             except OSError:
                 break
             stats.on_packet(packet)
+            if packet_log is not None:
+                offset = RtpStats._payload_offset(packet)
+                packet_log.write(json.dumps({"at": time.monotonic(), "udp_bytes": len(packet),
+                    "rtp_timestamp": int.from_bytes(packet[4:8], "big") if offset is not None else None,
+                    "sequence": int.from_bytes(packet[2:4], "big") if offset is not None else None,
+                    "marker": bool(packet[1] & 0x80) if offset is not None else False,
+                    "rtp_payload_bytes": max(0, len(packet) - offset) if offset is not None else 0,
+                    "wire_bytes": RtpStats._wire_bytes(len(packet))}) + "\n")
             profile = stats.snapshot()["profile"]
             restart_generation, ready_packets = switch_gate.feed(packet, profile)
             if restart_generation is not None:
@@ -1693,6 +1765,8 @@ def main() -> int:
                 depacketizer.reset()
             for ready_packet in ready_packets:
                 annex_b = depacketizer.feed(ready_packet)
+                if video_log is not None and annex_b:
+                    video_log.write(annex_b)
                 if annex_b and ready_packet[1] & 0x80:
                     decoded_pts.push_rtp_timestamp(
                         int.from_bytes(ready_packet[4:8], "big"))
@@ -1712,19 +1786,24 @@ def main() -> int:
         cv2.resizeWindow(window, *window_size)
     started_at = time.monotonic()
     last_report = 0.0
+    last_quality_status = 0.0
     next_rebuild_present = started_at
     next_gan_present = started_at
     current_canvas: Optional[np.ndarray] = None
     current_updated = 0.0
     current_source_sequence: Optional[int] = None
+    current_rtp_timestamp: Optional[int] = None
     current_mode = "normal"
     gan_display_fallback = False
     gan_display_signature = None
     first_video_logged = False
+    quality_hud_attempted = False
+    window_frames = WindowFrameTracker()
     exit_code = 0
     try:
         while not stopping.is_set():
             now = time.monotonic()
+            pending_display_event = None
             sync_ms: Optional[int] = None
             if args.duration > 0 and now - started_at >= args.duration:
                 break
@@ -1732,7 +1811,7 @@ def main() -> int:
             values = stats.snapshot()
             profile = values["profile"]
             is_rebuild = profile is not None and profile["name"] == "rebuild"
-            is_gan = profile is not None and profile["name"] in ("gan2", "gan4")
+            is_gan = profile is not None and profile["name"] in GAN_PROFILES
             requested_mode = "gan" if is_gan else ("rebuild" if is_rebuild else "normal")
             if current_mode != requested_mode:
                 previous_mode = current_mode
@@ -1759,6 +1838,7 @@ def main() -> int:
             # output over a new-size source); wait until ProfileSwitchGate has
             # restarted FFmpeg on the complete IDR, then replace the worker.
             if is_gan and profile is not None:
+                profile = receiver_gan_profile(profile, args.ganq_scale, args.gan_enhancer == 'none')
                 try:
                     wanted_gan_signature = gan_profile_signature(profile)
                 except (TypeError, ValueError) as error:
@@ -1879,6 +1959,7 @@ def main() -> int:
                         newest_output.frame, args.rotate, False)
                     current_updated = newest_output.completed_at
                     current_source_sequence = newest_output.source_sequence
+                    current_rtp_timestamp = newest_output.rtp_timestamp
                     gan_display_fallback = False
 
                 # Once fallback is active, every newly decoded source frame is
@@ -1894,6 +1975,7 @@ def main() -> int:
                             frame, args.rotate, gan_profile_sizes(profile)[2])
                         current_updated = updated
                         current_source_sequence = source_sequence
+                        current_rtp_timestamp = source_rtp_timestamp
                         gan_display_fallback = True
                         gan_controller.note_lanczos_display(source_sequence)
                 elif (current_canvas is None and frame is not None and
@@ -1904,6 +1986,7 @@ def main() -> int:
                         frame, args.rotate, gan_profile_sizes(profile)[2])
                     current_updated = updated
                     current_source_sequence = source_sequence
+                    current_rtp_timestamp = source_rtp_timestamp
                     gan_display_fallback = True
                     gan_controller.note_lanczos_display(source_sequence)
                 if now >= next_gan_present:
@@ -1911,13 +1994,19 @@ def main() -> int:
                     skipped = max(0, int((now - next_gan_present) / interval))
                     next_gan_present += (skipped + 1) * interval
                     if current_source_sequence is not None:
-                        presentation.present(
+                        provenance = presentation.present(
                             current_source_sequence,
                             ("GAN-FALLBACK-LANCZOS" if gan_display_fallback else
                              f"GAN-{worker.backend.upper()}"),
                             int(profile["generation"]),
                             now,
                         )
+                        pending_display_event = {"TYPE": "GAN_PRESENT", "AT": now,
+                            "SEQ": current_source_sequence,
+                            "PTS": current_rtp_timestamp,
+                            "GENERATION": int(profile["generation"]),
+                            "PROVENANCE": provenance, "HEADLESS": args.headless}
+                        worker.debug_event(pending_display_event)
             elif (is_gan and frame is not None and source_sequence is not None and
                   gan_profile_decoder_ready(profile) and
                   (frame.shape[1], frame.shape[0]) ==
@@ -1985,6 +2074,14 @@ def main() -> int:
                 else {}
             )
             presentation_values = presentation.snapshot()
+            if (is_gan and worker is not None and args.gan_debug_log is not None and
+                    now - last_quality_status >= 1.0):
+                worker.debug_event(dict(TYPE='QUALITY_RX_STATUS', AT=now,
+                    DECODE_FPS=values['decode_fps'], LOST=values['lost'],
+                    REORDER=values['reordered'], DECODE_ERRORS=values['decode_errors'],
+                    PACKETS=values['packets'],
+                    DECODED_PTS_DROPPED=decoded_pts.snapshot()['dropped']))
+                last_quality_status = now
             if current_canvas is not None and not first_video_logged:
                 print(
                     f"VIDEO FIRST FRAME: startup_ms="
@@ -2049,7 +2146,7 @@ def main() -> int:
                             f" enhancer={gan_values['backend']}"
                             f" provider={gan_values['provider']}"
                             f" input={input_size[0]}x{input_size[1]}"
-                            f" native={native_size[0]}x{native_size[1]}"
+                            f" native={gan_native_size_text(profile, native_size)}"
                             f" output={output_size[0]}x{output_size[1]}"
                             f" output_budget_ms={gan_values['max_latency_ms']:.1f}"
                             f" infer_all_p50_ms={gan_values['infer_all_p50_ms']:.1f}"
@@ -2192,7 +2289,7 @@ def main() -> int:
                     f"GAN H265-only RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} "
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
                     f"INPUT {input_size[0]}x{input_size[1]} "
-                    f"NATIVE {native_size[0]}x{native_size[1]}",
+                    f"NATIVE {gan_native_size_text(profile, native_size)}",
                     f"OUTPUT {output_size[0]}x{output_size[1]}  {output_backend}",
                     gan_bitrate_hud_line(profile, values),
                     f"INFER ALL L/P50/P95/P99/MAX "
@@ -2262,12 +2359,35 @@ def main() -> int:
                             (80, 255, 80), 1, cv2.LINE_AA)
             cv2.imshow(window, canvas)
             key = cv2.waitKey(1 if (is_rebuild or is_gan) else 20) & 0xFF
+            if is_gan and worker is not None and current_source_sequence is not None:
+                window_event = window_frames.submit(
+                    current_source_sequence, current_rtp_timestamp, current_updated,
+                    "GAN-FALLBACK-LANCZOS" if gan_display_fallback else f"GAN-{worker.backend.upper()}",
+                    int(profile["generation"]), time.monotonic())
+                worker.debug_event(window_event)
+                if (not quality_hud_attempted and args.quality_video_log is not None and
+                        window_event["PROVENANCE"].startswith("DECODED+GAN-") and
+                        "FALLBACK" not in window_event["PROVENANCE"]):
+                    quality_hud_attempted = True
+                    try:
+                        saved = cv2.imwrite(
+                            str(args.quality_video_log.with_suffix(".hud.png")), canvas)
+                        if not saved:
+                            print("QUALITY HUD snapshot write failed", flush=True)
+                    except cv2.error as error:
+                        print(f"QUALITY HUD snapshot write failed: {error}", flush=True)
             if key in (ord("q"), 27):
                 break
     finally:
         stopping.set()
         gan_initializer.close()
         receiver.close()
+        for thread in threads:
+            thread.join(timeout=1.0)
+        if packet_log is not None and not threads[0].is_alive():
+            packet_log.close()
+        if video_log is not None and not threads[0].is_alive():
+            video_log.close()
         disable_rebuild_components()
         disable_gan_worker()
         with decoder_lock:

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "validation_state": "CANDIDATE_600S",
+  "sender_binary_sha256": "cf8b7d0340a877ab36b55a1422f99371c8703fd4880ba0b14b30a5a4b973d081",
+  "default_receiver_ip": "192.168.0.100",
+  "default_udp_port": 5004,
+  "validation_gpu": "NVIDIA GeForce RTX 5060 Ti",
+  "models": {
+    "yolo": {
+      "path": "model/yolov8_seg.rknn",
+      "sha256": "aa4a4ae3282e127ab18ed9fc454d02e87db4bae422bf26e3c45feccc3c6ba05d"
+    },
+    "gan_x2": {
+      "path": "model/RealESRGAN_x2_dynamic.onnx",
+      "sha256": "e560ad7ddcb2b12dab3166ee4d5c8e32adfc3cedcbc895e6f69e4913947b92e5"
+    },
+    "gan_x4": {
+      "path": "model/RealESRGAN_x4plus_dynamic.onnx",
+      "sha256": "4851ec156207d271f5328605d0582eeb851e656227da8aca093ced9e60789291"
+    },
+    "labels": {
+      "path": "model/coco_80_labels_list.txt",
+      "sha256": "4d4aaea7bee6be2f675d9b53a9195ca36dfe6429f7479f29155da522a6c85930"
+    }
+  },
+  "profiles": {
+    "60": {
+      "width": 320,
+      "height": 180,
+      "fps": 6,
+      "target": 45,
+      "gop_seconds": 2,
+      "qp_min": 20,
+      "qp_max": 40,
+      "qp_min_i": 28,
+      "enhancer": "x4",
+      "adaptive": false,
+      "provider": "tensorrt-fp16",
+      "qp_max_i": 40
+    },
+    "120": {
+      "width": 320,
+      "height": 180,
+      "fps": 10,
+      "target": 90,
+      "gop_seconds": 4,
+      "qp_min": 20,
+      "qp_max": 40,
+      "qp_min_i": 24,
+      "enhancer": "x4",
+      "adaptive": false,
+      "provider": "tensorrt-fp16",
+      "qp_max_i": 40
+    },
+    "180": {
+      "width": 384,
+      "height": 216,
+      "fps": 8,
+      "target": 155,
+      "gop_seconds": 4,
+      "qp_min": 16,
+      "qp_max": 40,
+      "qp_min_i": 24,
+      "enhancer": "x2",
+      "adaptive": false,
+      "provider": "tensorrt-fp16",
+      "qp_max_i": 40
+    }
+  },
+  "validation": {
+    "candidate_600s": true,
+    "camera_1800s": false,
+    "camera_1800s_status": "CANCELLED_BY_USER",
+    "functional_sender_all_caps": true,
+    "functional_receiver_all_caps": true
+  }
+}

@@ -34,19 +34,22 @@ struct AsyncRtpSenderSnapshot {
     size_t queued_frames;
     size_t queued_bytes;
     uint64_t sent_frames;
+    uint64_t sent_wire_bytes;
+    uint64_t sent_rtp_payload_bytes;
     uint64_t dropped_p_frames;
     uint64_t dropped_key_frames;
     uint64_t last_sent_frame_id;
     uint64_t last_capture_to_send_us;
     uint64_t last_queue_delay_us;
+    uint64_t oldest_queue_age_us;
     uint32_t tx_wire_bps;
     bool waiting_for_key_frame;
     bool sending;
 
     AsyncRtpSenderSnapshot()
-        : queued_frames(0), queued_bytes(0), sent_frames(0), dropped_p_frames(0),
+        : queued_frames(0), queued_bytes(0), sent_frames(0), sent_wire_bytes(0), sent_rtp_payload_bytes(0), dropped_p_frames(0),
           dropped_key_frames(0), last_sent_frame_id(0), last_capture_to_send_us(0),
-          last_queue_delay_us(0), tx_wire_bps(0), waiting_for_key_frame(false), sending(false) {}
+          last_queue_delay_us(0), oldest_queue_age_us(0), tx_wire_bps(0), waiting_for_key_frame(false), sending(false) {}
 };
 
 // Owns the blocking token bucket and UDP socket on a dedicated worker thread.
@@ -109,6 +112,8 @@ private:
     bool sending_;
     std::string failure_message_;
     uint64_t sent_frames_;
+    uint64_t sent_wire_bytes_ = 0;
+    uint64_t sent_rtp_payload_bytes_ = 0;
     uint64_t dropped_p_frames_;
     uint64_t dropped_key_frames_;
     uint64_t last_sent_frame_id_;

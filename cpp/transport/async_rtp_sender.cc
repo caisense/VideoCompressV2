@@ -146,7 +146,17 @@ void AsyncRtpSender::workerLoop() {
             break;
         }
         ++sent_frames_;
-        if (item.access_unit.key_frame) waiting_for_key_frame_ = false;
+        sent_wire_bytes_ += sent_wire_bytes;
+        for (size_t index = 0; index < packets.size(); ++index) {
+            // Current v1 RO GAN metadata uses a 28-byte RTP header.
+            const size_t header = item.access_unit.stream_profile.valid ?
+                ((item.access_unit.stream_profile.target_bitrate_kbps ||
+                  item.access_unit.stream_profile.link_cap_kbps) ? 28U : 24U) : 12U;
+            sent_rtp_payload_bytes_ += packets[index].size() - header;
+        }
+        // Recovery is cleared when a fresh IDR is enqueued. An older IDR can
+        // finish after dependent queued P frames were discarded; its completion
+        // must not cancel that newer recovery request.
         last_sent_frame_id_ = item.access_unit.frame.frame_id;
         last_capture_to_send_us_ = item.access_unit.frame.capture_time_us > 0 &&
             completed_us >= item.access_unit.frame.capture_time_us
@@ -226,11 +236,18 @@ AsyncRtpSenderSnapshot AsyncRtpSender::snapshot() const {
     for (std::deque<QueueItem>::const_iterator it = queue_.begin(); it != queue_.end(); ++it)
         value.queued_bytes += it->access_unit.bytes.size();
     value.sent_frames = sent_frames_;
+    value.sent_wire_bytes = sent_wire_bytes_;
+    value.sent_rtp_payload_bytes = sent_rtp_payload_bytes_;
     value.dropped_p_frames = dropped_p_frames_;
     value.dropped_key_frames = dropped_key_frames_;
     value.last_sent_frame_id = last_sent_frame_id_;
     value.last_capture_to_send_us = last_capture_to_send_us_;
     value.last_queue_delay_us = last_queue_delay_us_;
+    if (!queue_.empty()) {
+        value.oldest_queue_age_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - queue_.front().enqueued_at).count());
+    }
     uint64_t wire_bytes = 0;
     const std::chrono::steady_clock::time_point cutoff =
         std::chrono::steady_clock::now() - std::chrono::seconds(1);
