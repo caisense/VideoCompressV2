@@ -223,6 +223,10 @@ def commands(config: dict, args, directory: Path) -> tuple[list[str], list[str],
               # timestamps can jitter across the nominal last-frame boundary;
               # that tail must not shorten an otherwise complete measurement.
               f"--max-frames={int((args.duration + args.warmup + 1) * config['fps'])}"]
+    if config.get('legacy'):
+        # Stage A is the historical 320x180 gan4 reference.  Keep its opt-in
+        # native-720p geometry after the gan4 default moves to rate120 input.
+        sender.append('--gan-native-720p=on')
     sender += [f'--{flag}={config[key]}' for key, flag in OPTIONAL_ENCODER_OPTIONS.items()
                if key in config]
     if not config.get('legacy'):

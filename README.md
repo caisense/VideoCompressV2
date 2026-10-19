@@ -1,8 +1,92 @@
 # RK3588 YOLOv8-Seg ROI H.265 sender
 
-## gan4 temporal quality configuration
+## 当前启动接口与超分支持（2026-10-19）
 
-For 180p → native 720p at 8fps, use the measured CAP120 configuration in
+README.md 和启动.md 直接在项目根目录持续更新。本文以 docs/history 的对应文档恢复为基础，
+保留原有部署、音频、检测事件、截图和双板说明；下方折叠的旧 GAN 实验仅供追溯。
+
+用 `--rate-profile=rateNN --gan=x2|x4` 组合码率档位与超分倍率；省略 GAN 或 `--gan=off`
+为普通接收。旧 `--rate-profile=gan2/gan4` 及 `--mode=gan/gan2/gan4` 已移除。
+倍率只决定接收端增强，编码分辨率、FPS、GOP、ROI、音频及发送限速由 rate 档位决定。
+
+| 码率档位 | 输入尺寸 / FPS | H.265 目标 / 物理限速配置 | 本次验证倍率 | AI 原生及最终输出 |
+| --- | --- | --- | --- | --- |
+| `rate60` | 320×180 / 10 | 42 / 60 kbps | x2 / x4 | 640×360 / 1280×720 |
+| `rate80` | 320×180 / 10 | 56 / 80 kbps | x2 / x4 | 640×360 / 1280×720 |
+| `rate100` | 384×216 / 10 | 72 / 100 kbps | x2 / x4 | 768×432 / 1536×864 |
+| `rate120` | 480×270 / 10 | 88 / 120 kbps | x2 | 960×540 |
+| `rate150` | 480×270 / 15 | 110 / 150 kbps | x2 | 960×540 |
+| `rate180` | 512×288 / 15 | 135 / 180 kbps | x2 | 1024×576 |
+| `rate200` | 512×288 / 18 | 150 / 200 kbps | x2 | 1024×576 |
+| `rate300` | 640×360 / 20 | 240 / 300 kbps | x2 | 1280×720 |
+
+此前已支持的 `rate120 --gan=x4` 继续保留，原生/最终输出 1920×1080。
+上表尺寸均为旋转前的实际数组尺寸；`--rotate=ccw90` 后宽高交换，不额外缩小。
+rate60 继承其原有灰度编码，超分不会恢复真实颜色。
+
+先启动 Windows 接收端，x2/x4 模型由发送端元数据选择，默认 TensorRT FP16：
+
+```powershell
+Set-Location D:\workspace\VideoCompressV2_TensorRT
+& D:\Python\Python311\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-x4-model=.\model\realesr-general-x4v3_dn05_dynamic.onnx `
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
+```
+
+然后在板端启动，按上表替换 `rate60` 与 `x2`：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 --gan=x2 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=""
+```
+
+x2 模型为 `model/RealESRGAN_x2_dynamic.onnx`；上述 x4 命令明确指定
+`realesr-general-x4v3` 去噪强度 0.5 模型。HUD 和日志显示实际 provider、精度、输入、原生输出、最终输出和旋转后尺寸。
+发送端通过 RO v2 独立传递 rate profile 与 GAN scale；新版发送参数需配套新版接收端。
+
+15/18/20 FPS 的高帧率 x2 档位，默认输出年龄预算最低为 115 ms；
+使用 latest-only 有界缓冲，自动按该预算计算允许序号间隔（15 FPS 为 2 帧，18/20 FPS 为 3 帧）。
+超时仍丢弃并明确回退，显示保持顺序。显式 `--gan-output-latency-budget-ms` 和
+`--gan-recovery-max-sequence-lag` 继续优先生效。发送 FPS 与实际超分显示 FPS 分别统计，
+不保证较高发送 FPS 都能逐帧增强。
+
+首次使用新的输入尺寸时，TensorRT 需要构建对应缓存，引擎构建可能超过一分钟；
+期间 HUD 明确显示 GAN-WARMING/Lanczos。缓存构建结束后才统计实际超分 FPS，
+后续启动复用缓存。
+
+本次逐档实板验证数据见 `runs/gan/rate_matrix_20261019/REPORT.md`。
+
+### 本次实板验证结果（2026-10-19）
+
+RTX 5060 Ti 16GB、TensorRT FP16，每个组合均录制不少于 60 秒的有效段。
+x2 使用 RealESRGAN_x2；x4 使用上述 realesr-general-x4v3（DNI0.5）。
+下面是窗口实际显示的独立超分帧数，不把重复显示或 Lanczos 回退计入 GAN FPS。
+
+| rate 档位 | x2 实测超分 FPS | x4 实测超分 FPS |
+| --- | ---: | ---: |
+| rate60 | 9.99 | 9.97 |
+| rate80 | 9.98 | 9.97 |
+| rate100 | 9.99 | 9.99 |
+| rate120 | 9.97 | 本次未测试 |
+| rate150 | 14.97 | 本次未测试 |
+| rate180 | 14.98 | 本次未测试 |
+| rate200 | 17.85 | 本次未测试 |
+| rate300 | 9.34 | 本次未测试 |
+
+11 项均确认实际增强输出、原生输出尺寸、接收解码 FPS、实际 provider、延迟分布与顺序。
+有效测试段内丢包、乱序、解码错误和倒序呈现均为 0。
+高帧率源不保证逐帧增强：rate300 仍发送/解码约 20 FPS，实际超分约 9.34 FPS，
+有短暂新鲜度回退；详细延迟、回退和线速数据见上述报告。
+这些是当前桌面场景的功能和性能验证，不代表所有场景的画质或长期稳定性结论。
+
+## Historical native-720p temporal-quality experiment
+
+For the historical 180p → native 720p at 8fps experiment, use the explicit
+configuration in
 `tools/start_gan4_stable.sh` or the full command in `启动.md`.
 It bounds base I/P QP to 28–32 using the existing configuration flags,
 keeps GOP at two seconds, and leaves MPP debreath off.
@@ -14,87 +98,42 @@ Comparison evidence is in `runs/gan/gan4_debreath_sweep_20261009/REPORT.md`.
 192.168.0.100 Windows PC 本机：视频 HUD、音频和图片接收端
 192.168.0.101 RK3588 开发板 A：摄像头、YOLOv8-Seg、编码与发送端
 192.168.0.102 RK3588 开发板 B：摄像头、YOLOv8-Seg、编码与发送端
-192.168.0.10  Ubuntu 22.04 虚拟机：交叉编译与部署
+192.168.72.128 Ubuntu 22.04 虚拟机：交叉编译与部署
 ```
 ## Rate profiles
 
-Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4`
-(or the shorter `--profile=`) to select a complete synchronized sender profile.
-Options written after an ordinary `rateNN` profile
-can override individual values. `rebuild` is deliberately atomic: its wire size,
-FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
-options from another profile. `gan2` and `gan4` are also atomic: they are H.265-only on the wire,
-select one shared physical A/V ceiling through `--gan-link-cap-kbps`,
-and never starts the rebuild side channels. Generic encoder geometry and
-`--pacing-bitrate` overrides are rejected for GAN.
+Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild`
+(or `--profile=`) to select sender settings. Combine rate profiles with `--gan=off|x2|x4`
+as documented above. Explicit generic geometry/FPS/bitrate overrides remain available after the rate selector.
+`rebuild` and `ganq60/120/180` remain separate atomic experiments.
 
-| Profile | Wire source / FPS | H.265 target | Shared physical A/V cap | PC display |
-| --- | --- | ---: | ---: | --- |
-| `rate60` (ID 0, former low) | 320×180 / 10 fps | 42 kbps | 60 kbps | decoded grayscale video |
-| `rate80` (ID 5) | 320×180 / 10 fps | 56 kbps | 80 kbps | decoded color video |
-| `rate100` (ID 6) | 384×216 / 10 fps | 72 kbps | 100 kbps | decoded color video |
-| `rate120` (ID 7) | 480×270 / 10 fps | 88 kbps | 120 kbps | decoded color video |
-| `rate150` (ID 1, former medium) | 480×270 / 15 fps | 110 kbps | 150 kbps | decoded color video |
-| `rate180` (ID 8) | 512×288 / 15 fps | 135 kbps | 180 kbps | decoded color video |
-| `rate200` (ID 9) | 512×288 / 18 fps | 150 kbps | 200 kbps | decoded color video |
-| `rate300` (ID 2, former high) | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
-| `rebuild` | 256×144 / 6 fps | 28 kbps | **100 kbps** | reconstructed 640×360 / 12 fps |
-| `gan2` ID 4 CAP 60 | 256×144 / **8 fps** default | 45 kbps | **60 kbps** | x2 512×288, then Lanczos4 640×360 |
-| `gan2` ID 4 CAP 70 | 640×360 / **8 fps** default | 50 kbps | **70 kbps** | x2 native 1280×720 |
-| `gan2` ID 4 CAP 80 | 640×360 / **8 fps** default | 57 kbps | **80 kbps** | x2 native 1280×720 |
-| `gan2` ID 4 CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
-| `gan2` ID 4 CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x2 native 640×360 |
-| `gan2` ID 4 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360 |
-| `gan2` ID 4 CAP 300 | 640×360 / **10 fps** default | 240 kbps | **300 kbps** | x2 native 1280×720 |
-| `gan4` ID 10 CAP 120 | 320×180 / **8 fps** default | 90 kbps | **120 kbps** | x4 Real-ESRGAN native 1280×720 |
-| `gan4` ID 10 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x4 Real-ESRGAN native 1280×720 |
-
-The legacy name `gan` continues to select `gan2`. By default, `gan4` only accepts the
-120/150 kbps presets so the 320×180 input maps to 1280×720 with the x4 model.
-
-The ordinary rate presets use the following encoder details. `I QP` is the
-inclusive I-frame QP range; frame limits are bits.
-
-| Profile | QP init | I QP | max I | max P | background ΔQP |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `rate60` | 38 | 36–48 | 12000 | 5500 | +12 |
-| `rate80` | 37 | 35–47 | 16000 | 7000 | +12 |
-| `rate100` | 36 | 34–46 | 22000 | 9000 | +11 |
-| `rate120` | 35 | 33–45 | 28000 | 11000 | +10 |
-| `rate150` | 34 | 32–44 | 35000 | 14000 | +10 |
-| `rate180` | 33 | 31–44 | 42000 | 17000 | +8 |
-| `rate200` | 32 | 30–43 | 48000 | 19000 | +8 |
-| `rate300` | 30 | 28–42 | 60000 | 24000 | +6 |
-
-All ordinary presets use `qp_min=10`, `qp_max=51`, `halo_delta_qp=2`,
-`core_delta_qp=-6`, `edge_delta_qp=-10`, one-row intra refresh, at most three
-re-encodes, MTU 1200, a 16-frame send queue, and a 2000 ms send-age limit.
-The old CLI/FIFO names are rejected with migration hints: low → rate60,
-medium → rate150, and high → rate300.
-
-Examples:
-
-```bash
-./rknn_yolov8_seg_cam --rate-profile=rate60 --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006
-./rknn_yolov8_seg_cam --rate-profile=rate150 --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
-./rknn_yolov8_seg_cam --rate-profile=rate300 --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
-./rknn_yolov8_seg_cam --rate-profile=rebuild --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --rebuild-udp-port=5009
-./rknn_yolov8_seg_cam --mode=gan --gan-link-cap-kbps=150 --gan-fps=10 \
-  --gan-inference-fps=4 --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --audio=off --preview=off --profile-control=""
-./rknn_yolov8_seg_cam --rate-profile=gan4 --model=model/yolov8_seg.rknn \
-  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
-  --audio=off --preview=off
-```
+<details>
+<summary>Historical GAN tuning and backend experiments (old CLI, retained for reference)</summary>
 
 ## `gan2` / `gan4`: H.265-only full-frame enhancement
+
+The current bare `--rate-profile=gan2` and `--rate-profile=gan4` defaults use the
+same sender preset as `rate120`: 480×270 at 10 fps, 88 kbps H.265 target, 120 kbps
+physical cap, and a 5-second GOP. The receiver selects Real-ESRGAN x2 for `gan2`
+and x4 for `gan4` from the RTP profile. CAP/FPS/target overrides and the explicit
+`--gan-native-720p=on` option still select custom sender geometries.
+
+```bash
+# Board: run one profile after starting the PC receiver.
+./rknn_yolov8_seg_cam --rate-profile=gan2 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+./rknn_yolov8_seg_cam --rate-profile=gan4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+
+# PC: model scale is selected automatically from the RTP profile.
+python .\tools\live_h265_hud.py --udp-port=5004 --gan-enhancer=esrgan `
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
+```
+
+For the default gan2 CAP120 profile, the receiver outputs 960×540 (540p). With
+`--rotate=ccw90`, the displayed frame is 540×960; the HUD reports both sizes.
+Default gan4 CAP120 preserves its native 1920×1080 output; the rotated frame
+is 1080×1920. Neither profile is downscaled to 640×360 after enhancement.
 
 Both tiers keep the board path small and deterministic: camera input is processed by
 YOLOv8-Seg only to produce the encoder ROI/QP map, then MPP emits colour H.265 at
@@ -106,13 +145,14 @@ its sender telemetry remains `RB/1=0 PATCH=0 STATE=0`.
 | ---: | --- | ---: | ---: |
 | `60` | 256×144 / 8 fps | 45 kbps | 1–50 kbps |
 | `100` | 256×144 / 10 fps | 75 kbps | 1–85 kbps |
-| `120` | 320×180 / 8 fps | 90 kbps | 1–100 kbps |
+| `120` | 480×270 / 10 fps | 88 kbps | 1–100 kbps |
 | `150` | 320×180 / 10 fps | 110 kbps | 1–125 kbps |
 | `300` | 640×360 / 10 fps | 240 kbps | 1–260 kbps |
 
 `--gan-fps=6|8|10|12` and `--gan-video-bitrate-kbps=N` may override the default
 within the selected row's allowed range. `gan2` is the x2 Real-ESRGAN tier;
-`gan4` is the x4 tier and by default accepts CAP 120 or 150, both at 320×180 input.
+`gan4` is the x4 tier. Its CAP120 default matches rate120 at 480×270; CAP150
+retains 320×180 input.
 CAP 60 deliberately preserves the proven
 `256×144 @ 8 fps` CUDA inference geometry; its lower 45 kbps TARGET leaves physical
 wire headroom under the 60 kbps CAP. `150` is the recommended low-bandwidth
@@ -130,23 +170,25 @@ preset default is used):
 --mode=gan --gan-link-cap-kbps=60 --gan-fps=8
 # Compatibility baseline: 256x144, 10 fps, TARGET 75, CAP 100
 --mode=gan --gan-link-cap-kbps=100 --gan-fps=10
-# Balanced quality: 320x180, 8 fps, TARGET 90, CAP 120
---mode=gan --gan-link-cap-kbps=120 --gan-fps=8
+# rate120-matched enhancement: 480x270, 10 fps, TARGET 88, CAP 120
+--mode=gan --gan-link-cap-kbps=120 --gan-fps=10
 # Recommended quality: 320x180, 10 fps, TARGET 110, CAP 150
 --mode=gan --gan-link-cap-kbps=150 --gan-fps=10
 # Native 720p enhancement: 640x360, 10 fps, TARGET 240, CAP 300
 --mode=gan --gan-link-cap-kbps=300 --gan-fps=10
-# Native 720p x4 enhancement: 320x180, 8 fps, TARGET 90, CAP 120
---rate-profile=gan4
+# Custom native-720p x4: 320x180, 8 fps, TARGET 90, CAP 120
+--gan-native-720p=on --rate-profile=gan4 --gan-link-cap-kbps=120 --gan-fps=8 --gan-video-bitrate-kbps=90
 ```
 
 The PC path is independent of rebuild state and semantic side data:
 
 ```text
 CAP 60/100: decoded H.265 256×144 -> x2 native 512×288 -> Lanczos4 -> 640×360
-CAP 120/150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 output
+CAP 120 gan2: decoded H.265 480×270 -> x2 native/output 960×540 (540p)
+CAP 150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 output
 CAP 300: decoded H.265 640×360 -> x2 native 1280×720 -> direct 1280×720 output
-GAN4 CAP 120/150: decoded H.265 320×180 -> x4 native 1280×720 -> direct 1280×720 output
+GAN4 CAP 120: decoded H.265 480×270 -> x4 native/output 1920×1080 (1080p)
+GAN4 CAP 150: decoded H.265 320×180 -> x4 native 1280×720 -> direct 1280×720 output
 ```
 
 For `gan4`, the receiver selects `model/RealESRGAN_x4plus_dynamic.onnx` from
@@ -155,14 +197,15 @@ the profile ID and requires `--gan-enhancer=esrgan`:
 ```powershell
 python .\tools\live_h265_hud.py --udp-port=5004 --gan-enhancer=esrgan `
   --gan-esrgan-x4-model=.\model\RealESRGAN_x4plus_dynamic.onnx `
-  --gan-execution-provider=tensorrt-fp16 --rotate=none
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
 ```
 
 For native 720p comparisons at lower link caps, explicitly enable
 `--gan-native-720p=on`. This selects 640×360 source frames for `gan2` and
 320×180 for `gan4`, independently of CAP 60/70/80/100/120/150/300. CAP 70 and
 80 have default TARGET 50 and 57 kbps, respectively, and default 8 fps.
-The explicit option preserves the original source sizes when it is omitted.
+Without this option, source dimensions follow the selected CAP preset; the
+default CAP120 geometry for both profiles is 480×270.
 Use 6 or 8 fps and the same video target/GOP when comparing both routes:
 
 ```bash
@@ -236,12 +279,11 @@ Port `5004` is the default, so `--udp-port=5004` may also be omitted. Use
 `--headless` only for a no-window metrics run. When the receiver starts after
 the sender, it waits for the next complete IDR before displaying video.
 
-For ESRGAN, pass the real model explicitly. Select
-`--gan-execution-provider=cuda` for CUDA with FP32 math (TF32 disabled), or
-`--gan-execution-provider=tensorrt-fp16` for TensorRT with FP16 enabled. TensorRT
-keeps CUDA as the provider for unsupported nodes. Both explicit modes fail clearly
-if the requested GPU provider cannot initialize; neither silently changes the
-whole run to CPU.
+For ESRGAN, pass the real model explicitly. The receiver defaults to
+`--gan-execution-provider=tensorrt-fp16`; TensorRT enables FP16 and keeps CUDA for
+unsupported nodes. Use `--gan-execution-provider=cuda` to select CUDA with FP32
+math (TF32 disabled). A requested GPU mode fails clearly if its provider cannot
+initialize, and the HUD reports the providers that are actually active.
 
 ```powershell
 Set-Location D:\workspace\videoCompressV2
@@ -376,6 +418,9 @@ frame and discarded stale work instead of accumulating delay. There is no
 `NOT RUN`; `tools/export_esrnet_onnx.py` documents the real-checkpoint export
 path and does not rename the ESRGAN model.
 
+
+</details>
+
 ## Runtime profile and transport switching
 
 The sender can change H.265 profiles or switch into detection-triggered image
@@ -391,17 +436,15 @@ echo rate180 > /tmp/roi-rate-profile
 echo rate200 > /tmp/roi-rate-profile
 echo rate300 > /tmp/roi-rate-profile
 echo rebuild > /tmp/roi-rate-profile
-echo gan2 > /tmp/roi-rate-profile
-echo gan4 > /tmp/roi-rate-profile
-echo gan > /tmp/roi-rate-profile  # legacy alias for gan2
+echo rate120 > /tmp/roi-rate-profile  # retains the startup --gan selection
 echo image > /tmp/roi-rate-profile
 echo video > /tmp/roi-rate-profile
 ```
 
 Use `--profile-control=/another/path` to move the FIFO, or
 `--profile-control=` to disable runtime control. Ordinary `rateNN` profiles and `rebuild` enter
-video mode; `gan2` and `gan4` enter the H.265-only full-frame path and keep RB/1, RSNP and
-ROEV disabled. `image` (or `snapshot`) drains the H.265 access unit currently on
+video mode; the startup `--gan` selection is retained across rate changes. With GAN enabled,
+rebuild/image switches require a restart with `--gan=off`. `image` (or `snapshot`) drains the H.265 access unit currently on
 the wire, drops queued dependency frames, shuts down MPP, and keeps camera plus
 RKNN running. `video` cancels any in-flight JPEG transfer, rebuilds MPP, and
 returns with VPS/SPS/PPS plus an IDR. The process, camera and RKNN model remain
@@ -410,8 +453,10 @@ running throughout.
 Every RTP packet carries an RFC 3550 header extension identified by `0x524f`
 (`RO`) with metadata version, profile, width, height, FPS and generation. GAN
 packets additionally append network-order 16-bit `TARGET` and `CAP` fields:
-`TARGET` is `gan_video_bitrate_kbps`, and `CAP` is the selected shared physical
-link ceiling. Non-GAN packets retain the original eight-byte profile record.
+`TARGET` is the configured encoder bitrate in kbps, and `CAP` is the configured shared physical
+link ceiling. Independent `--gan=x2/x4` uses RO v2 with a 16-byte record: the scale
+is at offset 12, followed by three reserved bytes (32-byte total RTP header).
+Legacy wire records remain readable. Non-GAN packets retain the original eight-byte profile record.
 A receiver treats the former `TARGET` + zero-reserved tail
 and the older no-tail GAN record as CAP 100; the latter displays `TARGET --`. The HUD
 buffers the first complete random-access unit of each generation/geometry,

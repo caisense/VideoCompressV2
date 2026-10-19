@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import importlib.util
 import io
 import tempfile
@@ -43,6 +44,91 @@ def rtp_profile_packet(sequence: int, profile: int, width: int, height: int,
         extension.extend(int(target_bitrate_kbps or 0).to_bytes(2, "big"))
         extension.extend(int(link_cap_kbps or 0).to_bytes(2, "big"))
     return bytes(packet[:12] + extension + packet[12:])
+
+
+class ComposedGanProfileTests(unittest.TestCase):
+    def test_v2_scale_output_and_identity(self):
+        for scale in (2, 4):
+            packet = bytearray(rtp_profile_packet(1, 7, 480, 270, 10, 0,
+                                                 target_bitrate_kbps=88, link_cap_kbps=120))
+            packet[15] = 4
+            packet[16] = 2
+            packet[28:28] = bytes((scale, 0, 0, 0))
+            profile = HUD.RtpStats._profile_extension(bytes(packet))
+            self.assertEqual(profile["name"], "rate120")
+            self.assertEqual(profile["gan_scale"], scale)
+            self.assertTrue(HUD.is_gan_profile(profile))
+            self.assertEqual(HUD.gan_profile_sizes(profile)[2], (480 * scale, 270 * scale))
+            self.assertEqual(profile["target_bitrate_kbps"], 88)
+            self.assertEqual(profile["link_cap_kbps"], 120)
+            plain = dict(profile, gan_scale=0)
+            self.assertFalse(HUD.is_gan_profile(plain))
+            self.assertNotEqual(HUD.profile_switch_key(profile), HUD.profile_switch_key(plain))
+            self.assertEqual(HUD.RtpStats._payload_offset(bytes(packet)), 32)
+            packet[28] = 3
+            self.assertIsNone(HUD.RtpStats._profile_extension(bytes(packet)))
+            self.assertIsNone(HUD.RtpStats._profile_extension(bytes(packet[:28])))
+
+
+class RateGanMatrixTests(unittest.TestCase):
+    def test_requested_matrix_metadata_and_native_output(self):
+        matrix = [(0, "rate60", 320, 180, 10, 42, (2, 4)),
+                  (5, "rate80", 320, 180, 10, 56, (2, 4)),
+                  (6, "rate100", 384, 216, 10, 72, (2, 4)),
+                  (7, "rate120", 480, 270, 10, 88, (2,)),
+                  (1, "rate150", 480, 270, 15, 110, (2,)),
+                  (8, "rate180", 512, 288, 15, 135, (2,)),
+                  (9, "rate200", 512, 288, 18, 150, (2,)),
+                  (2, "rate300", 640, 360, 20, 240, (2,))]
+        for ident, name, width, height, fps, target, scales in matrix:
+            for scale in scales:
+                with self.subTest(profile=name, scale=scale):
+                    cap = int(name[4:])
+                    packet = bytearray(rtp_profile_packet(1, ident, width, height, fps, 0,
+                                                         target_bitrate_kbps=target, link_cap_kbps=cap))
+                    packet[15:17] = bytes((4, 2))
+                    packet[28:28] = bytes((scale, 0, 0, 0))
+                    profile = HUD.RtpStats._profile_extension(bytes(packet))
+                    self.assertEqual(profile["name"], name)
+                    self.assertTrue(HUD.is_gan_profile(profile))
+                    self.assertEqual(HUD.gan_profile_sizes(profile),
+                                     ((width, height), (width * scale, height * scale),
+                                      (width * scale, height * scale)))
+                    self.assertEqual(HUD.display_dimensions(width * scale, height * scale,
+                                                            "ccw90", 1),
+                                     (height * scale, width * scale))
+                    self.assertEqual(profile["fps"], fps)
+                    self.assertEqual(profile["link_cap_kbps"], cap)
+
+    def test_high_fps_recovery_accepts_skipped_frames_but_rejects_old_age(self):
+        profile = dict(name="rate300", fps=20, gan_scale=2)
+        budget = HUD.gan_effective_output_budget_ms(20, profile=profile)
+        lag = HUD.gan_effective_recovery_sequence_lag(profile, budget)
+        controller = HUD.GanFallbackController(budget, recovery_max_sequence_lag=lag)
+        accepted = controller.update(1.0, 20.0, 12, idle_worker_snapshot(),
+                                     gan_candidate(10, 0.99, total_pc_ms=90))
+        self.assertEqual(accepted.action, HUD.GanAction.ACCEPT_GAN)
+        too_old = controller.update(1.1, 20.0, 14, idle_worker_snapshot(),
+                                    gan_candidate(12, 1.09, total_pc_ms=116))
+        self.assertEqual(too_old.action, HUD.GanAction.DISCARD_STALE_GAN)
+        too_far = controller.update(1.2, 20.0, 18, idle_worker_snapshot(),
+                                    gan_candidate(13, 1.19, total_pc_ms=90))
+        self.assertEqual(too_far.action, HUD.GanAction.DISCARD_STALE_GAN)
+
+    def test_high_fps_x2_can_finish_with_bounded_age_and_lag(self):
+        for name, fps, expected_lag in (("rate150", 15, 2), ("rate180", 15, 2),
+                                         ("rate200", 18, 3), ("rate300", 20, 3)):
+            profile = dict(name=name, fps=fps, gan_scale=2)
+            budget = HUD.gan_effective_output_budget_ms(fps, profile=profile)
+            self.assertEqual(budget, 115.0)
+            self.assertEqual(HUD.gan_effective_recovery_sequence_lag(profile, budget), expected_lag)
+            self.assertEqual(HUD.gan_effective_output_budget_ms(
+                fps, requested_budget_ms=50, profile=profile), 50)
+            self.assertEqual(HUD.gan_effective_recovery_sequence_lag(profile, budget, 0), 0)
+        # Existing low-rate/legacy modes keep their timing contract.
+        self.assertAlmostEqual(HUD.gan_effective_output_budget_ms(20), 57.5)
+        self.assertEqual(HUD.gan_effective_recovery_sequence_lag(
+            dict(name="gan4", fps=10), 115), 1)
 
 
 class FixedDelayEnhancer:
@@ -224,7 +310,7 @@ class HudTests(unittest.TestCase):
         values = {"rtp_kbps": 30.2, "wire_kbps": 36.5}
         for cap, target, width, height in (
                 (60, 45, 256, 144), (100, 75, 256, 144),
-                (120, 90, 320, 180), (150, 110, 320, 180)):
+                (120, 88, 480, 270), (150, 110, 320, 180)):
             with self.subTest(cap=cap):
                 profile = {
                     "name": "gan2", "width": width, "height": height,
@@ -250,6 +336,18 @@ class HudTests(unittest.TestCase):
         self.assertEqual(profile["link_cap_kbps"], 60)
         self.assertEqual(HUD.gan_profile_sizes(profile),
                          ((256, 144), (512, 288), (640, 360)))
+
+    def test_gan2_rate120_outputs_native_540p_and_reports_rotated_display(self):
+        profile = {
+            "name": "gan2", "width": 480, "height": 270,
+            "fps": 10, "generation": 1, "link_cap_kbps": 120,
+        }
+        input_size, native_size, output_size = HUD.gan_profile_sizes(profile)
+        self.assertEqual(input_size, (480, 270))
+        self.assertEqual(native_size, (960, 540))
+        self.assertEqual(output_size, (960, 540))
+        self.assertEqual(HUD.display_dimensions(*output_size, "ccw90", 1),
+                         (540, 960))
 
     def test_gan_360p_source_keeps_native_720p_output(self):
         profile = {
@@ -338,6 +436,21 @@ class HudTests(unittest.TestCase):
         self.assertEqual(gate.feed(idr_320, gan_320), (9, [idr_320]))
         idr_256 = rtp_profile_packet(63, 4, 256, 144, 10, 10)
         self.assertEqual(gate.feed(idr_256, gan_256_again), (10, [idr_256]))
+
+    def test_gan4_rate120_outputs_native_1080p_and_rotates_display(self):
+        stats = HUD.RtpStats()
+        stats.on_packet(rtp_profile_packet(
+            64, 10, 480, 270, 10, 3,
+            target_bitrate_kbps=88, link_cap_kbps=120))
+        profile = stats.snapshot()["profile"]
+        self.assertEqual(profile["name"], "gan4")
+        self.assertEqual(HUD.gan_profile_sizes(profile),
+                         ((480, 270), (1920, 1080), (1920, 1080)))
+        self.assertEqual(HUD.display_dimensions(1920, 1080, "ccw90", 1),
+                         (1080, 1920))
+        frame = HUD.np.zeros((270, 480, 3), dtype=HUD.np.uint8)
+        fallback = HUD.gan_lanczos_fallback(frame, "ccw90", (1920, 1080))
+        self.assertEqual(fallback.shape, (1920, 1080, 3))
 
     def test_gan4_profile_uses_native_x4_720p_output(self):
         stats = HUD.RtpStats()
@@ -716,6 +829,14 @@ class AsyncInitializationTests(unittest.TestCase):
         gate.set()
         self.assertTrue(wait_for(lambda: disposed == ["old"]))
         self.assertIsNone(loader.poll("a"))
+
+
+class ArgumentDefaultTests(unittest.TestCase):
+    def test_gan_execution_provider_defaults_to_tensorrt_fp16(self):
+        parser = argparse.ArgumentParser()
+        HUD.add_gan_execution_provider_argument(parser)
+        args = parser.parse_args([])
+        self.assertEqual(args.gan_execution_provider, "tensorrt-fp16")
 
 
 if __name__ == "__main__":

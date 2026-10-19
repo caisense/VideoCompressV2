@@ -47,11 +47,14 @@ int main() {
         assert(!parse({profile, "--roi-weight-core=0"}, &invalid));
     }
     AppConfig legacy;
-    assert(parse({"--rate-profile=gan4"}, &legacy));
-    assert(legacy.gan.video_bitrate_kbps == 90 && legacy.encoder.qp_min_i == 36);
+    assert(parse({"--rate-profile=rate120", "--gan=x4"}, &legacy));
+    assert(legacy.gan.scale == 4);
+    assert(legacy.encoder.width == 480 && legacy.encoder.height == 270);
+    assert(legacy.encoder.fps == 10 && legacy.encoder.gop == 50);
+    assert(legacy.encoder.target_bitrate_bps == 88000 && legacy.encoder.qp_min_i == 33);
     AppConfig gan180;
-    assert(parse({"--rate-profile=gan2", "--gan-link-cap-kbps=180"}, &gan180));
-    assert(gan180.encoder.target_bitrate_bps == 145000);
+    assert(parse({"--rate-profile=rate180", "--gan=x2"}, &gan180));
+    assert(gan180.encoder.target_bitrate_bps == 135000);
     RoiMap map;
     map.frame_width = 32; map.frame_height = 18; map.cell_size = 16;
     map.grid_width = 2; map.grid_height = 2;

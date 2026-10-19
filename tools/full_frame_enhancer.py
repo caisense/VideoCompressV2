@@ -3,9 +3,9 @@
 
 The module deliberately has no knowledge of RB/1, semantic masks, reference
 JPEGs, registration, or ROI compositing.  Every model consumes the same
-decoded BGR frame and produces an x2 native frame.  Lower input profiles are
-presented at the shared 640x360 size; 640x360 input is kept at its x2 native
-1280x720 size.
+decoded BGR frame and produces the configured x2 or x4 native frame. The
+receiver chooses the presentation size separately; native 540p, 720p and
+1080p output can be preserved without a conventional post-scale.
 """
 
 from __future__ import annotations

@@ -11,9 +11,9 @@ app_dir=${GAN4_APP_DIR:-/opt/atk/rknn_yolov8_seg_cam}
 cd "$app_dir"
 export LD_LIBRARY_PATH="$app_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec ./rknn_yolov8_seg_cam \
-    --gan-native-720p=on --rate-profile=gan4 \
-    --gan-link-cap-kbps=120 --gan-fps=8 --gan-video-bitrate-kbps=64 \
-    --gan-gop-seconds=2 --gan-inference-fps=0 \
+    --rate-profile=rate120 --gan=x4 --encoder-width=320 --encoder-height=180 \
+    --fps=8 --target-bitrate=64000 \
+    --gop=16 --gan-inference-fps=0 \
     --gan-qp-min-p=28 --gan-qp-max-p=31 --gan-qp-min-i=28 \
     --gan-debreath=off --gan-intra-refresh=off --gan-super-frame=current \
     --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \

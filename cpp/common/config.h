@@ -182,6 +182,8 @@ struct GanBandwidthPreset {
 };
 
 struct GanConfig {
+    // Independent receiver enhancement hint: 0=off, 2=x2, 4=x4.
+    int scale;
     // The board source/encoder cadence is 6, 8, 10 or 12 fps.
     int fps;
     // Zero means run YOLO at the source cadence; a positive value enables
@@ -198,7 +200,8 @@ struct GanConfig {
     std::string super_frame_policy;
     int idr_roi_scale_percent;
     // Explicitly select source geometry that produces native 1280x720:
-    // gan2 sends 640x360; gan4 sends 320x180. Legacy presets stay unchanged.
+    // gan2 sends 640x360; gan4 sends 320x180. The default CAP120 gan2/gan4
+    // sender geometry matches rate120 (480x270); this flag remains an opt-in.
     bool native_720p;
 
     GanConfig();
@@ -214,7 +217,7 @@ struct TransportConfig {
     // Optional receiver SDP emitted from the first IDR access unit.  It carries
     // the H.265 VPS/SPS/PPS required by FFmpeg to determine frame dimensions.
     std::string rtp_sdp_path;
-    // Runtime profile commands are written as rate60/.../rate300/rebuild/gan2/gan4 lines to this
+    // Runtime profile commands are written as rate60/.../rate300/rebuild lines to this
     // FIFO. image/snapshot switches to detection-triggered JPEG transfer;
     // video returns to H.265. Empty disables live switching.
     std::string profile_control_path;

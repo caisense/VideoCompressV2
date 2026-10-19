@@ -15,6 +15,8 @@ struct RtpStreamProfile {
     uint16_t height;
     uint8_t fps;
     uint8_t generation;
+    // RO v2 independent enhancement hint. Zero keeps the v1 wire layout.
+    uint8_t gan_scale;
     // Present only for GAN. Zero preserves the original eight-byte RO record
     // used by all other profiles.
     uint16_t target_bitrate_kbps;
@@ -22,7 +24,7 @@ struct RtpStreamProfile {
     // v1 bytes, so the profile extension remains the same 12-byte payload.
     uint16_t link_cap_kbps;
     RtpStreamProfile()
-        : valid(false), profile(0), width(0), height(0), fps(0), generation(0),
+        : valid(false), profile(0), width(0), height(0), fps(0), generation(0), gan_scale(0),
           target_bitrate_kbps(0), link_cap_kbps(0) {}
 };
 

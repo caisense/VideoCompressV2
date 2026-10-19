@@ -1,0 +1,1033 @@
+> 历史快照：gan2/gan4 启动接口已于 2026-10-19 移除。当前命令见仓库根目录启动.md。
+
+正确流程
+
+## 当前 gan2 / gan4 默认发送规格
+
+直接启动 `gan2` 或 `gan4` 时，板端发送参数与传统 `rate120` 一致：480×270、10 fps、
+H.265 目标 88 kbps、物理 cap 120 kbps、GOP 50（5 秒）、QP 初值 35、I 帧 QP 33–45，
+ROI ΔQP 为背景 +10、核心 −6、边缘 −10。板端不启用音频和本地预览。接收端根据 RTP
+档位自动选择 x2 或 x4 Real-ESRGAN；两种启动方式的发送码流规格相同。
+启用 ESRGAN 时接收端默认使用 TensorRT FP16，HUD 会显示实际运行的 provider。
+默认 gan2 CAP120 的 x2 原生输出为 960×540（540p）；使用 `--rotate=ccw90` 后，窗口中的
+实际显示尺寸为 540×960。HUD 会分别标出旋转前输出和旋转后显示尺寸。
+默认 gan4 CAP120 保留完整 1920×1080 原生输出，逆时针旋转后的画面为 1080×1920。
+
+先在 Windows 本机启动接收端：
+
+```powershell
+Set-Location D:\workspace\VideoCompressV2_TensorRT
+& D:\Python\Python311\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan --rotate=ccw90
+```
+
+再在板子 `root@192.168.0.101` 终端启动其中一个发送档：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=gan2 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=""
+```
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=gan4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=""
+```
+
+接收端根据 RTP 档位选择 x2 或 x4 模型。明确指定 CAP、FPS、目标码率或
+`--gan-native-720p=on` 时属于自定义发送规格；下方按日期记录的其他 gan4 配置包含这类选项。
+
+## gan4 轻量模型测试：完整 1920×1080 输出（2026-10-16）
+
+板端使用上面的 `--rate-profile=gan4` 命令：480×270、10 fps、视频目标 88 kbps、物理 cap
+120 kbps。先启动以下接收端，再启动板端，以接收到完整首个 IDR。
+
+```powershell
+Set-Location D:\workspace\VideoCompressV2_TensorRT
+& D:\Python\Python311\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-x4-model=.\model\realesr-general-x4v3_dn05_dynamic.onnx `
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
+```
+
+这里使用官方默认去噪强度 0.5 的权重插值版；强度 1.0 的原始模型为
+`model\realesr-general-x4v3_dynamic.onnx`，可通过同一个参数切换。两者模型文件约 4.87 MB。
+日志应显示 `native=1920x1080 pre_rotate_output=1920x1080 display=1080x1920`。
+程序将完整 1080p 输出交给显示路径，旋转仅改变方向。
+
+在 RTX 5060 Ti 16GB 上，同源离线原生 1080p 处理 p95：x4plus 192.1 ms，x4v3 0.5 为
+72.0 ms。两分钟实际窗口测试中，平均解码 10.02 fps、worker 有效输出 9.46 fps、窗口
+独立 GAN 帧 8.84 fps；因此不能将离线吞吐 14.79 fps 表述为端到端稳定满 10 fps。
+文字和人像 A/B、延迟分布及完整记录见 `runs/gan/x4v3_test_20261016/REPORT.md`。
+
+## gan4 CAP120 画质折中配置（2026-10-10）
+
+实板比较后新增 `start_gan4_quality.sh`：CAP120、8fps、编码目标64kbps，
+基础QP28–31（原稳定配置为28–32/目标86）。180秒动作录像测试增强约7.99fps，
+无增强丢帧或测量阶段回退；同源线速提高约6.2%，画质提升较小，GOP波动略减。
+真实摄像头60秒复核通过。新脚本已部署，使用现有发送端程序：
+
+```bash
+sh /opt/atk/rknn_yolov8_seg_cam/start_gan4_quality.sh 192.168.0.100
+```
+
+接收端继续使用gan4 TensorRT FP16命令。详细实验见
+`runs/gan/qp_utilization_20261010/REPORT.md`，A/B视频为同目录 `native720_ab.mp4`。
+
+## 当前有线网络拓扑
+
+| 角色 | IP 地址 | 用途 | 登录 |
+| --- | --- | --- | --- |
+| Windows PC 本机 | `192.168.0.100` | 视频 HUD、音频、图片和检测事件接收端 |  |
+| RK3588 开发板 A | `192.168.0.101` | 摄像头、YOLOv8-Seg、编码与发送端 | root（凭据省略） |
+| RK3588 开发板 B | `192.168.0.102` | 摄像头、YOLOv8-Seg、编码与发送端 | root（凭据省略） |
+| Ubuntu 22.04 虚拟机 | `192.168.0.10` | 交叉编译与部署 | alientek（凭据省略） |
+
+下面板端启动命令中的 `--udp-host` 必须指向 Windows PC 本机
+`192.168.0.100`，不能填写虚拟机地址。单板命令默认以开发板 A 为例；双板并发测试见后文。
+
+若接收端改为另一台 RTX 4060 Windows PC（`192.168.0.99`），板端命令中的
+`--udp-host` 必须改为 `192.168.0.99`。4060 PC 上的接收程序必须使用 conda 的
+`videocompress` 环境；不要继续使用本机专用的 `D:\Env\Python\Python314\python.exe`。
+
+4060 PC 若 PowerShell 尚未识别 `conda`，先在 Anaconda Prompt 执行一次
+`conda init powershell`，关闭并重新打开 PowerShell。之后可用下面的预检确认 Python、
+OpenCV、NumPy、FFmpeg 和 CUDA 版 ONNX Runtime 均来自目标环境：
+
+```powershell
+conda run -n videocompress --no-capture-output python -c 'import cv2, numpy, onnxruntime as ort; print("python=ok cv2=" + cv2.__version__ + " numpy=" + numpy.__version__ + " ort=" + ort.__version__); print("providers=" + str(ort.get_available_providers())); raise SystemExit(0 if "CUDAExecutionProvider" in ort.get_available_providers() else 2)'
+conda run -n videocompress --no-capture-output ffmpeg -version
+```
+
+若预检提示缺少模块，在目标电脑执行：
+
+```powershell
+conda install -n videocompress -c conda-forge numpy opencv ffmpeg
+conda run -n videocompress --no-capture-output python -m pip install "onnxruntime-gpu[cuda,cudnn]"
+```
+
+`onnxruntime-gpu[cuda,cudnn]` 会把与 ONNX Runtime GPU 包匹配的 CUDA/cuDNN
+运行库装入当前环境；启动器也会搜索 conda 环境的 `Library\bin`。如果日志仍出现
+`LoadLibrary failed with error 126`，先重新执行上面的安装，再确认 NVIDIA 驱动正常，
+不要用 `--gan-require-cuda` 关闭检查来掩盖 CPU 回退。
+
+当前新板的 Buildroot 镜像中，ES8388 录音设备枚举为 `card 3, device 0`
+（`hw:3,0`）；`card 4`、`card 5` 是 HDMI 播放设备，不是麦克风。若以后重新刷机，先用
+`arecord -l` 确认声卡号，再替换本文的 `3`。
+
+## 2026-10-08：低限速原生 720p
+
+最新发送端支持 `--rate-profile=gan2|gan4` 和
+`--gan-native-720p=on`。后者将 gan2 输入固定为 640×360、gan4 输入固定为
+320×180，两者均由模型原生输出 1280×720。当前默认 CAP120 输入为 480×270；本节历史
+原生720p测试命令显式启用该选项，未启用时按所选 CAP 预设决定输入尺寸。
+支持 CAP 60/70/80/100/120/150/300，以及 6/8/10/12 fps。
+同源测试数据见 `runs/gan/cap60_120_compare_20261008/REPORT.md`。
+
+gan4 去呼吸推荐配置（2026-10-09）：CAP120、8fps、视频目标86kbps、
+基础 QP 28～32。原 CAP60 最低已测配置只通过传输测试，存在明显 GOP 呼吸，
+连续画面优先使用下面的配置。数据见 `runs/gan/gan4_debreath_sweep_20261009/REPORT.md`。
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --gan-native-720p=on --rate-profile=gan4 \
+  --gan-link-cap-kbps=120 --gan-fps=8 --gan-video-bitrate-kbps=86 \
+  --gan-gop-seconds=2 --gan-inference-fps=0 \
+  --gan-qp-min-p=28 --gan-qp-max-p=32 --gan-qp-min-i=28 \
+  --gan-debreath=off --gan-intra-refresh=off --gan-super-frame=current \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=
+```
+
+部署后也可执行 `sh /opt/atk/rknn_yolov8_seg_cam/start_gan4_stable.sh 192.168.0.100`。
+脚本使用已有参数实现推荐配置。QP 范围同时约束基础 I/P QP 和初始化 QP；
+ROI 偏置仍保留。CAP120 为 IDR 突发留余量，实测平均线速不等于120kbps。
+
+gan2 原生720p同样启用 `--gan-native-720p=on`，可选择 CAP60/6fps/TARGET43、
+CAP70/8fps/TARGET50、CAP80/8fps/TARGET57；实际通过条件和线速峰值以测试报告为准。
+
+本机接收端（先启动接收端，再启动板端）：
+
+```powershell
+Set-Location D:\workspace\VideoCompressV2_TensorRT
+.\runs\gan\tensorrt-venv\Scripts\python.exe .\tools\live_h265_hud.py `
+  --udp-port=5004 --rotate=ccw90 --gan-enhancer=esrgan `
+  --gan-execution-provider=tensorrt-fp16 `
+  --gan-trt-cache-dir=.\runs\gan\trt_cache --gan-warmup=1
+```
+
+模型由 RTP 档位自动选择。HUD 应显示 `NATIVE 1280x720 OUTPUT 1280x720`。
+`--rotate=ccw90` 将最终画面逆时针旋转90度，720p输出显示为720×1280，
+模型仍处理未旋转的原始帧。使用 `--rotate=none` 可恢复横向显示。
+接收端已将 GAN 模型加载、TensorRT 预热和推理移至独立后台进程：预热期间显示并标记
+`GAN WARMING / Lanczos4 (not AI output)`，模型就绪后切换到 GAN，
+窗口刷新不再等待整个初始化流程。首次构建引擎仍可能较慢，缓存请继续复用。
+
+## 0. 部署已构建的 RK3588 包
+
+**2026-09-02 GAN 版本已完成交叉编译并部署到开发板 101**：Ubuntu
+`192.168.0.10` 使用 RK3588 AArch64 工具链和 Codec2 1.2.0 构建了
+`artifacts/videoCompressV2-goal0902-rk3588.tar.gz`，包 SHA-256 为
+`58e924f2b065b264e70203211d8cb010d3364f8931961780a3851be54f71a607`，板端已安装二进制
+SHA-256 为 `2e57ee58d1e30c745fec7da510539dfdba5232637de8e6258a57da502619182b`。
+部署目标是 `/opt/atk/rknn_yolov8_seg_cam`，采用同文件系统暂存后原子替换，旧目录保留为
+`/opt/atk/rknn_yolov8_seg_cam.backup_20260902_085237`。
+
+开发板 101 已用真实摄像头执行 `--mode=gan --gan-fps=8 --gan-inference-fps=4`
+两帧自检：RKNN、RGA、MPP H.265 和 Codec2 均加载成功并发送 IDR/P 帧，日志中的
+`RB/1=0 PATCH=0 STATE=0` 均为零，进程退出码为 `0`。PC 端随后真实接收
+`256×144@8` RTP，`lost=0`、`reorder=0`、`decode_errors=0`；`none/Lanczos4` 全帧路径输出
+`640×360`，100 ms 延迟预算内的总处理 p50/p95/p99 为 `2.519/3.614/4.602 ms`。
+
+GAN 实时运行必须按下面的顺序在两个终端执行。板端命令只在开发板
+`root@192.168.0.101` 的 Linux SSH/串口终端执行，不能直接粘贴到 Windows
+PowerShell；PC 命令只在 `D:\workspace\videoCompressV2` 的 PowerShell 执行。
+
+板端终端：
+
+| 链路档 | 启动选择 | 发送 H.265 | 默认 TARGET / CAP | PC x2 路径 |
+| --- | --- | --- | --- | --- |
+| 低码率稳定 GAN | `--gan-link-cap-kbps=60 --gan-fps=8` | 256×144 @8 | 45 / 60 kbps | 512×288 后 Lanczos4 到 640×360 |
+| 兼容基准 | `--gan-link-cap-kbps=100 --gan-fps=10` | 256×144 @10 | 75 / 100 kbps | 512×288 后 Lanczos4 到 640×360 |
+| CAP120 自定义 8fps | `--gan-link-cap-kbps=120 --gan-fps=8` | 480×270 @8 | 88 / 120 kbps | x2 原生/输出 960×540 |
+| 推荐质量 | `--gan-link-cap-kbps=150 --gan-fps=10` | 320×180 @10 | 110 / 150 kbps | 原生 640×360 |
+| gan4 默认 CAP120 | `--rate-profile=gan4` | 480×270 @10 | 88 / 120 kbps | x4 原生/输出 1920×1080 |
+
+这四个档位的 `CAP` 都是视频和可选 Codec2 音频合计的物理 wire 上限；音频 reserve
+先从 CAP 中扣除，剩余部分才是视频子桶。不要在 GAN 命令中追加通用
+`--pacing-bitrate`、`--encoder-width`、`--encoder-height` 或 `--gop`。
+
+CAP 60 不采用更小的输入尺寸，而是复用本机已实测稳定的 `256×144 @ 8 fps` ESRGAN/CUDA
+路径；`TARGET 45` 和最高 `50 kbps` 为 RTP、以太网开销及 I 帧留出余量。它优先保证 GAN
+输出的新鲜度，画质低于 CAP 100。
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --mode=gan --gan-link-cap-kbps=150 --gan-fps=10 --gan-inference-fps=4 \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --profile-control="" --audio=off --preview=off
+```
+
+这里的 `--profile-control=""` 是一个空字符串参数，表示关闭运行时 FIFO 控制，
+不是等待用户输入，也不是未完成的命令。实时运行时程序以前台方式持续采集，
+因此不会返回 Shell 提示符；按 `Ctrl+C` 才会停止。
+
+板端若只想确认二进制、摄像头和 H.265 是否能启动，先运行两帧自检：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --mode=gan --gan-link-cap-kbps=60 --gan-fps=8 --gan-inference-fps=4 \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --profile-control="" --audio=off --preview=off --max-frames=2
+echo "RC=$?"
+```
+
+正常应看到 `GAN H.265-only mode enabled`、IDR/P 帧发送日志，最后显示 `RC=0`。
+未设置 `--max-frames` 时发送端会持续前台运行；若仍没有 Shell 提示符，另开 SSH/串口终端检查
+`ps | grep '[r]knn_yolov8_seg_cam'`；有进程表示它正在前台运行，使用 `Ctrl+C` 停止。
+
+PC 端直接按发送端 UDP 端口启动带窗口的视频接收端（不要加 `--headless`）：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+New-Item -ItemType Directory -Force .\runs\gan | Out-Null
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=none --rotate=none
+```
+
+如果只需要后台接收和统计、不需要视频窗口，才加 `--headless`。接收端最好先启动，
+看到窗口中的 `WAITING FOR COMPLETE IDR` 后再启动板端；若板端已经在发送，接收端会等到
+下一帧 IDR 后才开始显示。
+
+GAN 接收端的默认输出预算是按源帧率自动计算的：
+`1.15 × 1000 / source_fps`，所以 8/10/12 fps 分别约为 `143.8/115.0/95.8 ms`。
+旧参数 `--gan-max-inference-latency-ms` 仍可作为显式固定预算使用，但已废弃，启动日志会标出
+`LEGACY_FIXED`。新的 HUD 分开显示 `AGE DEC`（最新解码帧）、`GAN`（最近有效 GAN 输出）和
+`RUN`（当前推理调用），不能把 `RUN=84 ms` 误读为硬卡死。
+
+接收端从 RTP profile 自动选择 GAN 尺寸：60/100 档显示 `INPUT 256x144 NATIVE
+512x288 OUTPUT 640x360`；默认 gan2 CAP120 显示 `INPUT 480x270 NATIVE 960x540`
+和 `OUTPUT 960x540 DISPLAY 540x960`（默认逆时针旋转）；gan4 CAP120 显示
+`INPUT 480x270 NATIVE 1920x1080 OUTPUT 1920x1080 DISPLAY 1080x1920`。150 档显示
+`INPUT 320x180 NATIVE 640x360 OUTPUT 640x360`。档位切换或发送端
+重启导致尺寸变化时，HUD 会等新完整 IDR、按新 SPS 重建 FFmpeg 和 full-frame worker，
+无需重启 HUD。
+
+`gan4` 使用 RTP profile ID 10、x4 模型；默认 CAP120 输入为 480×270，显式启用
+`--gan-native-720p=on` 时输入为 320×180、AI 原生输出 1280×720。接收端必须启用
+`--gan-enhancer=esrgan`。x2 profile ID 4 的新名称为 `gan2`，旧名称 `gan` 仍作为兼容别名。
+
+若有效 GAN 输出超过 soft threshold，HUD 只进入 `STATE SOFT-FALLBACK`，并用每个新解码帧的
+`Lanczos4` 保持视频运动；只有当前推理 `RUN AGE >= --gan-hard-stall-ms`（默认 500 ms）才记为
+`HARD-STALL`。恢复需要 `--gan-recovery-good-frames`（默认 3）个新鲜连续输出；同一 source 的
+GAN 结果允许把该帧的 Lanczos 升级为 GAN，严格旧于已显示 Lanczos source 的结果才不能覆盖画面。
+允许的一帧 lag 仍可作为 GPU 已恢复的证据。H.265 接收、解码和 fallback 不等待 GPU，也不会停止。
+
+推荐先启动 PC 接收端再启动板端。视频端口保持默认 `5004` 时，甚至可以省略
+`--udp-port`：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py `
+  --gan-enhancer=none --rotate=none
+```
+
+若出现 `./rknn_yolov8_seg_cam: not found`，先执行板端的 `cd`；若出现
+`cannot bind UDP 5004`，先关闭占用同一端口的旧接收进程。
+若出现 `unknown option --mode=gan` 或 `--gan-fps`，说明板端仍是旧二进制，应重新部署本节
+开头记录的 GAN 包，不能用旧目录中的程序替代。
+
+PC 端的 `none` 模式使用上面的命令；
+ESRNet/ESRGAN 必须分别提供真实模型，CUDA 要求启用时若运行时未激活
+`CUDAExecutionProvider`，结果应记录为 `NOT RUN`。
+
+PC 端实际使用 ESRGAN/CUDA 时：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
+  --gan-require-cuda `
+  --gan-output-latency-budget-ms=0 `
+  --gan-output-latency-factor=1.15 `
+  --gan-hard-stall-ms=500 `
+  --gan-recovery-good-frames=3 `
+  --gan-recovery-max-sequence-lag=1 `
+  --gan-debug-log=.\runs\gan\esrgan8.jsonl
+```
+
+在 RTX 4060 PC 上应使用下面的等价命令。`$tag` 现在只用于区分 JSONL 日志；
+每次测试使用新的 `$tag`，避免把多次运行追加到同一个日志：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+$tag = "cap60_f8_i4_b45_4060"
+New-Item -ItemType Directory -Force .\runs\gan | Out-Null
+conda run -n videocompress --no-capture-output python .\tools\live_h265_hud.py --udp-port=5004 `
+  --rotate=ccw90 `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
+  --gan-require-cuda `
+  --gan-output-latency-budget-ms=0 `
+  --gan-output-latency-factor=1.15 `
+  --gan-hard-stall-ms=500 `
+  --gan-recovery-good-frames=3 `
+  --gan-recovery-max-sequence-lag=1 `
+  --gan-debug-log=".\runs\gan\$($tag).jsonl"
+```
+
+接收器会根据实际 FFmpeg 能力选择 `-fps_mode passthrough`（新版本）或
+`-vsync 0`（旧版本）；因此旧 FFmpeg 不支持 `fps_mode` 时也不会在启动阶段退出。
+
+4060 场景测试应同时选择 CAP、源 fps 和 target；显式 target 不能超过该 CAP 的上限
+（60/100/120/150 分别为 50/85/100/125 kbps）：
+
+```bash
+# 低码率稳定 GAN：CAP 60 / 256x144 / 8 fps / TARGET 45
+--gan-link-cap-kbps=60 --gan-fps=8 --gan-inference-fps=4 --gan-video-bitrate-kbps=45
+
+# 兼容稳定性：CAP 100 / 256x144 / 10 fps / TARGET 75
+--gan-link-cap-kbps=100 --gan-fps=10 --gan-inference-fps=4 --gan-video-bitrate-kbps=75
+
+# CAP120 自定义 8fps：当前输入 480x270 / TARGET 90
+--gan-link-cap-kbps=120 --gan-fps=8 --gan-inference-fps=4 --gan-video-bitrate-kbps=90
+
+# 推荐质量：CAP 150 / 320x180 / 10 fps / TARGET 110
+--gan-link-cap-kbps=150 --gan-fps=10 --gan-inference-fps=4 --gan-video-bitrate-kbps=110
+
+# 仅用于 4060 压力实验：CAP 150 / 12 fps / TARGET 125
+--gan-link-cap-kbps=150 --gan-fps=12 --gan-inference-fps=4 --gan-video-bitrate-kbps=125
+```
+
+完整板端模板为：
+
+```bash
+CAP=60; FPS=8; INFER_FPS=4; BITRATE=45; TAG="cap${CAP}_f${FPS}_i${INFER_FPS}_b${BITRATE}_4060"
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --mode=gan --gan-link-cap-kbps="$CAP" --gan-fps="$FPS" --gan-inference-fps="$INFER_FPS" \
+  --gan-video-bitrate-kbps="$BITRATE" --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.99 --udp-port=5004 \
+  --profile-control="" \
+  --audio=off --preview=off
+```
+
+`--gan-inference-fps` 只改变板端 YOLO/ROI 更新频率，不改变发往 4060 的视频帧率；
+`--gan-fps` 只能取 `8`、`10`、`12`，`--gan-video-bitrate-kbps` 上限随 CAP 为
+`50/85/100/125 kbps`。切换组合时先停止旧板端进程再用新参数启动；只要 UDP 端口不变，
+PC 接收端无需重启。
+
+判定 CAP 60 是否稳定时，不要只看 `OUTPUT ... CUDAExecutionProvider`：连续运行后应同时看到
+`ENH` 接近 `RX/DEC`、`GOOD PC` 非零且低于 `BUDGET 143.8 ms`、`AGE GAN` 持续刷新，以及
+`DROP ... PRED/POST`、`PRESENT OLD` 不持续增长。`PRED` 是近期 provider p95 预计必然超时、
+因此未进入 GPU 的累计 pending 数；它不是 FIFO 堆积。若一次 p95 尖峰会阻断后续采样，
+接收端最多每 250 ms 放行一帧刷新探测，使历史可自行恢复。详细 HUD 口径见 [协议.md](协议.md)。
+
+只做后台统计时追加 `--headless --duration=600`；需要视频窗口时不要加 `--headless`。
+分析已完成的 JSONL 使用：
+
+```powershell
+& D:\Env\Python\Python314\python.exe .\tools\analyze_gan_run.py `
+  .\runs\gan\esrgan8.jsonl
+```
+
+4060 PC 的日志分析也应在同一 conda 环境中执行：
+
+```powershell
+conda run -n videocompress --no-capture-output python .\tools\analyze_gan_run.py `
+  .\runs\gan\cap60_f8_i4_b45_4060.jsonl
+```
+
+RealESRGAN 输出固定按模型的 `ZERO_TO_ONE` 契约处理：先 clip 到 `[0,1]`，再乘 255，
+不会根据单帧 `RAW_MIN/RAW_MAX` 在 `[0,1]` 与 `[-1,1]` 之间切换。模型轻微负值或大于 1
+属于 convolution overshoot。开启 `--gan-debug-log` 后，`GAN_WORKER` 会记录
+`RAW_MIN`、`RAW_MAX`、`POSTPROCESS_MODE`、clip 数量和 `OUTPUT_LUMA_MEAN`；白闪问题应使用
+新的 JSONL 文件分析，避免把多次运行追加到 `esrgan8.jsonl` 后误判。
+
+2026-09-03 PC 实测：板 101 的 ESRGAN/CUDA 在 8 fps 连续 `634.1 s`，接收/解码/增强/显示
+均约 `8.0 fps`，`5068` 次推理全部返回且全部在 AUTO `143.75 ms` 预算内；all-inference
+`p50/p95/p99/max=82.03/90.77/98.03/119.36 ms`，成功输出总时延
+`82.14/90.92/98.13/119.43 ms`，worker/presentation drop 均为 `0`，`LOSS=0`、`ERR=0`、
+实际 provider 为 `CUDAExecutionProvider`，`HARDSTALL=0`。发送端停止后的收尾阶段产生 1 次
+正常的 soft overdue，不计入运行期间的周期性闪烁。
+
+2026-09-02 PC 实测：`none` 在 8 fps 连续 63.7 s，唯一增强 8.04 fps、丢弃 0.78%、
+总处理 p95 6.82 ms；同一板端 H.265 流上的 ESRGAN CUDA 在 8/10 fps 分别为
+8.08/10.10 fps 且 0 丢弃，p95 为 89.00/93.90 ms；12 fps 主动丢旧帧，增强约 2.94 fps、
+丢弃 75.68%，队列仍限制为运行中 1 帧加 pending 1 帧。三档真实接收均无丢包、乱序和解码错误。
+ESRNet 因仓库没有对应 ONNX 模型暂记 `NOT RUN`，不能用 ESRGAN 改名代替。
+
+固定 100 ms 对照也已量化：旧 8 fps 样本为 `88/88` 接受、总时延最大 `98.88 ms`；
+新增 deterministic `8 fps/110 ms` 测试在 AUTO `143.75 ms` 下接受，而旧固定预算会误丢。
+旧 12 fps 样本有 `82` 次 `stale_after_infer`、`2` 次 `replaced_pending`；被丢弃调用的总时延
+`p50/p95/p99/max=130.82/164.71/170.59/173.59 ms`，推理本身为
+`85.40/94.08/97.59/105.23 ms`（全部调用的 p99 为 `95.74 ms`）。
+
+## HUD 指标
+
+HUD 的完整字段表、GAN 成功使用判定、rebuild 的 21 行含义和普通档口径统一维护在
+[协议.md](协议.md) 的“PC HUD：字段口径与 GAN 成功判定”章节。启动文档只保留收发命令，
+避免字段解释与运行代码脱节。
+
+HUD 接收器自行监听 UDP、解包 RTP 并把 Annex-B H.265 交给 FFmpeg。发送端运行时切换
+档位后，档位元数据由每个 RTP 包携带，新 VPS/SPS/PPS 随 IDR 在码流内发送；PC 接收端只需
+保持同一 UDP 端口，无需重启。
+
+视频实时运行时，顺序必须是：
+
+1. 先在Windows PC启动带HUD的实时接收端并占用5004端口：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+python tools\live_h265_hud.py --udp-port=5004
+```
+
+HUD会自动识别解码后的实际分辨率；不要再为320×180或480×270手工设置接收端宽高，也不要同时运行第二个5004接收程序。
+HUD默认将画面逆时针旋转90度，并启用边缘保持平滑降噪；如需关闭可加 `--rotate=none --denoise=off`。
+
+窗口显示 `WAITING FOR COMPLETE IDR` 后再启动板端。HUD显示接收/解码FPS、
+RTP与物理链路kbps、丢包、乱序、解码错误、显示帧年龄和最近IDR时间。
+不要同时运行FFplay或`receive_h265_rtp.sh`，否则会抢占UDP 5004。
+
+## 四类检测事件：ROEV/1 UDP `5010`
+
+本次源代码重新编译、部署后，板端会在 YOLOv8-Seg 检测到 `person`、`car`、`boat`、
+`airplane` 时，通过独立的 ROEV/1 UDP 通道推送事件。它不写入 H.265 RTP，
+也不显示在视频 HUD 中；请让 PC 的独立事件接收器常驻运行。默认开启，使用独立的
+置信度阈值 `0.35`，只在类别集合变化时立即发送，目标持续存在时每 `1000 ms` 发送一次
+心跳状态。普通视频、rebuild 和图片模式都可用；`--mode=baseline` 没有 YOLO 推理，因而没有事件。
+`--mode=gan` 为 H.265-only，强制不启用 ROEV/1、RB/1 或 PATCH。
+
+先在 Windows PC 新开终端：
+
+```powershell
+cd D:\workspace\videoCompressV2
+python tools\receive_detection_events.py --port 5010
+```
+
+若 Windows 防火墙未放行，管理员 PowerShell 执行一次：
+
+```powershell
+New-NetFirewallRule -DisplayName 'RK3588 ROEV events UDP 5010' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5010
+```
+
+然后在任一板端视频、rebuild 或图片模式启动命令的末尾追加（不写也会采用这些默认值）：
+
+```bash
+--event-push=on --event-udp-port=5010 \
+--event-min-confidence=0.35 --event-heartbeat-ms=1000
+```
+
+板端日志出现 `Detection event push enabled` 表示功能已启用；类别集合变化后出现
+`Detection event sent: ... present_mask=... entered_mask=... exited_mask=...`。常规状态行的
+`event_packets/event_heartbeat/event_wire_bytes/event_mask/event_q` 分别是累计事件包、累计
+心跳、按共享限速器计的物理线速字节、最近四类状态 mask 和待发队列深度。PC 默认文字输出为
+“`2个人出现`”“`当前检测到1辆车`”“`人员离开`”，不显示置信度；`--json` 输出则保留
+`present_mask`、`entered_mask`、`exited_mask`、实例数与最高置信度，供上层告警使用。完整字节布局
+见 [协议.md 的 ROEV/1 节](协议.md#9-roev1-四类检测事件推送)。
+
+旧部署包不含这些 `--event-*` 参数；若看到
+`configuration error: invalid value or unknown option: --event-push`，说明板端尚未替换为本次
+重新编译的二进制，而不是接收端或网络故障。
+
+## rebuild 档：100 kbps、PC 重建 640×360 @ 12 fps
+
+`rebuild` 是第四个视频档，不是原有 `low` 的改名。线上基础视频为彩色
+`256×144 @ 6 fps`、H.265 目标 `28 kbps`；YOLO 语义状态和稀疏原相机 ROI 参考走
+`RB/1` UDP `5009`。H.265、RB/1 与可选 Codec2 音频合计物理上限严格为
+`100000 bit/s`。标准 FFplay 仍可解码 UDP `5004`，但只会看到基础层；完整重建必须用 HUD。
+参考发送默认每个目标每 `700 ms` 最多刷新一次，单个参考以 parity 加数据分片渐进发送；默认
+JPEG 上限 `1600 B`、分片 `1100 B`，每个源帧最多发 2 个分片，以缩短参考完成时间而不阻塞
+H.265/STATE。参考分片带有参考时刻 detector bbox，PC 先对当前框做 EMA，再按参考框到当前框
+等比配准 crop，并在预测位置 `±8 px` 内做内容相关校正。掩码核心区完全替换、边缘羽化半径
+随 64×64 掩码放大倍率自适应；若中心位移超过 25%、面积比不在 `[0.70,1.40]`、相关度过低
+或参考超过 `1.0 s`，HUD 会显示 `REGDROP/MATCHDROP`、不贴图，回退到基础层。
+
+Real-ESRGAN 只安装在 Windows PC 接收端，不部署到 RK3588。当前 PC 有 NVIDIA GPU 时使用 CUDA
+档；CPU 档只用于无 NVIDIA GPU 的回退。两种 ONNX Runtime 包不能共存。确认模型位于
+`D:\workspace\videoCompressV2\model\RealESRGAN_x2_dynamic.onnx`：
+
+```powershell
+cd D:\workspace\videoCompressV2
+# NVIDIA CUDA 12 / cuDNN 9（推荐）
+python -m pip uninstall -y onnxruntime onnxruntime-gpu
+python -m pip install --upgrade --only-binary=:all: -r requirements-rebuild-cuda-pc.txt
+python -c "import onnxruntime as ort; ort.preload_dlls(directory=''); print(ort.__version__, ort.get_available_providers())"
+```
+
+预期列表包含 `CUDAExecutionProvider`。若 PC 没有 NVIDIA CUDA GPU，安装
+`requirements-rebuild-pc.txt` 作为 CPU 回退，并跳过 `preload_dlls` 调用。
+
+PC 终端 1 直接按视频端口启动 Real-ESRGAN HUD：
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+python tools\live_h265_hud.py --udp-port=5004 `
+  --rebuild-port=5009 `
+  --esrgan=auto `
+  --esrgan-model=model\RealESRGAN_x2_dynamic.onnx `
+  --esrgan-threads=2
+```
+
+HUD 直接监听视频端口 `5004`；这里显式监听 RB/1 `5009`。
+Windows 防火墙应放行 UDP `5004`、`5009`、`5010`，启用音频时再放行 `5006`。生产显示不绘制
+目标框，HUD 显示 `BOX OFF`；只在临时诊断时追加 `--rebuild-boxes=on`。
+
+成功时控制台出现 `loaded ROI model ... (CUDAExecutionProvider); warmup ... ms`，HUD 显示
+`SR Real-ESRGAN/CUDA`。`FRAME ...+ROI-ESRGAN` 才表示当前显示帧实际使用了超分缓存；新的
+参考刚到达时先用 `ROI-LANCZOS`，后台推理完成后再切换是正常的。接收端在 RB/1 参考完整收齐时
+就启动后台超分，并在发送端补发匹配 STATE 后才允许贴图，所以不会因等待 `PTSAGE` 接近 `+1000ms`
+才开始 GPU 推理。没有目标时不会创建超分任务。
+CUDA 运行库不可用时会依次回退 CPU 或 Lanczos4，不会中断接收。GPU 只加速 PC 的 ROI 超分，
+不改变板端 H.265 编码、UDP 限速或基础视频帧率。默认逆时针旋转后，视频内容仍是 640×360，窗口
+客户区自动匹配为 `360×640`；无需传 `--width/--height/--scale`。
+
+**本机实测（RTX 3060 Laptop GPU，2026-08-27）**：动态模型 `105×128 -> 210×256` ROI 的
+CUDA 端到端超分中位数为 `93.13 ms`（P95 `105.60 ms`）；CPU 两线程为 `889.40 ms`
+（P95 `1097.76 ms`），约快 `9.55×`。CUDA 会在后台完成模型加载和一次典型 `106×128` 动态尺寸
+预热（本机实测约 `3.5 s` 推理预热）；`SR` 在预热完成后才接收参考任务，之后异步 ROI 作业可在
+6 fps 源帧间隔内完成；该收益不改变基础 H.265 或网络时延。
+
+HUD 已出现等待提示后，在板端执行完整命令：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rebuild \
+  --mode=segmentation \
+  --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --rebuild-udp-port=5009 \
+  --send-queue-frames=3 --send-max-latency-ms=250 \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 \
+  --audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400 \
+  --audio-frames-per-packet=4 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --audio-dtx=on --audio-dtx-preroll-ms=80 --audio-dtx-hangover-ms=600 \
+  --audio-dtx-keepalive-ms=1000 --audio-reserve-bitrate=0 --audio-max-latency-ms=160 \
+  --audio-preprocess=on --audio-highpass-hz=80 --audio-lowpass-hz=3600 \
+  --audio-noise-suppression-db=6 --audio-noise-gate-snr-db=2 \
+  --audio-noise-gate-attenuation-db=30 --audio-noise-gate-hangover-ms=600 \
+  --audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20 \
+  --audio-vad=on --audio-vad-start-frames=2 --audio-vad-min-voicing=42 \
+  --profile-control=/tmp/roi-rate-profile \
+  --preview=on --preview-rotate=ccw --preview-width=720 --preview-height=1280
+```
+
+不要在 `--rate-profile=rebuild` 后追加旧档位的 `--encoder-width`、`--encoder-height`、
+`--fps`、`--target-bitrate`、`--pacing-bitrate` 或 `--grayscale-encode`。程序会将 rebuild
+作为原子档位校验，混用后立即报出 `rebuild is an atomic 256x144@6 ... profile`，从源头避免
+HUD 显示 REBUILD、实际却仍是 `320×180 @ 10 fps` 灰度 low 参数。只排查视频时可将
+`--audio=on` 改为 `--audio=off` 并删去其余 `--audio-*` 参数。
+
+## rebuild HUD
+
+rebuild 的完整 21 行定义、`AGE` 与 `PTSAGE` 的区别、RB/1 包率/长度和物理线速换算统一维护在
+[协议.md](协议.md) 的“PC HUD：字段口径与 GAN 成功判定”章节。
+
+## 两块开发板同时发送、PC 双窗口接收测试
+
+此测试由**两块不同的开发板**分别发送视频，不能在同一块板上重复启动两次摄像头程序。
+PC 必须为每路视频分配不同的 UDP 端口；两个 HUD 若都绑定 `5004`，后启动者会失败或抢占前一路。
+
+| 流 | 开发板 A：`192.168.0.101` | 开发板 B：`192.168.0.102` |
+| --- | --- | --- |
+| H.265 目标 UDP 端口（PC） | `5004` | `5005` |
+| 可选 Codec2 音频端口 | `5006` | `5007` |
+
+分别在两块板的两个终端中启动以下**视频专用**命令。推荐先启动 PC 的两个 HUD，
+再启动两块板；HUD 会等待各路完整 IDR。
+
+```bash
+# 开发板 A（192.168.0.101）终端
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off
+```
+
+```bash
+# 开发板 B（192.168.0.102）终端
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5005 \
+  --audio=off --preview=off
+```
+
+Windows PC 直接在两个独立终端中指定各自端口：
+
+```powershell
+# PC 终端 1：接收开发板 A 的 UDP 5004
+Set-Location D:\workspace\videoCompressV2
+python tools\live_h265_hud.py --udp-port=5004
+```
+
+```powershell
+# PC 终端 2：接收开发板 B 的 UDP 5005
+Set-Location D:\workspace\videoCompressV2
+python tools\live_h265_hud.py --udp-port=5005
+```
+
+每个终端会打开一个独立 HUD 窗口。首次在发送端已运行后才启动 HUD 时，等待下一帧 IDR
+即可显示（rate60 档最长约一个 GOP）；常规重复测试则推荐先启动两个 HUD，看到各自
+`WAITING FOR COMPLETE IDR` 后，再同时启动两块板的发送程序。需要双路音频时，开发板 A 使用
+`--audio-udp-port=5006 --audio-rtp-sdp-path=/tmp/roi-audio-101.sdp`，开发板 B 使用
+`--audio-udp-port=5007 --audio-rtp-sdp-path=/tmp/roi-audio-102.sdp`，并在 PC 上各启一个
+`receive_codec2_rtp.py` 进程；不要让两路音频共用同一端口或 SDP 文件。
+
+启用音频时，再新开一个 Windows 终端接收 UDP 5006。它可与视频 HUD 同时运行：
+
+```powershell
+cd D:\workspace\videoCompressV2
+python tools\receive_codec2_rtp.py runs\audio.sdp --play `
+  --ffplay D:\ffmpeg\bin\ffplay.exe
+```
+
+接收器第一行完全由传入的 `runs\audio.sdp` 决定；当前版本必须显示
+`mode 2400, 4 frames/packet, 24 payload bytes, DTX on (1000 ms keepalive)`。若显示为其他数值，说明 PC
+仍在使用与板端不匹配的 SDP；重新复制板端刚生成的文件并重启接收器：
+
+```powershell
+scp root@192.168.0.101:/tmp/roi-audio.sdp runs/audio.sdp
+```
+
+之后每秒会显示 `receiving`、`dtx-silence` 或 `waiting`。`dtx-silence` 表示发送端
+正在正常抑制静音，保活间隔内没有常规语音包；`waiting` 表示 UDP 5006 已绑定但尚未收到
+任何有效 RTP；`invalid` 递增通常表示 SDP 的模式/每包帧数与发送端不一致。状态行的
+`codec` 是 Codec2 载荷码率（2400/4 帧时约 2.4 kbps），`wire` 是包含 RTP、UDP/IP、
+以太网、前导码和帧间隔的共享限速计费（约 10.2 kbps），`RTP` 是包速率而非码率
+（连续语音正常约 12.5 pps，即每 80 ms 一包）。
+
+本机已安装经 Codec2 1.2.0 源码构建的原生 x64 解码器：`D:\codec2\bin\c2dec.exe`。
+接收器在 Windows 上会自动优先使用它；因此 RTP、Codec2 解码和 FFplay 播放都在原生
+Windows 进程中完成，不再依赖 WSL。若手工指定路径，可添加
+`--c2dec D:\codec2\bin\c2dec.exe`。
+安装来源、版本、哈希和 Windows 二进制管道修复记录在 `D:\codec2\INSTALL.md`。
+
+`--wsl-c2dec` 仍保留为未安装原生解码器时的兼容回退选项；它只在 WSL 中运行解码器，
+Windows 程序仍绑定 UDP 5006。
+接收器会自动兼容 FFplay 9 的 `-ch_layout` 参数和旧版 FFplay 的 `-ac` 参数；不要将
+`-ac 1` 额外添加到上述命令中。
+
+若只验证是否收到音频而暂未准备解码器，可替换为：
+
+```powershell
+python tools\receive_codec2_rtp.py runs\audio.sdp --record runs\live.c2raw --duration 60
+```
+
+Codec2 没有使用 FFplay 可直接识别的标准 RTP 载荷格式，因此原来的 `ffplay` 仍只接收
+H.265 视频；音频必须使用上述辅助接收器。两个端口不同，不会互相抢占。
+
+2. 再启动板端发送程序：
+
+```
+cd /opt/atk/rknn_yolov8_seg_cam
+
+./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 \
+  --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --mode=segmentation \
+  --encoder-width=320 --encoder-height=180 --fps=10 \
+  --target-bitrate=42000 --gop=50 \
+  --qp-init=38 --qp-min-i=36 --qp-max-i=48 \
+  --intra-refresh=on --intra-refresh-rows=1 \
+  --max-reencode-times=3 --super-i-frame-bits=12000 --super-p-frame-bits=5500 \
+  --grayscale-encode=on \
+  --background-delta-qp=12 --halo-delta-qp=2 --core-delta-qp=-6 --edge-delta-qp=-10 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --pacing-bitrate=60000 \
+  --send-queue-frames=16 --send-max-latency-ms=2000 \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 \
+  --audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400 \
+  --audio-frames-per-packet=4 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --audio-dtx=on --audio-dtx-preroll-ms=80 --audio-dtx-hangover-ms=600 --audio-dtx-keepalive-ms=1000 \
+  --audio-reserve-bitrate=0 --audio-max-latency-ms=160 \
+  --audio-preprocess=on --audio-highpass-hz=80 --audio-lowpass-hz=3600 \
+  --audio-noise-suppression-db=6 --audio-noise-gate-snr-db=2 \
+  --audio-noise-gate-attenuation-db=30 --audio-noise-gate-hangover-ms=600 \
+  --audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20 \
+  --audio-vad=on --audio-vad-start-frames=2 --audio-vad-min-voicing=42 \
+  --profile-control=/tmp/roi-rate-profile \
+  --preview=on --preview-rotate=ccw --preview-width=720 --preview-height=1280
+```
+普通速率档可用
+`--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300`
+（也可写 `--profile=`）选择。档位数字是共享物理 A/V 上限，不是 H.265
+目标码率；rate150 就是原 medium，不存在第二个 150 kbps 档。
+
+| 档位 | 分辨率/FPS | H.265 目标 | 共享物理上限 | 色彩 |
+| --- | --- | ---: | ---: | --- |
+| `rate60` | 320×180 / 10 fps | 42 kbps | 60 kbps | 灰度 |
+| `rate80` | 320×180 / 10 fps | 56 kbps | 80 kbps | 彩色 |
+| `rate100` | 384×216 / 10 fps | 72 kbps | 100 kbps | 彩色 |
+| `rate120` | 480×270 / 10 fps | 88 kbps | 120 kbps | 彩色 |
+| `rate150` | 480×270 / 15 fps | 110 kbps | 150 kbps | 彩色 |
+| `rate180` | 512×288 / 15 fps | 135 kbps | 180 kbps | 彩色 |
+| `rate200` | 512×288 / 18 fps | 150 kbps | 200 kbps | 彩色 |
+| `rate300` | 640×360 / 20 fps | 240 kbps | 300 kbps | 彩色 |
+
+| 档位 | QP 初值 | I 帧 QP | 最大 I 帧 | 最大 P 帧 | 背景 ΔQP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `rate60` | 38 | 36–48 | 12000 bit | 5500 bit | +12 |
+| `rate80` | 37 | 35–47 | 16000 bit | 7000 bit | +12 |
+| `rate100` | 36 | 34–46 | 22000 bit | 9000 bit | +11 |
+| `rate120` | 35 | 33–45 | 28000 bit | 11000 bit | +10 |
+| `rate150` | 34 | 32–44 | 35000 bit | 14000 bit | +10 |
+| `rate180` | 33 | 31–44 | 42000 bit | 17000 bit | +8 |
+| `rate200` | 32 | 30–43 | 48000 bit | 19000 bit | +8 |
+| `rate300` | 30 | 28–42 | 60000 bit | 24000 bit | +6 |
+
+所有普通档共用 `qp_min=10`、`qp_max=51`、`halo_delta_qp=2`、
+`core_delta_qp=-6`、`edge_delta_qp=-10`、单行 intra refresh、最多三次重编码、
+MTU 1200、16 帧发送队列和 2000 ms 发送年龄上限。旧名称会被拒绝并提示迁移：
+low → rate60、medium → rate150、high → rate300。
+
+`rebuild` 仍为线上 256×144 / 6 fps、PC 重建 640×360 / 12 fps、
+100 kbps A/V 总物理上限；`gan` 的原子预设也保持不变。
+
+音频启用时，这四个数值都是 H.265、rebuild伴随流与 Codec2 RTP 的**合计**物理带宽上限；默认
+Codec2-2400（4 帧/包）保持 80 ms 一个 RTP 包。发送端会由包几何自动保留一个约
+`10.2 kbps` 的音频物理线速子桶，视频只使用剩余子桶；这不是额外带宽，A/V 仍严格共用
+总上限。采集/编码与发送线程之间使用 `160 ms` 上限的完整 RTP 包队列，积压时丢最旧
+语音而不回放旧声音。运行时切档会按相同的音频保留速率重新设置视频剩余子桶，音频无需重启。
+
+板端也可以直接使用：
+
+```bash
+./rknn_yolov8_seg_cam --rate-profile=rate300 \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --preview=on --preview-rotate=ccw --preview-width=720 --preview-height=1280
+```
+
+板端实测 DSI 输出为 `720x1280`。预览显示的是送入 MPP 的 NV12 编码帧（而不是原始 `640x480`
+相机帧），随后逆时针旋转 90°，因此内容、画幅 `180x320`（rate60 档）及横向边界与 PC H.265
+接收画面一致；mask、框、标签和状态文字再叠加在该画面上。窗口默认/推荐为 `720x1280`，不会
+改变采集、YOLO、H.265 编码分辨率或网络带宽。若改回横屏，使用
+`--preview-rotate=none --preview-width=1280 --preview-height=960`。
+
+3. 发送和接收程序都保持运行，通过控制 FIFO 切换档位。只有一个串口终端时，启动发送端
+时将完整命令的开头改成 `nohup env LD_LIBRARY_PATH="$PWD/lib"`，并在最后追加日志重定向
+和 `&`：
+
+```bash
+nohup env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  ...原完整启动参数... \
+  --profile-control=/tmp/roi-rate-profile \
+  >/tmp/roi_sender.log 2>&1 &
+echo $! >/tmp/roi_sender.pid
+```
+
+发送端已经后台运行，同一个串口 Shell 可直接执行：
+
+```bash
+printf 'rate150\n' > /tmp/roi-rate-profile
+printf 'rate300\n' > /tmp/roi-rate-profile
+printf 'rebuild\n' > /tmp/roi-rate-profile
+printf 'rate60\n' > /tmp/roi-rate-profile
+tail -f /tmp/roi_sender.log
+```
+
+每条命令写入一个完整档位名。板端日志会出现 `Runtime profile requested` 和
+`Runtime video mode applied`；PC HUD中的 `Profile`、分辨率、接收FPS和解码FPS会随之
+更新。切换瞬间会清空旧档位待发送P帧、重建MPP并发送恢复IDR，两个进程都无需重启。
+在 `tail -f` 中按 `Ctrl+C` 只退出日志查看，不会停止后台发送端；不要对前台发送端使用
+`Ctrl+Z`，否则进程被挂起后采集和发送也会停止。
+
+## 4. 超低速图片模式：只检测并上传高像素截图
+
+此模式不发送 H.265，不使用 HUD 或 FFplay。程序仍运行 YOLOv8-Seg，
+但只保留 `person`、`car`、`boat`、`airplane` 四类；出现其中任意一类时上传一张 JPEG。
+PC 必须先启动接收器（端口 `5008`）。接收器以 250 ms 轮询 UDP，因此空闲时按
+`Ctrl+C` 也会在约 0.25 秒内退出，且不会删除未完成的 `.jpg.part`：
+
+```powershell
+cd D:\workspace\videoCompressV2
+python tools\receive_snapshot_udp.py --port 5008 --output runs\snapshots --sync-every-bytes=32768
+```
+
+仅显示 `Snapshot UDP listening ...` 表示 PC 已正常监听，并不表示故障。图片模式不是连续视频：
+只有板端发送程序仍在运行、实际处于 `image` 模式，且检测到 `person`、`car`、`boat` 或
+`airplane`（默认置信度不低于 `0.35`）时，才会出现分块统计和完成日志。
+`--snapshot-min-interval-ms=5000` 限制任意两次上传的**开始时间**至少间隔 `5 s`；它不识别
+目标运动方向，也不是“上传完成后再等待 5 s”。单张图片传输本身超过 `5 s` 时，该限制不会增加
+额外等待。板端应先打印 `Image mode enabled`，命中并收到 PC 回复后会打印
+`Snapshot complete`；若出现 `Snapshot transfer deferred`，再按其错误内容排查 UDP 5008。
+
+从零启动图片模式的板端命令如下。`--camera-width/--camera-height` 是**采集源图**尺寸，
+不是 H.265 尺寸；先确认摄像头节点支持 `1920x1080`，不支持时改为它支持的最大值。默认将
+四类目标框合并、四周各扩展 `25%` 后编码；它会先限制到 `1280×720`，再逆时针旋转 `90°`，
+所以普通 16:9 场景在 PC 保存为 `720×1280`。下面是带 Codec2 音频和板端竖屏预览的完整命令：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --transport-mode=image --rate-profile=rate60 --mode=segmentation \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --camera-width=1920 --camera-height=1080 --fps=10 \
+  --udp-host=192.168.0.100 --pacing-bitrate=60000 \
+  --snapshot-udp-port=5008 --snapshot-jpeg-quality=75 \
+  --snapshot-crop=relevant --snapshot-crop-margin-percent=25 --snapshot-rotate=ccw \
+  --snapshot-max-width=1280 --snapshot-max-height=720 \
+  --snapshot-min-interval-ms=5000 --snapshot-chunk-bytes=1100 \
+  --snapshot-ack-timeout-ms=300 --snapshot-max-retries=20 \
+  --snapshot-min-confidence=0.35 --profile-control=/tmp/roi-rate-profile \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 \
+  --audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400 \
+  --audio-frames-per-packet=4 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --audio-dtx=on --audio-dtx-preroll-ms=80 --audio-dtx-hangover-ms=600 --audio-dtx-keepalive-ms=1000 \
+  --audio-reserve-bitrate=0 --audio-max-latency-ms=160 \
+  --audio-preprocess=on --audio-highpass-hz=80 --audio-lowpass-hz=3600 \
+  --audio-noise-suppression-db=6 --audio-noise-gate-snr-db=2 \
+  --audio-noise-gate-attenuation-db=30 --audio-noise-gate-hangover-ms=600 \
+  --audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20 \
+  --audio-vad=on --audio-vad-start-frames=2 --audio-vad-min-voicing=42 \
+  --preview=on --preview-rotate=ccw --preview-width=720 --preview-height=1280
+```
+
+PC 应先启动图片接收器（UDP `5008`）。首次启用音频时，待板端生成
+`/tmp/roi-audio.sdp` 后复制到 PC，再启动音频接收器（UDP `5006`）；后续配置不变时可复用该 SDP。
+`--audio-reserve-bitrate=0` 会按 Codec2-2400、每包 4 帧的实际线速自动预留音频带宽，图片只使用
+剩余媒体速率；因此说话时单张图片传输会比静音或关闭音频更慢。若优先缩短图片保存时间，只把
+`--audio=on` 改为 `--audio=off`；`--preview=on` 是本地 DSI 显示，不占网络带宽，可保持开启。
+
+```powershell
+# 板端启动并写出 /tmp/roi-audio.sdp 后，在 Windows PC 执行一次
+scp root@192.168.0.101:/tmp/roi-audio.sdp runs\audio.sdp
+python tools\receive_codec2_rtp.py runs\audio.sdp --play `
+  --ffplay D:\ffmpeg\bin\ffplay.exe
+```
+
+已经在视频模式运行时，不必重启。先确认 PC 的 5008 接收器已运行，再在板端另开终端：
+
+```bash
+echo image > /tmp/roi-rate-profile   # 清空旧视频队列、关闭 MPP，开始只检测/截图
+echo video > /tmp/roi-rate-profile   # 取消当前截图并返回上一视频档位，发送恢复 IDR
+```
+
+上传协议为私有 RSNP/UDP，而非 RTP：发送端同时只保留正在上传的一张和其传输期间**最新**
+命中的一个候补；新命中会覆盖旧候补，不会形成积压队列。PC 对每个分块回复连续偏移，并复用
+一个 `.jpg.part` 文件句柄；默认每 `32 KiB`、START、END 和正常退出时才执行一次磁盘同步，
+避免每个 UDP 分块同步一次。PC 接收程序或链路短暂中断后，板端会继续同一张图；突发断电时尾部
+最多重传一个未同步批次，END 的 CRC 不通过时会自动从头重传。需要完整全景图时使用
+`--snapshot-crop=full`；需要原始分辨率，再同时写
+`--snapshot-max-width=0 --snapshot-max-height=0`（仍默认逆时针旋转）。板端进程被停止后，该张内存截图取消，下一次
+目标命中会产生新截图。
+
+当前网络角色固定为：PC 接收端 `192.168.0.100`、开发板发送端
+`192.168.0.101`、Ubuntu 交叉编译虚拟机 `192.168.0.10`。
+
+当前新板 Buildroot 镜像的 ES8388 为 `card 3, device 0`；发送端会自行降采样和混音：
+
+```bash
+--audio-device=hw:3,0 --audio-capture-rate=44100 --audio-channels=2
+```
+
+DTX 发送端在 Codec2 前默认启用软件语音预处理：3.6 kHz 抗混叠重采样、80 Hz 高通、最多
+6 dB 的宽带降噪、带 600 ms 挂起时间的软门限、VAD 和 AGC。Codec2-2400/4 帧每包保持
+80 ms RTP 周期；静音时仍持续编码以维持 Codec2 状态，但只保留最近 80 ms 的预卷帧。一次
+语音段被打开后，DTX 会额外保持 600 ms，避免无声辅音或短暂停顿被错误拆段；超过该时长才
+抑制常规 RTP，并每 1000 ms 发一个完整静音保活包。程序启动后的前 `600 ms` 用于学习环境底噪，
+因此首次验证时先保持约 `0.6 s` 安静，再说话。
+
+默认 160 采样 Codec2 帧下，预卷的 80 ms 为 4 帧、语音保持的 600 ms 为 30 帧、保活的
+1000 ms 为 50 帧；这里都是毫秒语义，不会因 DTX 在语音开始时回放秒级的静音历史。
+
+不要使用 `ALC Capture NG` 的 `Mute ADC Output` 模式来压低底噪：它会在本程序之前
+直接丢掉弱人声。当前新板的该控制项位于 ES8388 的 card 3；需要音频时在每次板端重启后、
+启动发送程序前关闭硬门限：
+
+```bash
+amixer -c 3 scontents
+amixer -c 3 sset 'ALC Capture NG' off
+```
+
+本板已验证的起点是下面这组。不要再使用 `3 / 9 / 12`：其中较高的
+`ALC Capture NG Threshold` 配合 `Mute ADC Output` 会在 Codec2 和软件 AGC 之前
+直接切掉弱人声；关闭 `ALC Capture NG` 后，该 Threshold 不再生效。
+
+```bash
+amixer -c 3 sset 'ALC Capture Function' Stereo
+amixer -c 3 sset 'ALC Capture Max PGA' 5
+amixer -c 3 sset 'ALC Capture Target' 12
+amixer -c 3 sset 'ALC Capture NG' off
+```
+
+先保持已验证的麦克风路由和 `ALC Capture Max PGA` 不变；不要把 PGA 调低来代替降噪。
+板卡上的 `PCM Volume` 不一定是录音增益，应以 `amixer -c 3 scontents` 的实际控制名为准。
+
+首次启用前可在板端做一次独立录音预检；这一步成功后，程序会以相同的声卡、采样率、
+位宽和声道数持续采集原始 PCM：
+
+```bash
+arecord -D hw:3,0 -r 44100 -f S16_LE -d 3 -c 2 /tmp/es8388-check.wav
+aplay /tmp/es8388-check.wav
+```
+
+若 `amixer -c 3 scontents` 确认当前镜像的 `PCM Volume` 确实作用于所选麦克风路由，
+且录音音量仍过低，才按板卡手册设置：
+
+```bash
+amixer -c 3 cset name='PCM Volume' '192' '192'
+```
+
+运行日志中的 `audio_dtx_drop` 是被静音抑制的 Codec2 帧数，`audio_dtx_hold` 是为保护连续
+讲话而在 DTX 语音尾部保持发送的帧数，`audio_dtx_speech` 和 `audio_dtx_keepalive` 分别是
+生成的语音包和静音保活包；`audio_rtp` 才是实际成功发送的
+RTP 包数。`audio_q`、`audio_q_age_ms`、`audio_q_drop`、`audio_q_wait_ms`、
+`audio_reserve_bps` 分别表示当前队列包数、最旧包年龄、丢弃的陈旧包数、最近包队列等待
+和自动/显式保留的物理线速。`audio_dtx=1` 表示当前处于语音段。要做无软件处理的对照实验，
+使用 `--audio-preprocess=off --audio-dtx=off`。
+
+发送程序会在每条状态行后立即刷新 `/tmp/roi-sender.log`；因此 `tail -f`、`grep` 看到的
+`audio_rtp`、`audio_q_drop` 等值就是当前值，而不是 stdout 缓冲区中滞后的旧记录。
+前者旁路高通、降噪、软门限、VAD 和 AGC，后者恢复连续 RTP；安全的抗混叠降采样仍会保留。
+
+若人声仍偏弱，追加下面整组弱人声优先参数做诊断，不要重新打开 `ALC Capture NG`：
+
+```bash
+--audio-noise-suppression-db=6 --audio-noise-gate-snr-db=1 \
+--audio-noise-gate-attenuation-db=12 --audio-noise-gate-hangover-ms=500 \
+--audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20
+```
+
+这样会留下更多静音底噪，但应能确认是否是软件门限误判；仍听不见时应检查麦克风路由或
+模拟 PGA，而不是 Codec2/RTP。
+
+# 两块板子全双工
+开启四个SSH终端，先启动 101 接收端，再启动 102 发送端。
+再先启动 102 接收端，再启动 101 发送端。
+
+每块板上的发送端会把本卡最近 1 秒实际发送的视频物理线速，通过本机 Unix
+数据报 `/tmp/board_tx_wire_rate.sock` 提供给接收显示端。HUD 第一行的 `TX`
+因此表示本卡发送线速，`RX` 表示本卡接收线速；TX 不通过板间 RTP 协议传输。
+接收端先启动或发送端先启动均可；本机发送端未运行或遥测超过 2 秒未更新时显示
+`TX --`。
+
+## 1. 在 101 启动接收端
+```
+cd /opt/atk/board_receiver
+chmod +x scripts/start_receiver.sh
+./scripts/start_receiver.sh
+```
+
+## 2. 在 102 启动发送端
+先准备切档控制 FIFO：
+```
+rm -f /tmp/roi-rate-profile
+mkfifo /tmp/roi-rate-profile
+```
+
+然后启动发送端，例如以 rate300 档启动：
+```
+cd /opt/atk/rknn_yolov8_seg_cam
+
+env LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ./rknn_yolov8_seg_cam \
+    --rate-profile=rate300 \
+    --mode=segmentation \
+    --model=model/yolov8_seg.rknn \
+    --camera-device=/dev/video-camera0 \
+    --udp-host=192.168.0.101 \
+    --udp-port=5004 \
+    --audio=off \
+    --preview=off \
+    --profile-control=/tmp/roi-rate-profile \
+    --send-queue-frames=16 \
+    --send-max-latency-ms=2000
+```
+## 3.在102启动接收端
+```
+cd /opt/atk/board_receiver
+chmod +x scripts/start_receiver.sh
+./scripts/start_receiver.sh
+```
+## 4. 在 101 启动发送端
+```
+cd /opt/atk/rknn_yolov8_seg_cam
+
+env LD_LIBRARY_PATH="$PWD/lib" \
+./rknn_yolov8_seg_cam \
+  --rate-profile=rate150 \
+  --mode=segmentation \
+  --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.102 \
+  --udp-port=5004 \
+  --audio=off \
+  --preview=off \
+  --profile-control=/tmp/roi-rate-profile \
+  --send-queue-frames=16 \
+  --send-max-latency-ms=2000
+```
+
+## 5.运行中切档
+在 101/102 上另开一个 SSH 终端执行：
+```
+echo rate60  > /tmp/roi-rate-profile
+echo rate80  > /tmp/roi-rate-profile
+echo rate100 > /tmp/roi-rate-profile
+echo rate120 > /tmp/roi-rate-profile
+echo rate150 > /tmp/roi-rate-profile
+echo rate180 > /tmp/roi-rate-profile
+echo rate200 > /tmp/roi-rate-profile
+echo rate300 > /tmp/roi-rate-profile
+```

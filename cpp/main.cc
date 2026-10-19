@@ -171,15 +171,14 @@ private:
 
 void printUsage(const char *program) {
     std::fprintf(stderr,
-        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|ganq60|ganq120|ganq180] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild|gan2|gan4]\n"
+        "Usage: %s [--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|ganq60|ganq120|ganq180] [--model=PATH] [--camera-device=/dev/video0] [--mode=baseline|bbox|segmentation|rebuild] [--gan=off|x2|x4]\n"
         "          [--input-video=PATH --max-frames=N]\n"
         "          [--encoder-width=320 --encoder-height=180 --fps=10 --target-bitrate=42000]\n"
         "          [--gop=50 --qp-min=10 --qp-max=51 --qp-init=38 --qp-min-i=36 --qp-max-i=48]\n"
         "          [--gan-link-cap-kbps=60|70|80|100|120|150|180|300 --gan-fps=6|8|10|12 --gan-inference-fps=0]\n"
         "          [--adaptive-roi=off|on --roi-weight-background=1 --roi-weight-halo=1.2 --roi-weight-core=2 --roi-weight-edge=3]\n"
-        "          [--gan-native-720p=on|off (gan2:640x360, gan4:320x180)]\n"
         "          [--gan-video-bitrate-kbps=75 --gan-max-inference-latency-ms=100]\n"
-        "          [--gan-gop-seconds=1|2|4 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
+        "          [--gan-gop-seconds=1|2|4|5 --gan-debreath=on|off --gan-debreath-strength=0..35]\n"
         "          [--gan-intra-refresh=on|off --gan-refresh-mode=row|col --gan-refresh-num=N]\n"
         "          [--gan-qp-ip=0..8 --gan-super-frame=current|off|relaxed]\n"
         "          [--encoder-debug-log=/tmp/encoder.jsonl]\n"
@@ -243,7 +242,7 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
         return;
     }
     std::fprintf(stderr,
-        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4|ganq60|ganq120|ganq180|image|video > %s\n",
+        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|ganq60|ganq120|ganq180|image|video > %s\n",
         path.c_str());
     std::string pending;
     while (running->load()) {
@@ -400,6 +399,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "UDP initialization failed: %s\n", error.c_str());
         return EXIT_FAILURE;
     }
+    std::fprintf(stderr, "Receiver enhancement: profile=%s gan=%s source=%dx%d@%d native=%dx%d\n",
+                 rateProfileName(config.rate_profile),
+                 config.gan.scale == 4 ? "x4" : (config.gan.scale == 2 ? "x2" :
+                     (isGanRateProfile(config.rate_profile) ? "legacy-profile" : "off")),
+                 config.encoder.width, config.encoder.height, config.encoder.fps,
+                 config.encoder.width * (config.gan.scale ? config.gan.scale : 1),
+                 config.encoder.height * (config.gan.scale ? config.gan.scale : 1));
     // GAN is intentionally H.265-only (plus optional audio).  Do not even
     // construct the legacy side-channel senders on that path: this keeps the
     // RB socket, reference JPEG worker, snapshot sender, and ROEV sender out
@@ -675,6 +681,14 @@ int main(int argc, char **argv) {
             const RateProfile desired = static_cast<RateProfile>(requested_profile.load());
             const TransportMode desired_transport = static_cast<TransportMode>(
                 requested_transport_mode.load());
+            if (runtimeConfig().gan.scale != 0 &&
+                (desired == RATE_PROFILE_REBUILD || isGanRateProfile(desired) ||
+                 desired_transport != TRANSPORT_MODE_VIDEO)) {
+                std::fprintf(stderr, "GAN enhancement requires a rate video profile; restart with --gan=off for this mode\n");
+                requested_profile.store(active_profile.load());
+                requested_transport_mode.store(active_transport_mode.load());
+                continue;
+            }
             if (desired != static_cast<RateProfile>(active_profile.load()) &&
                 isGanQualityProfile(desired) != isGanQualityProfile(
                     static_cast<RateProfile>(active_profile.load()))) {
@@ -922,15 +936,16 @@ int main(int argc, char **argv) {
             transport_unit.stream_profile.generation =
                 static_cast<uint8_t>(profile_generation.load() & 0xffU);
             // The GAN encoder target is configuration, not an observed rate.
-            // Carry it in the existing RO RTP profile extension only for GAN;
+            // Carry it in RO metadata for independent enhancement and legacy GAN;
             // zero keeps every other profile on its original metadata layout.
+            transport_unit.stream_profile.gan_scale = static_cast<uint8_t>(live.gan.scale);
             transport_unit.stream_profile.target_bitrate_kbps =
-                isGanRateProfile(live.rate_profile)
-                    ? static_cast<uint16_t>(live.gan.video_bitrate_kbps)
+                (live.gan.scale != 0 || isGanRateProfile(live.rate_profile))
+                    ? static_cast<uint16_t>(live.encoder.target_bitrate_bps / 1000)
                     : 0U;
             transport_unit.stream_profile.link_cap_kbps =
-                isGanRateProfile(live.rate_profile)
-                    ? static_cast<uint16_t>(live.gan.link_cap_kbps)
+                (live.gan.scale != 0 || isGanRateProfile(live.rate_profile))
+                    ? static_cast<uint16_t>(live.transport.pacing_bitrate_bps / 1000)
                     : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {
                 std::fprintf(stderr, "UDP transport enqueue error: %s\n", encoder_error.c_str());

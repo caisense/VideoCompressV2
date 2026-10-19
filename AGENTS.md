@@ -150,3 +150,7 @@ Recent commits use concise, outcome-oriented subjects, for example `fallback死�
 Pull requests should summarize behavior changes, list exact test commands, identify hardware/profile combinations tested, and link logs or screenshots for HUD or visual-quality changes.
 
 Never commit credentials, machine-specific paths, generated binaries, accelerator caches, models, or run logs unless the repository explicitly tracks them.
+
+## Documentation Maintenance
+
+Keep README.md and 启动.md as the canonical project documentation in the repository root. Update them directly in place. Preserve relevant existing sections; docs/history contains reference snapshots and must not replace ongoing root-document maintenance.

@@ -148,9 +148,10 @@ void AsyncRtpSender::workerLoop() {
         ++sent_frames_;
         sent_wire_bytes_ += sent_wire_bytes;
         for (size_t index = 0; index < packets.size(); ++index) {
-            // Current v1 RO GAN metadata uses a 28-byte RTP header.
+            // RO v1 uses 24/28 bytes; independent GAN v2 uses 32 bytes.
             const size_t header = item.access_unit.stream_profile.valid ?
-                ((item.access_unit.stream_profile.target_bitrate_kbps ||
+                (item.access_unit.stream_profile.gan_scale ? 32U :
+                 (item.access_unit.stream_profile.target_bitrate_kbps ||
                   item.access_unit.stream_profile.link_cap_kbps) ? 28U : 24U) : 12U;
             sent_rtp_payload_bytes_ += packets[index].size() - header;
         }

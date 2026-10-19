@@ -7,6 +7,11 @@ out_dir="${TMPDIR:-/tmp}/roi_h265_tests"
 mkdir -p "$out_dir"
 
 g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
+  "$cpp_dir/common/config.cc" "$cpp_dir/transport/packetizer.cc" \
+  "$cpp_dir/tests/test_gan_selection.cc" -o "$out_dir/test_gan_selection"
+"$out_dir/test_gan_selection"
+
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/common/config.cc" "$cpp_dir/roi/roi_region_merger.cc" \
   "$cpp_dir/transport/packetizer.cc" "$cpp_dir/transport/rate_pacer.cc" \
   "$cpp_dir/tests/test_video_quality.cc" -o "$out_dir/test_video_quality"

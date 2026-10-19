@@ -1,0 +1,1301 @@
+> 历史快照：gan2/gan4 启动接口已于 2026-10-19 移除。当前命令见仓库根目录启动.md。
+
+# RK3588 YOLOv8-Seg ROI H.265 sender
+
+## gan4 temporal quality configuration
+
+For the historical 180p → native 720p at 8fps experiment, use the explicit
+configuration in
+`tools/start_gan4_stable.sh` or the full command in `启动.md`.
+It bounds base I/P QP to 28–32 using the existing configuration flags,
+keeps GOP at two seconds, and leaves MPP debreath off.
+The original CAP60 throughput test did not qualify temporal quality.
+Comparison evidence is in `runs/gan/gan4_debreath_sweep_20261009/REPORT.md`.
+
+## 网络拓扑
+```
+192.168.0.100 Windows PC 本机：视频 HUD、音频和图片接收端
+192.168.0.101 RK3588 开发板 A：摄像头、YOLOv8-Seg、编码与发送端
+192.168.0.102 RK3588 开发板 B：摄像头、YOLOv8-Seg、编码与发送端
+192.168.0.10  Ubuntu 22.04 虚拟机：交叉编译与部署
+```
+## Rate profiles
+
+Use `--rate-profile=rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|gan2|gan4`
+(or the shorter `--profile=`) to select a complete synchronized sender profile.
+Options written after an ordinary `rateNN` profile
+can override individual values. `rebuild` is deliberately atomic: its wire size,
+FPS, H.265 target, physical cap and colour mode cannot be replaced by leftover
+options from another profile. `gan2` and `gan4` are also atomic: they are H.265-only on the wire,
+select one shared physical A/V ceiling through `--gan-link-cap-kbps`,
+and never starts the rebuild side channels. Generic encoder geometry and
+`--pacing-bitrate` overrides are rejected for GAN.
+
+| Profile | Wire source / FPS | H.265 target | Shared physical A/V cap | PC display |
+| --- | --- | ---: | ---: | --- |
+| `rate60` (ID 0, former low) | 320×180 / 10 fps | 42 kbps | 60 kbps | decoded grayscale video |
+| `rate80` (ID 5) | 320×180 / 10 fps | 56 kbps | 80 kbps | decoded color video |
+| `rate100` (ID 6) | 384×216 / 10 fps | 72 kbps | 100 kbps | decoded color video |
+| `rate120` (ID 7) | 480×270 / 10 fps | 88 kbps | 120 kbps | decoded color video |
+| `rate150` (ID 1, former medium) | 480×270 / 15 fps | 110 kbps | 150 kbps | decoded color video |
+| `rate180` (ID 8) | 512×288 / 15 fps | 135 kbps | 180 kbps | decoded color video |
+| `rate200` (ID 9) | 512×288 / 18 fps | 150 kbps | 200 kbps | decoded color video |
+| `rate300` (ID 2, former high) | 640×360 / 20 fps | 240 kbps | 300 kbps | decoded color video |
+| `rebuild` | 256×144 / 6 fps | 28 kbps | **100 kbps** | reconstructed 640×360 / 12 fps |
+| `gan2` ID 4 CAP 60 | 256×144 / **8 fps** default | 45 kbps | **60 kbps** | x2 512×288, then Lanczos4 640×360 |
+| `gan2` ID 4 CAP 70 | 640×360 / **8 fps** default | 50 kbps | **70 kbps** | x2 native 1280×720 |
+| `gan2` ID 4 CAP 80 | 640×360 / **8 fps** default | 57 kbps | **80 kbps** | x2 native 1280×720 |
+| `gan2` ID 4 CAP 100 | 256×144 / **10 fps** default | 75 kbps | **100 kbps** | x2 512×288, then Lanczos4 640×360 |
+| `gan2` ID 4 CAP 120 | 480×270 / **10 fps** default | 88 kbps | **120 kbps** | x2 native/output 960×540 (540p) |
+| `gan2` ID 4 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x2 native 640×360 |
+| `gan2` ID 4 CAP 300 | 640×360 / **10 fps** default | 240 kbps | **300 kbps** | x2 native 1280×720 |
+| `gan4` ID 10 CAP 120 | 480×270 / **10 fps** default | 88 kbps | **120 kbps** | x4 native/output 1920×1080 (1080p) |
+| `gan4` ID 10 CAP 150 | 320×180 / **10 fps** default | 110 kbps | **150 kbps** | x4 Real-ESRGAN native 1280×720 |
+
+The legacy name `gan` continues to select `gan2`. By default, `gan4` accepts the
+120/150 kbps presets. CAP150 retains 320×180 input and maps to native 1280×720
+with x4; CAP120 follows the rate120 sender geometry.
+
+The ordinary rate presets use the following encoder details. `I QP` is the
+inclusive I-frame QP range; frame limits are bits.
+
+| Profile | QP init | I QP | max I | max P | background ΔQP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `rate60` | 38 | 36–48 | 12000 | 5500 | +12 |
+| `rate80` | 37 | 35–47 | 16000 | 7000 | +12 |
+| `rate100` | 36 | 34–46 | 22000 | 9000 | +11 |
+| `rate120` | 35 | 33–45 | 28000 | 11000 | +10 |
+| `rate150` | 34 | 32–44 | 35000 | 14000 | +10 |
+| `rate180` | 33 | 31–44 | 42000 | 17000 | +8 |
+| `rate200` | 32 | 30–43 | 48000 | 19000 | +8 |
+| `rate300` | 30 | 28–42 | 60000 | 24000 | +6 |
+
+All ordinary presets use `qp_min=10`, `qp_max=51`, `halo_delta_qp=2`,
+`core_delta_qp=-6`, `edge_delta_qp=-10`, one-row intra refresh, at most three
+re-encodes, MTU 1200, a 16-frame send queue, and a 2000 ms send-age limit.
+The old CLI/FIFO names are rejected with migration hints: low → rate60,
+medium → rate150, and high → rate300.
+
+Examples:
+
+```bash
+./rknn_yolov8_seg_cam --rate-profile=rate60 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006
+./rknn_yolov8_seg_cam --rate-profile=rate150 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+./rknn_yolov8_seg_cam --rate-profile=rate300 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+./rknn_yolov8_seg_cam --rate-profile=rebuild --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --rebuild-udp-port=5009
+./rknn_yolov8_seg_cam --mode=gan --gan-link-cap-kbps=150 --gan-fps=10 \
+  --gan-inference-fps=4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off --profile-control=""
+./rknn_yolov8_seg_cam --rate-profile=gan4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off
+```
+
+## `gan2` / `gan4`: H.265-only full-frame enhancement
+
+The current bare `--rate-profile=gan2` and `--rate-profile=gan4` defaults use the
+same sender preset as `rate120`: 480×270 at 10 fps, 88 kbps H.265 target, 120 kbps
+physical cap, and a 5-second GOP. The receiver selects Real-ESRGAN x2 for `gan2`
+and x4 for `gan4` from the RTP profile. CAP/FPS/target overrides and the explicit
+`--gan-native-720p=on` option still select custom sender geometries.
+
+```bash
+# Board: run one profile after starting the PC receiver.
+./rknn_yolov8_seg_cam --rate-profile=gan2 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+./rknn_yolov8_seg_cam --rate-profile=gan4 --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 --udp-host=192.168.0.100 --udp-port=5004
+
+# PC: model scale is selected automatically from the RTP profile.
+python .\tools\live_h265_hud.py --udp-port=5004 --gan-enhancer=esrgan `
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
+```
+
+For the default gan2 CAP120 profile, the receiver outputs 960×540 (540p). With
+`--rotate=ccw90`, the displayed frame is 540×960; the HUD reports both sizes.
+Default gan4 CAP120 preserves its native 1920×1080 output; the rotated frame
+is 1080×1920. Neither profile is downscaled to 640×360 after enhancement.
+
+Both tiers keep the board path small and deterministic: camera input is processed by
+YOLOv8-Seg only to produce the encoder ROI/QP map, then MPP emits colour H.265 at
+the geometry selected by its atomic link preset. The PC receives only H.265 (plus
+optional audio), so GAN mode does not open or parse `RB/1`, `RSNP`, or `ROEV` and
+its sender telemetry remains `RB/1=0 PATCH=0 STATE=0`.
+
+| `--gan-link-cap-kbps` | source / default fps | default H.265 target | allowed explicit target |
+| ---: | --- | ---: | ---: |
+| `60` | 256×144 / 8 fps | 45 kbps | 1–50 kbps |
+| `100` | 256×144 / 10 fps | 75 kbps | 1–85 kbps |
+| `120` | 480×270 / 10 fps | 88 kbps | 1–100 kbps |
+| `150` | 320×180 / 10 fps | 110 kbps | 1–125 kbps |
+| `300` | 640×360 / 10 fps | 240 kbps | 1–260 kbps |
+
+`--gan-fps=6|8|10|12` and `--gan-video-bitrate-kbps=N` may override the default
+within the selected row's allowed range. `gan2` is the x2 Real-ESRGAN tier;
+`gan4` is the x4 tier. Its CAP120 default matches rate120 at 480×270; CAP150
+retains 320×180 input.
+CAP 60 deliberately preserves the proven
+`256×144 @ 8 fps` CUDA inference geometry; its lower 45 kbps TARGET leaves physical
+wire headroom under the 60 kbps CAP. `150` is the recommended low-bandwidth
+preset. CAP 300 sends 640×360 and presents the x2 Real-ESRGAN output at its
+native 1280×720 size.
+The cap is the combined physical wire budget for video plus optional Codec2 audio:
+the existing audio reserve is subtracted first, and only the remainder becomes the
+video child bucket.
+
+Choose one of these sender selections (the target is omitted so the documented
+preset default is used):
+
+```bash
+# Low-rate stable GAN: 256x144, 8 fps, TARGET 45, CAP 60
+--mode=gan --gan-link-cap-kbps=60 --gan-fps=8
+# Compatibility baseline: 256x144, 10 fps, TARGET 75, CAP 100
+--mode=gan --gan-link-cap-kbps=100 --gan-fps=10
+# rate120-matched enhancement: 480x270, 10 fps, TARGET 88, CAP 120
+--mode=gan --gan-link-cap-kbps=120 --gan-fps=10
+# Recommended quality: 320x180, 10 fps, TARGET 110, CAP 150
+--mode=gan --gan-link-cap-kbps=150 --gan-fps=10
+# Native 720p enhancement: 640x360, 10 fps, TARGET 240, CAP 300
+--mode=gan --gan-link-cap-kbps=300 --gan-fps=10
+# Custom native-720p x4: 320x180, 8 fps, TARGET 90, CAP 120
+--gan-native-720p=on --rate-profile=gan4 --gan-link-cap-kbps=120 --gan-fps=8 --gan-video-bitrate-kbps=90
+```
+
+The PC path is independent of rebuild state and semantic side data:
+
+```text
+CAP 60/100: decoded H.265 256×144 -> x2 native 512×288 -> Lanczos4 -> 640×360
+CAP 120 gan2: decoded H.265 480×270 -> x2 native/output 960×540 (540p)
+CAP 150: decoded H.265 320×180 -> x2 native 640×360 -> direct 640×360 output
+CAP 300: decoded H.265 640×360 -> x2 native 1280×720 -> direct 1280×720 output
+GAN4 CAP 120: decoded H.265 480×270 -> x4 native/output 1920×1080 (1080p)
+GAN4 CAP 150: decoded H.265 320×180 -> x4 native 1280×720 -> direct 1280×720 output
+```
+
+For `gan4`, the receiver selects `model/RealESRGAN_x4plus_dynamic.onnx` from
+the profile ID and requires `--gan-enhancer=esrgan`:
+
+```powershell
+python .\tools\live_h265_hud.py --udp-port=5004 --gan-enhancer=esrgan `
+  --gan-esrgan-x4-model=.\model\RealESRGAN_x4plus_dynamic.onnx `
+  --gan-execution-provider=tensorrt-fp16 --rotate=ccw90
+```
+
+For native 720p comparisons at lower link caps, explicitly enable
+`--gan-native-720p=on`. This selects 640×360 source frames for `gan2` and
+320×180 for `gan4`, independently of CAP 60/70/80/100/120/150/300. CAP 70 and
+80 have default TARGET 50 and 57 kbps, respectively, and default 8 fps.
+Without this option, source dimensions follow the selected CAP preset; the
+default CAP120 geometry for both profiles is 480×270.
+Use 6 or 8 fps and the same video target/GOP when comparing both routes:
+
+```bash
+--gan-native-720p=on --rate-profile=gan2 --gan-link-cap-kbps=70 --gan-fps=8 --gan-video-bitrate-kbps=50
+--gan-native-720p=on --rate-profile=gan4 --gan-link-cap-kbps=70 --gan-fps=8 --gan-video-bitrate-kbps=50
+```
+
+`tools/full_frame_enhancer.py` owns full-frame model and execution-provider
+selection. Its worker has
+one running item and one replaceable pending item, copies decoded input before
+background processing, drops stale results, and records queue/inference/total
+latency, completed/dropped counts, and provider. After eight successful
+provider calls it also uses a bounded recent-inference p95 (60 samples) to skip
+a pending frame predicted to miss its budget. If a transient high p95 would
+otherwise suppress every future call, one refresh probe is allowed at most once
+per 250 ms so the bounded history can recover; it never adds a FIFO backlog.
+HUD/worker telemetry exposes rolling 1/5/10-second rates, while the optional
+JSONL debug log records the per-source-frame fields needed to reproduce those
+rates. The source H.265 frame is never modified. The `--gan-inference-fps`
+value may be lower than the source fps; the latest ROI/QP map is reused on the
+board, while the PC enhancer still receives the live full frame cadence.
+
+A CUDA/ONNX call cannot be safely cancelled from the Python worker thread. The
+receiver therefore uses an FPS-aware output-age budget by default:
+`1.15 × 1000 / source_fps` (about `143.8/115.0/95.8 ms` at 8/10/12 fps).
+`--gan-output-latency-budget-ms` can set an explicit budget; `0` means AUTO.
+The old `--gan-max-inference-latency-ms` remains only as a deprecated explicit
+fixed override and is reported as `LEGACY_FIXED`.
+
+The HUD distinguishes `DEC AGE`, last accepted GAN `GOOD AGE`, current
+in-flight `RUN AGE`, and completed `OUTPUT AGE`. A missing fresh GAN result
+enters `SOFT-FALLBACK` and displays the newest decoded frame through Lanczos4;
+only `RUN AGE >= --gan-hard-stall-ms` (default 500 ms) is a hard stall. Recovery
+requires three fresh outputs by default. A GAN result from the same source frame
+may upgrade that frame's Lanczos display; a strictly older result never replaces
+a newer fallback frame, although a permitted one-frame lag can still prove that
+the worker recovered. Decode and fallback stay live while the provider call
+runs.
+
+Start the board and receiver as separate processes. Run the sender in the
+Linux shell on board `root@192.168.0.101`, and run the receiver in a separate
+PowerShell window from `D:\workspace\videoCompressV2`:
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --mode=gan --gan-link-cap-kbps=150 --gan-fps=10 --gan-inference-fps=4 \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 --audio=off --preview=off \
+  --profile-control=""
+```
+
+`--profile-control=""` is an explicit empty value that disables the runtime
+profile FIFO; it does not wait for console input. The live sender runs in the
+foreground, so the shell prompt does not return until `Ctrl+C` is pressed. For
+a short board-side startup check, append `--max-frames=2` and then run
+`echo "RC=$?"`; success includes transmitted IDR/P frames and `RC=0`.
+
+The project HUD receives RTP directly from its UDP port. Start the receiver
+window directly; do not add `--headless` when a video window is required:
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+New-Item -ItemType Directory -Force .\runs\gan | Out-Null
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=none --rotate=none `
+  --gan-debug-log=.\runs\gan\none.jsonl
+```
+
+Port `5004` is the default, so `--udp-port=5004` may also be omitted. Use
+`--headless` only for a no-window metrics run. When the receiver starts after
+the sender, it waits for the next complete IDR before displaying video.
+
+For ESRGAN, pass the real model explicitly. The receiver defaults to
+`--gan-execution-provider=tensorrt-fp16`; TensorRT enables FP16 and keeps CUDA for
+unsupported nodes. Use `--gan-execution-provider=cuda` to select CUDA with FP32
+math (TF32 disabled). A requested GPU mode fails clearly if its provider cannot
+initialize, and the HUD reports the providers that are actually active.
+
+```powershell
+Set-Location D:\workspace\videoCompressV2
+& D:\Env\Python\Python314\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan `
+  --gan-esrgan-model=.\model\RealESRGAN_x2_dynamic.onnx `
+  --gan-execution-provider=cuda `
+  --gan-output-latency-budget-ms=0 `
+  --gan-output-latency-factor=1.15 `
+  --gan-hard-stall-ms=500 `
+  --gan-recovery-good-frames=3 `
+  --gan-recovery-max-sequence-lag=1 `
+  --gan-debug-log=.\runs\gan\esrgan.jsonl
+```
+
+`model/RealESRGAN_x2_dynamic.onnx` is the existing x2 model. ESRNet is a separate
+model and must be exported from its actual checkpoint with
+`tools/export_esrnet_onnx.py`; the exporter refuses to copy or rename an ESRGAN
+model. The benchmark uses at least 10 warmup and 200 measured frames. Compare both
+providers at the 640×360 source geometry with the commands below:
+
+```powershell
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x2_dynamic.onnx --execution-provider=cuda `
+  --input-size=640x360 --warmup=20 --measured=200 `
+  --output=runs\gan\gan720_cuda.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x2_dynamic.onnx --execution-provider=tensorrt-fp16 `
+  --input-size=640x360 --warmup=20 --measured=200 `
+  --trt-cache-dir=runs\gan\trt_cache `
+  --output=runs\gan\gan720_tensorrt_fp16.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x4plus_dynamic.onnx --execution-provider=cuda `
+  --input-size=320x180 --scale-factor=4 --warmup=20 --measured=200 `
+  --output=runs\gan\gan4_cuda.json
+python tools\benchmark_gan_enhancers.py --backend=esrgan `
+  --model=model\RealESRGAN_x4plus_dynamic.onnx --execution-provider=tensorrt-fp16 `
+  --input-size=320x180 --scale-factor=4 --warmup=20 --measured=200 `
+  --trt-cache-dir=runs\gan\trt_cache `
+  --output=runs\gan\gan4_tensorrt_fp16.json
+```
+
+Each JSON result records model input dtype, requested execution mode, registered
+providers, precision configuration, input/output geometry, plus
+p50/p95/p99/max latency and mean inference FPS. The first TensorRT run builds the
+engine; repeat it after cache creation to measure steady state. The cache depends
+on the model, ONNX Runtime/TensorRT versions, GPU and profile shape. If a requested
+provider cannot initialize or complete its live-shape probe, the benchmark reports
+`NOT RUN` with the reason rather than labeling a fallback run.
+
+On a second Windows receiver with an RTX 4060 at `192.168.0.99`, change the
+board's `--udp-host` to `192.168.0.99` and run the receiver from the conda
+environment named `videocompress`. `conda run` avoids accidentally using a
+different system Python:
+
+```powershell
+conda run -n videocompress --no-capture-output python -c 'import cv2, numpy, onnxruntime as ort; print("python=ok cv2=" + cv2.__version__ + " numpy=" + numpy.__version__ + " ort=" + ort.__version__); print("providers=" + str(ort.get_available_providers())); raise SystemExit(0 if "CUDAExecutionProvider" in ort.get_available_providers() else 2)'
+conda run -n videocompress --no-capture-output ffmpeg -version
+conda run -n videocompress --no-capture-output python tools\live_h265_hud.py --udp-port=5004 `
+  --rotate=ccw90 --gan-enhancer=esrgan `
+  --gan-esrgan-model=model\RealESRGAN_x2_dynamic.onnx --gan-execution-provider=cuda `
+  --gan-output-latency-budget-ms=0 --gan-output-latency-factor=1.15 `
+  --gan-debug-log=runs\gan\f8_i4_b75_4060.jsonl
+```
+
+If `onnxruntime` lists CUDA but session creation reports `LoadLibrary failed
+with error 126`, install the matching runtime DLLs into this environment:
+
+```powershell
+conda install -n videocompress -c conda-forge numpy opencv ffmpeg
+conda run -n videocompress --no-capture-output python -m pip install "onnxruntime-gpu[cuda,cudnn]"
+```
+
+The receiver probes the selected FFmpeg before launching its decoder and uses
+`-fps_mode passthrough` on newer builds, `-vsync 0` on older builds, or no
+optional pacing flag when neither is available.
+
+The sender scenario knobs are `--gan-link-cap-kbps=60|70|80|100|120|150|300`,
+`--gan-fps=6|8|10|12`, `--gan-native-720p=on|off`, `--gan-inference-fps=0..30` (zero means every source
+frame), and the cap-specific `--gan-video-bitrate-kbps` range in the table
+above. Keep `--mode=gan` and `--profile-control=""`; do not mix generic
+`--fps`, `--gop`, encoder-size, or `--pacing-bitrate` overrides into the
+atomic GAN profile.
+
+The full-frame ESRGAN/ESRNet postprocessor uses the model contract `ZERO_TO_ONE`:
+outputs are clipped to `[0,1]` and then multiplied by 255. Small negative or above-1
+values are normal convolution overshoot and must not cause per-frame switching to a
+`[-1,1]` mapping. When `--gan-debug-log` is enabled, each `GAN_WORKER` record also
+contains `RAW_MIN`, `RAW_MAX`, `POSTPROCESS_MODE`, clip counts, and
+`OUTPUT_LUMA_MEAN`. Analyze a new run with `tools/analyze_gan_run.py`; use a new
+JSONL filename instead of appending unrelated runs to an old log.
+
+The explicit 9-cell command matrix is generated with:
+
+```powershell
+python tools\run_gan_ab.py --output-root artifacts\gan_ab
+```
+
+It covers `8/10/12 fps × none/esrnet/esrgan`, holds the sender bitrate at the
+same 75 kbps target, and requires at least 60 seconds per capture and the four
+scene conditions (`empty`, `person1`, `person2`, `person3_or_more`). The matrix
+is declarative; missing models or inactive CUDA are recorded as not run and are
+not replaced with fabricated A/B data.
+
+The following real board-to-PC checks were collected on 2026-09-02. The `none`
+8-fps run is a 63.7-second acceptance run; the other rows are short cadence or
+enhancer feasibility runs and are not presented as the complete 9-cell,
+four-scene A/B campaign:
+
+| source / enhancer | observed duration | unique outputs | enhanced fps | dropped | total PC p95 | wire peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 / none | 63.7 s | 512 | 8.04 | 0.78% | 6.82 ms | 37.8 kbps |
+| 10 / none | 11.1 s | 114 | 10.27 | 4.20% | 7.20 ms | 38.4 kbps |
+| 12 / none | 11.3 s | 139 | 12.25 | 2.80% | 6.72 ms | 48.5 kbps |
+| 8 / ESRGAN CUDA | 10.9 s | 88 | 8.08 | 0% | 89.00 ms | 35.5 kbps |
+| 10 / ESRGAN CUDA | 8.6 s | 87 | 10.10 | 0% | 93.90 ms | 39.1 kbps |
+| 12 / ESRGAN CUDA | 9.2 s | 27 | 2.94 | 75.68% | 99.27 ms | 54.2 kbps |
+| 8 / ESRGAN CUDA (goal0902a) | 634.1 s | 5068 | 7.99 | 0% | 90.92 ms | 38.9 kbps |
+
+The fixed-100-ms comparison is now explicit: the captured old 8-fps sample had
+88/88 accepted outputs with a 98.88-ms maximum, while the deterministic 8-fps
+110-ms test is accepted by AUTO `143.75 ms` and would have been rejected by the
+old fixed budget. In the old 12-fps sample, 82 results were `stale_after_infer`
+and 2 pending items were replaced; the dropped-after-infer total was
+`p50/p95/p99/max=130.82/164.71/170.59/173.59 ms`, with inference-only
+`85.40/94.08/97.59/105.23 ms` (the full all-inference p99 was 95.74 ms).
+
+All rows reported `lost=0`, `reorder=0`, and `decode_errors=0`, with a 100 kbps
+link cap. The 12-fps ESRGAN worker kept at most one running plus one pending
+frame and discarded stale work instead of accumulating delay. There is no
+`RealESRNet_x2_dynamic.onnx` in this checkout, so all ESRNet cells remain
+`NOT RUN`; `tools/export_esrnet_onnx.py` documents the real-checkpoint export
+path and does not rename the ESRGAN model.
+
+## Runtime profile and transport switching
+
+The sender can change H.265 profiles or switch into detection-triggered image
+mode without restarting. By default it creates the FIFO `/tmp/roi-rate-profile`:
+
+```bash
+echo rate60 > /tmp/roi-rate-profile
+echo rate80 > /tmp/roi-rate-profile
+echo rate100 > /tmp/roi-rate-profile
+echo rate120 > /tmp/roi-rate-profile
+echo rate150 > /tmp/roi-rate-profile
+echo rate180 > /tmp/roi-rate-profile
+echo rate200 > /tmp/roi-rate-profile
+echo rate300 > /tmp/roi-rate-profile
+echo rebuild > /tmp/roi-rate-profile
+echo gan2 > /tmp/roi-rate-profile
+echo gan4 > /tmp/roi-rate-profile
+echo gan > /tmp/roi-rate-profile  # legacy alias for gan2
+echo image > /tmp/roi-rate-profile
+echo video > /tmp/roi-rate-profile
+```
+
+Use `--profile-control=/another/path` to move the FIFO, or
+`--profile-control=` to disable runtime control. Ordinary `rateNN` profiles and `rebuild` enter
+video mode; `gan2` and `gan4` enter the H.265-only full-frame path and keep RB/1, RSNP and
+ROEV disabled. `image` (or `snapshot`) drains the H.265 access unit currently on
+the wire, drops queued dependency frames, shuts down MPP, and keeps camera plus
+RKNN running. `video` cancels any in-flight JPEG transfer, rebuilds MPP, and
+returns with VPS/SPS/PPS plus an IDR. The process, camera and RKNN model remain
+running throughout.
+
+Every RTP packet carries an RFC 3550 header extension identified by `0x524f`
+(`RO`) with metadata version, profile, width, height, FPS and generation. GAN
+packets additionally append network-order 16-bit `TARGET` and `CAP` fields:
+`TARGET` is `gan_video_bitrate_kbps`, and `CAP` is the selected shared physical
+link ceiling. Non-GAN packets retain the original eight-byte profile record.
+A receiver treats the former `TARGET` + zero-reserved tail
+and the older no-tail GAN record as CAP 100; the latter displays `TARGET --`. The HUD
+buffers the first complete random-access unit of each generation/geometry,
+converts RFC 7798 packets directly to Annex-B, and restarts only its internal
+FFmpeg pipe decoder and full-frame worker. It follows the new SPS dimensions;
+the receiver application does not restart.
+
+On a board running both processes, the sender publishes its preceding-one-second
+physical video transmit rate to `/tmp/board_tx_wire_rate.sock` using a local Unix
+datagram. The board receiver uses that local value for HUD `TX`; `RX` remains its
+own receive-side wire estimate. TX telemetry is not carried to the peer in RTP.
+
+With only one serial console, start the sender in the background and write the
+same FIFO from that shell; a second serial terminal is not required:
+
+```bash
+nohup env LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam ... \
+  --profile-control=/tmp/roi-rate-profile >/tmp/roi_sender.log 2>&1 &
+echo $! >/tmp/roi_sender.pid
+printf 'rebuild\n' >/tmp/roi-rate-profile
+tail -f /tmp/roi_sender.log
+```
+
+`Ctrl+C` exits only `tail`; the sender remains live. Do not suspend a foreground
+sender with `Ctrl+Z`, because a stopped process cannot capture or transmit.
+
+This project turns the existing RKNN YOLOv8-Seg instance masks into a 16×16,
+four-level ROI map for the RK3588 MPP HEVC encoder. The production sender uses
+MPP only—there is no x265 fallback—and sends normal RFC 7798 H.265 RTP packets.
+A standard FFmpeg/GStreamer/libavcodec receiver can decode the resulting stream.
+
+Optional audio is a separate Codec2 RTP stream on UDP 5006. It is disabled by
+default so a camera-only board keeps its prior behavior. When enabled, `main()`
+partitions the selected rate/rebuild physical-wire ceiling into an audio child
+bucket and a video child bucket; it is a total cap, not one cap per media
+stream. The recommended constrained-link
+profile uses Codec2-2400 and four 20 ms frames per RTP packet (80 ms ptime).
+Before Codec2, the sender uses a configurable speech preprocessor (anti-alias
+resampling, high-pass, adaptive attenuation, VAD, soft gate, and speech-only
+AGC). DTX then suppresses ordinary RTP during confirmed silence while Codec2
+continues encoding locally, retains an 80 ms pre-roll, and emits one complete
+keepalive packet per second. It reduces average wire use during silence without
+changing the Codec2 payload layout or the shared physical ceiling. Audio capture/
+encode and UDP sending are separate workers; the handoff is a whole-RTP-packet
+queue capped at 160 ms, so stale speech is discarded instead of replayed late.
+
+## 四类检测事件推送：ROEV/1 UDP `5010`
+
+完成本次版本的编译与部署后，YOLOv8-Seg 在任意启用事件且非 `baseline`/`gan` 模式中检测到
+`person`、`car`、`boat` 或 `airplane` 时，会额外发送一个很小的 **ROEV/1** 私有 UDP
+状态数据报。它不是 RTP 扩展，不修改标准 H.265 码流；因此可与视频 HUD、
+RB/1、图片接收和 Codec2 音频接收器同时运行。
+
+事件根据独立的 `--event-min-confidence=0.35` 在 **ROI/图片/rebuild 过滤之前**从原始
+RKNN 结果生成：目标集合变化时立即发送 `STATE`；目标持续存在时按
+`--event-heartbeat-ms=1000` 重复当前完整状态，以便 UDP 丢失一次进入/退出通知后仍能恢复。
+空闲且没有目标时不发保活包。默认启用，端口为 `5010`；可通过
+`--event-push=off` 关闭，或用 `--event-udp-port` 改端口。`gan` 为严格 H.265-only
+模式，即使传入 `--event-push=on` 也不会启动 ROEV/1。
+
+先在 Windows PC 的独立终端启动接收器：
+
+```powershell
+cd D:\workspace\videoCompressV2
+python tools\receive_detection_events.py --port 5010
+```
+
+然后在板端的既有启动命令末尾追加（默认值也可省略）：
+
+```bash
+--event-push=on --event-udp-port=5010 \
+--event-min-confidence=0.35 --event-heartbeat-ms=1000
+```
+
+PC 默认文字输出为“`2个人出现`”“`当前检测到1辆车`”“`人员离开`”，不显示置信度；`--json`
+保留 `present_mask`、`entered_mask`、`exited_mask`、四类实例数和每类最高置信度，可用于上层
+告警程序。放行 Windows 入站 UDP `5010`。每个 ROEV/1 数据报固定 `44 B`，按照当前
+以太网线速计费为 `110 B`；它和 H.265、RB/1、RSNP 一起使用视频侧剩余额度（音频启用时先
+扣除音频预留）。稳定目标默认仅约 `0.88 kbps` 的每秒心跳，不会为每个视频 RTP 分片重复付费。
+完整字节布局、CRC 和丢包语义见 [协议.md](协议.md#9-roev1-四类检测事件推送)。
+
+## `rebuild`：100 kbps 语义辅助重建档
+
+`rebuild` 不是把 640×360 视频直接压到 100 kbps，也不是把普通超分结果冒充源视频。
+板端仍发送可由标准播放器解码的 **256×144 @ 6 fps 彩色 H.265 基础层**（UDP `5004`，
+目标 28 kbps），同时把 YOLOv8-Seg 目标状态及少量原相机 ROI 参考通过 `RB/1` 伴随通道
+发送到 UDP `5009`。PC 将基础层用 Lanczos4 放大，在分割掩码内异步使用可选
+Real-ESRGAN 目标块，并以 PTS 校准、内容配准、EMA 等比几何、核心区全融合、尺度自适应羽化和
+`1.0 s` 参考过期保护贴回，最终在旋转前
+输出 **640×360 @ 12 fps**。诊断目标框默认不绘制；只有显式传入
+`--rebuild-boxes=on` 才会显示框和标签。
+
+```mermaid
+flowchart LR
+    CAM["RK3588 camera 640x480"] --> YOLO["YOLOv8-Seg"]
+    CAM --> BASE["RGA 256x144@6"]
+    YOLO --> QP["ROI/QP map"] --> MPP["MPP H.265 28 kbps"]
+    BASE --> MPP --> RTP["RFC 7798 RTP :5004"]
+    YOLO --> STATE["PTS target state"]
+    CAM --> REF["sparse source ROI JPEG + mask"]
+    STATE --> RB["RB/1 CRC32 + MTU fragments :5009"]
+    REF --> RB
+    RTP --> PACER["shared physical pacer"]
+    RB --> PACER
+    AUDIO["optional Codec2 RTP :5006"] --> CAP["central A/V allocation"]
+    PACER --> CAP --> LINK["combined physical cap 100 kbps"]
+    LINK --> DEC["PC H.265 decode + PTS alignment"]
+    DEC --> UPSCALE["base Lanczos4"]
+    RB -. "state/reference" .-> UPSCALE
+    UPSCALE --> ROISR["latest-only async ROI Real-ESRGAN or Lanczos4"]
+    ROISR --> OUT["640x360@12 rebuild HUD"]
+```
+
+H.265、RB/1 状态/参考和 ROEV/1 检测事件使用同一个视频侧 `RatePacer`，音频启用时先从
+100 kbps 总额中预留其实际物理包速率，剩余额度才供 H.265 + RB/1 + ROEV/1 使用。因此 100 kbps
+是含以太网/IP/UDP/RTP 开销的 A/V **组合上限**，不是每个端口各 100 kbps。每次处理先发
+当前 STATE，再发送最多两个待传参考数据报；大 JPEG 不再一次占住发送线程并令状态停更。
+参考传输先发 XOR parity、再渐进发送数据分片，完整传输在最后一个数据分片结束，不会因迟到
+parity 产生伪未完成任务。参考图只保留最新任务，默认长边不超过 128、JPEG 质量 72、JPEG
+最大 1600 B、1100 B 分片、每源帧最多 2 个分片、同一目标最短 `700 ms` 刷新。多个目标的参考传输会均匀错开，并用
+一个 XOR 校验分片恢复任意一个丢失数据分片。每个 RB/1 包都带源 PTS、帧号、档位代次和 CRC32。
+
+接收端先用**有界 FIFO**把完整 RTP 访问单元按解码顺序交给 BMP 输出，再以最近状态的滑动中位数估计固定 PTS
+偏移（`BIAS`）；校准后的时间戳严格按 H.265 RTP 的 90 kHz 时间戳选择最近语义 PTS，只有绝对偏差不超过
+`100 ms` 才允许贴 ROI。窗口内对同轨迹框做有限线性外推，无解码 PTS、代次不一致或超窗时均退化为纯基础层。目标 STATE
+还必须显式声明当前参考可用，且其 `reference_generation` 必须与完整收到的参考严格相等。
+如果基础层被检测为中性灰度，参考块也先转为灰度再融合，避免出现“彩色目标悬浮在灰色背景”现象。
+参考分片额外携带参考时刻的 detector bbox，接收端先对当前框做 EMA，再按参考框到当前框的等比平移/缩放关系放置 crop；
+随后在预测位置 ±8 px 内做内容相关配准，用峰值相关度作 fail-closed 闸门。中心位移超过 25% 或面积比超出 `[0.70,1.40]` 时拒绝贴图。
+掩码核心区 alpha=1、边缘羽化半径随 64×64 掩码放大倍率自适应，
+没有有效分割掩码时只使用 detector bbox，避免把 crop 边缘背景误贴到当前画面。
+因此 RB/1 PATCH 的重复元数据为 40 B（原 32 B 元数据后增加 8 B reference bbox），
+mask 采样为 64×64；发送端和 PC 接收端必须使用同一版本。
+12 fps 默认由 6 fps 解码帧交替显示新帧和 `HOLD` 帧，不使用会产生双影的线性插帧；所以它
+提高显示刷新稳定性，不会伪造额外运动细节。HUD 会明确显示 `DECODED`/`HOLD`、空间处理来源、
+HOLD 比例、`ROI AREA`、校准后 `PTS SYNC` 与 `BIAS`、参考 `PTSAGE`/墙钟年龄、`REGDROP`/`MATCHDROP`、
+`CHROMA`、RB/1 码率和 XOR 恢复数。
+
+Real-ESRGAN 只在 Windows PC 上处理小 ROI，RK3588 部署包不需要 ONNX Runtime。当前
+PC 有 NVIDIA GPU 时，优先安装 CUDA 档；CPU 档仅作为无 NVIDIA GPU 时的回退。两种 ONNX Runtime
+包不能安装在同一 Python 环境。
+
+```powershell
+cd D:\workspace\videoCompressV2
+# NVIDIA CUDA 12 / cuDNN 9（推荐，RTX 3060 已验证可安装）
+python -m pip uninstall -y onnxruntime onnxruntime-gpu
+python -m pip install --upgrade --only-binary=:all: -r requirements-rebuild-cuda-pc.txt
+python -c "import onnxruntime as ort; ort.preload_dlls(directory=''); print(ort.__version__, ort.get_available_providers())"
+```
+
+预期列表包含 `CUDAExecutionProvider`。若 PC 没有 NVIDIA CUDA GPU，改用
+`requirements-rebuild-pc.txt`，并忽略 `preload_dlls` 调用。
+
+模型固定放在 `model\RealESRGAN_x2_dynamic.onnx`。`--rebuild-port=0`（默认）会使用视频
+UDP 端口加 5，即 `5004 -> 5009`；下面显式写出端口和模型，便于检查配置：
+
+```powershell
+python tools\live_h265_hud.py --udp-port=5004 `
+  --rebuild-port=5009 `
+  --esrgan=auto `
+  --esrgan-model=model\RealESRGAN_x2_dynamic.onnx `
+  --esrgan-threads=2
+```
+
+启动日志必须出现 `loaded ROI model ... (CUDAExecutionProvider)`；HUD 的
+`SR Real-ESRGAN/CUDA` 表示 GPU 已实际加载。若 CUDA 运行库不可用，程序自动回退到
+`CPUExecutionProvider` 或 Lanczos4，不会中断 H.265 接收。`FRAME ...+ROI-ESRGAN` 表示该帧实际用了缓存的超分 ROI；
+刚收到新参考时先显示
+`ROI-LANCZOS`、异步任务完成后再切换为 `ROI-ESRGAN` 属于正常行为；接收端会在 RB/1 参考
+**完整收齐的当刻**就提交后台超分，不再等到该参考通过最终 STATE/PTS 贴图检查才启动。最终贴图
+仍必须通过 generation、reference_generation、PTS 和内容配准闸门，因此这项预热不会放宽防重影
+安全边界；没有目标时只显示基础层。
+超分结果按 `(generation, track_id, reference_generation)` 缓存为模型原生 x2 尺寸，当前框尺寸变化只做
+Lanczos 重采样，不会因检测框抖动重复提交 ONNX 推理。若模型或 ONNX Runtime 不可用，程序会自动回退
+Lanczos4，并在 HUD 的 `SR` 字段如实标明。GPU 只加速 PC 的 ROI 超分，不改变板端 H.265 编码、
+UDP 限速或基础视频帧率。
+
+**本机实测（RTX 3060 Laptop GPU，2026-08-27）**：对动态模型的 `105×128 -> 210×256`
+ROI，CUDA 端到端超分中位数为 `93.13 ms`（P95 `105.60 ms`）；同样输入、CPU 两线程为
+`889.40 ms`（P95 `1097.76 ms`），约快 `9.55×`。首次加载 CUDA 模型及一次代表动态尺寸预热在
+后台完成；预热完成前参考安全地保留为 Lanczos，不会把首个 GPU 推理塞进 1 s 的参考 PTS 窗口。
+由于 SR 仍只处理小 ROI，GPU 不会改变基础层 H.265 或网络时延。
+
+普通 FFplay/GStreamer 仍能接收 UDP `5004` 的标准 H.265，但只能看到 256×144 @ 6 fps
+基础层；只有本项目 HUD 同时解析 `RB/1` 才会得到 640×360 @ 12 fps 重建展示。
+
+## 极低速检测截图模式
+
+图片模式不发送实时 H.265。它只保留 YOLOv8-Seg 推理，且在
+推理结果中只接受 COCO 的 `person(0)`、`car(2)`、`boat(8)`、`airplane(4)`；其他类别在
+ROI、板端预览和截图触发前都会被过滤。命中目标后，独立工作线程从摄像头的**原始 RGB
+分辨率**取四类目标检测框的联合区域，并在四周各保留 `25%` 上下文；随后限制为最大
+`1280×720`、JPEG 质量 `75`、逆时针旋转 `90°` 后发送。典型 16:9 全景证据图最终保存为
+`720×1280` 的竖图。该默认值优先减少 60 kbps 链路上的 JPEG 字节数，而不是只改变上传间隔。
+使用 `--snapshot-crop=full` 保留完整画面；再配合
+`--snapshot-max-width=0 --snapshot-max-height=0` 可恢复原始像素数的全景图（仍默认逆时针旋转）。
+
+先在 Windows PC 接收端启动持久化接收器：
+
+```powershell
+cd D:\workspace\videoCompressV2
+python tools\receive_snapshot_udp.py --port 5008 --output runs\snapshots --sync-every-bytes=32768
+```
+
+The Windows receiver polls its UDP socket every 250 ms, so `Ctrl+C` exits even
+while no image packet is arriving.  It preserves any `.jpg.part` file, allowing
+the board to resume after the receiver is restarted.  It keeps one `.part` file
+handle open and fsyncs each 32 KiB batch, plus every START/END and normal exit,
+rather than reopening and syncing every UDP chunk.  After an abrupt power loss,
+the sender may retransmit at most the final unsynchronized batch; the final CRC
+still prevents a corrupted JPG from being published.
+Seeing only the listening line is normal until the running board sender is in
+`image` mode and detects `person`, `car`, `boat`, or `airplane` at the configured
+minimum confidence (default `0.35`).  Snapshot traffic is event-triggered, not
+a continuous preview.  `--snapshot-min-interval-ms=5000` limits the **start
+times** of any two uploads to at least five seconds apart; it does not identify
+target motion direction and does not add a further five-second wait after an
+upload completes.  While one JPEG is transferring, only the newest qualifying
+detection is retained as the single candidate for the next upload.  Therefore,
+when a JPEG itself takes longer than five seconds to transfer, this setting adds
+no extra delay.
+
+板端可直接以图片模式启动。下列完整命令保留 Codec2 音频、`1280×720` / JPEG 质量 `75` /
+`1100 B` 分块的截图策略，以及 `720×1280` 的逆时针旋转板端预览：
+
+```bash
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --transport-mode=image --rate-profile=rate60 --mode=segmentation \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --camera-width=1920 --camera-height=1080 --fps=10 \
+  --udp-host=192.168.0.100 --pacing-bitrate=60000 \
+  --snapshot-udp-port=5008 --snapshot-jpeg-quality=75 \
+  --snapshot-crop=relevant --snapshot-crop-margin-percent=25 --snapshot-rotate=ccw \
+  --snapshot-max-width=1280 --snapshot-max-height=720 \
+  --snapshot-min-interval-ms=5000 --snapshot-chunk-bytes=1100 \
+  --snapshot-ack-timeout-ms=300 --snapshot-max-retries=20 \
+  --snapshot-min-confidence=0.35 --profile-control=/tmp/roi-rate-profile \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 \
+  --audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400 \
+  --audio-frames-per-packet=4 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --audio-dtx=on --audio-dtx-preroll-ms=80 --audio-dtx-hangover-ms=600 --audio-dtx-keepalive-ms=1000 \
+  --audio-reserve-bitrate=0 --audio-max-latency-ms=160 \
+  --audio-preprocess=on --audio-highpass-hz=80 --audio-lowpass-hz=3600 \
+  --audio-noise-suppression-db=6 --audio-noise-gate-snr-db=2 \
+  --audio-noise-gate-attenuation-db=30 --audio-noise-gate-hangover-ms=600 \
+  --audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20 \
+  --audio-vad=on --audio-vad-start-frames=2 --audio-vad-min-voicing=42 \
+  --preview=on --preview-rotate=ccw --preview-width=720 --preview-height=1280
+```
+
+Start the snapshot receiver on UDP `5008` first. On first use, after the board has
+written `/tmp/roi-audio.sdp`, copy it to the PC and then start the audio receiver on
+UDP `5006`; the SDP can be reused while the audio configuration remains unchanged.
+With `--audio-reserve-bitrate=0`, the sender automatically reserves the actual Codec2
+wire rate and assigns the remaining 60 kbps media budget to JPEG. If snapshot delivery
+time is more important than audio, change only `--audio=on` to `--audio=off`; the local
+DSI preview does not consume network bandwidth and can remain enabled.
+
+```powershell
+scp root@192.168.0.101:/tmp/roi-audio.sdp runs\audio.sdp
+python tools\receive_codec2_rtp.py runs\audio.sdp --play `
+  --ffplay D:\ffmpeg\bin\ffplay.exe
+```
+
+截图传输保持“正在发送的一张 + 最新命中的一张”两个槽位，慢链路不会积压旧告警。每个
+数据块都等待 PC 的连续偏移确认；PC 程序重启后会从 `.jpg.part` 的已落盘字节数回复
+`RESUME(offset)`，板端继续上传同一张 JPEG。板端进程本身被杀掉时内存中的当前 JPEG 会取消，
+下一次检测会生成新截图。运行中可用 `echo image > /tmp/roi-rate-profile` 和
+`echo video > /tmp/roi-rate-profile` 在两种模式间切换。
+
+## 实际运行链路
+
+是按照“分割驱动ROI、MPP H.265、RTP/UDP、PC标准解码”的主链路实现的，但当前
+当前采用60 kbps可视档位：牺牲色彩信息、保留亮度和ROI边缘。ROI是编码控制
+支路，不会作为独立图层或元数据发送到PC；PC收到的是标准H.265视频。
+
+```mermaid
+flowchart TD
+    CAM["RK3588 摄像头 / V4L2"] --> CAP["采集线程\n档位帧率 10 / 15 / 20 / rebuild 6 / gan 8-12 fps"]
+    CAP --> RGA["RGA 预处理\n源RGB + 档位NV12/灰度帧"]
+
+    RGA --> IQ["最新帧推理队列"]
+    IQ --> NPU["RKNN YOLOv8-Seg"]
+    NPU --> SEG["SegResult\nmask / bbox / PTS"]
+    SEG --> FILTER["四类过滤\nperson / car / boat / airplane"]
+    SEG --> EVENT["ROEV/1 事件状态\n变化立即发送 + 1 s 心跳"]
+    FILTER -->|视频模式| MAP["RoiMapper\n16x16 BG/HALO/CORE/EDGE QP Map"]
+    MAP --> TEMP["RoiManager\n时序平滑和最大年龄控制"]
+    TEMP --> MERGE["ROI矩形合并\n最多64个区域"]
+
+    RGA --> EQ["最新帧编码队列"]
+    EQ --> MPP["RK3588 MPP H.265硬编码\nCBR目标 42 / 110 / 240 / rebuild 28 / gan 75 kbps\n低档灰度，其余彩色"]
+    MERGE --> MPP
+    MPP --> AU["完整H.265 Access Unit"]
+    AU --> SENDQ["有界整帧发送队列\n过期P帧丢弃 + 恢复IDR"]
+    SENDQ --> RTP["RFC 7798 H.265 RTP封包"]
+    FILTER -->|图片模式| SNAPQ["图片模式触发\n活动一张 + 最新一张"]
+    SNAPQ --> CROP["相关目标联合框 + 25% 上下文\nfull 可回退全景"]
+    CROP --> JPEG["最大 1280×720 → 逆时针 90° JPEG"]
+    JPEG --> SREL["RSNP 可靠分块\nSTART / DATA / ACK / RESUME / END"]
+    RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild 100 / gan 60|100|120|150|300 kbps"]
+    SREL --> PACER
+    EVENT --> PACER
+    MIC["板载麦克风 / 当前新板 card 3"] --> ARECORD["arecord 采集\nhw:3,0 44.1 kHz 双声道"]
+    ARECORD --> PCM["下混 + 3.6 kHz 抗混叠重采样\n8 kHz 单声道 PCM"]
+    PCM --> ADSP["80 Hz 高通 + 自适应降噪\n语音 VAD + 软门限 + 人声 AGC"]
+    ADSP --> C2["Codec2 2400\n推荐 4 × 20 ms 帧"]
+    C2 --> DTX["DTX 控制器\n80 ms 预卷 + 600 ms 保持 + 1 s 保活"]
+    DTX --> AQ["有界整 RTP 包队列\n160 ms 上限，丢最旧语音"]
+    AQ --> ARTP["私有动态 Codec2 RTP\nPT 97 / UDP :5006"]
+    ARTP --> PACER
+    CTRL["/tmp/roi-rate-profile\necho rate60..rate300 / rebuild / image / video"] -. "运行时切换" .-> MPP
+    CTRL -. "图片模式启停" .-> SNAPQ
+    RTP -. "RTP扩展: 档位/尺寸/FPS/代次" .-> PROXY
+    PACER --> UDP["H.265 UDP socket :5004"]
+    PACER --> AUDP["Codec2 UDP socket :5006"]
+    PACER --> SUDP["可恢复 JPEG UDP socket :5008"]
+    PACER --> EUDP["ROEV/1 UDP socket :5010"]
+    UDP --> NET["网络链路\n随档位切换的 A/V 合计物理线速上限"]
+    AUDP --> NET
+    SUDP --> NET
+    NET --> PCRX["PC UDP :5004"]
+    PCRX --> PROXY["HUD直接RFC 7798解包\n缓存参数集 + 首个完整IDR"]
+    PROXY --> DEC["Annex-B管道 → FFmpeg H.265解码"]
+    DEC --> HUD["BMP自描述帧管道\nOpenCV实时显示 + HUD"]
+    NET --> ARX["PC Codec2 RTP 接收器\n解 RTP + c2dec + ffplay"]
+    NET --> SRX["PC 图片接收器\n落盘 .jpg.part + RESUME 断点续传"]
+    NET --> ERX["PC 检测事件接收器\nSTATE / 当前存在 / 新出现 / 已离开 / heartbeat"]
+
+    SEG -. "仅板端显示" .-> PREVIEW["DSI Preview\nmask / bbox / 标签叠加"]
+    RGA -. "MPP 输入 NV12" .-> PREVIEW
+```
+
+当前默认视频档位：`320x180`、`10 fps`、`42 kbps`编码目标、`60 kbps`总物理线速上限、
+`50`帧GOP、编码UV固定为128（灰度）。启用默认音频后，Codec2 RTP 约占其中
+`10.2 kbps` 的物理预算；共享限速器为音频和视频分配子桶，视频只使用剩余额度。
+视频遇到 IDR 峰值时仍会优先遵守总上限并按既有策略丢弃过期 P 帧。HUD独占 PC 的 UDP 5004
+端口，不能与 ffplay 或保存脚本同时运行；
+音频接收器独占 UDP 5006，可与任一视频接收器并行运行。检测事件接收器独占 UDP 5010，
+可与任一视频、音频、图片或 rebuild 接收器并行运行。
+图片模式关闭 MPP/H.265 发送，JPEG 改用视频侧剩余子桶与 UDP 5008；PC 可重启图片接收器，
+它会从 `.jpg.part` 已持久化偏移继续。
+
+## HUD 指标
+
+完整字段定义、GAN 成功使用判定、rebuild 21 行 HUD 与普通档口径统一维护在
+[协议.md](协议.md) 的“PC HUD：字段口径与 GAN 成功判定”章节。
+
+
+## Cross-build and deploy
+
+The Buildroot sysroot must contain `rk_mpi.h`, `rk_venc_cmd.h`, and either
+`librockchip_mpp.so` or `libmpp.so`. The sender uses the public
+`MppEncROICfg`/`KEY_ROI_DATA` ABI, which is available on the supplied MPP 1.3.9
+SDK even though its private `mpp_enc_roi_utils.h` helper is not installed.
+CMake deliberately stops if a required public MPP component is missing;
+deploying without MPP ROI would not meet the sender contract.
+
+The ATK-DLRK3588 Buildroot image provides glibc 2.37 and a compatible
+`/lib/librockchip_mpp.so.1`. Some newer SDK bundles require glibc 2.38, so the
+default build links the SDK MPP library but intentionally uses the target image
+runtime at deployment. The application contains a narrow legacy-`strtol` ABI
+bridge for the SDK header redirect. Do not set `MPP_BUNDLE_RUNTIME=ON` unless
+the target image is known to provide glibc 2.38 or newer.
+
+The first configure of this audio-capable build downloads the pinned Codec2 1.2.0 source and
+installs its deployable `libcodec2.so*` beside the application under `lib/`.
+For an offline build, obtain that exact source tree in advance and set
+`ROI_CODEC2_SOURCE_DIR=/path/to/codec2-1.2.0` before running `build-linux.sh`.
+Codec2 is LGPL-2.1; preserve its license and the separately deployable shared
+library when distributing the application.
+
+`build-linux.sh` confines the AArch64 compiler to the top-level CMake
+configuration, then explicitly supplies `/usr/bin/cc` and `/usr/bin/c++` to the
+`make` environment used by Codec2's nested host-native codebook generator. This
+prevents CMake from producing an AArch64 generator that cannot run on the x86_64
+build machine. Override those two host paths only with `HOST_CC`/`HOST_CXX`.
+
+```bash
+cd cpp
+./build-linux.sh
+```
+
+If the SDK is installed somewhere else, set `RK3588_TOOLCHAIN_DIR` to its root;
+it must contain `bin/aarch64-buildroot-linux-gnu-g++` and the matching sysroot.
+
+Copy `cpp/install/rk3588_linux_aarch64/atk_rknn_yolov8_seg_cam/` to the board.
+Run the executable from that installed directory so its `model/` and `lib/`
+paths are available.
+
+The 2026-08-27 `rebuild` archive below is historical. The current 2026-09-02
+GAN build is recorded separately immediately after it.
+
+The historical cross-built deployable archive is
+`artifacts/rk3588_rebuild_refprefetch_20260827.tar.gz` (SHA-256
+`721a8a32a7a7e76685e0a5e3531f1aa58a9fdfc5ad03e509f4f6d8cf696130f7`; binary
+SHA-256 `ca6195cb0fa5e0c58a88f79b2810cab3eda19902329404586e47306012307234`). It retains
+the bounded low-latency audio, image mode and portrait preview features, and fixes
+rebuild jitter/ghosting with FIFO PTS pairing plus median bias calibration, content
+registration, EMA/isotropic geometry, adaptive feathering, native-size SR caching,
+and two reference packets per source frame. It additionally starts PC-side ROI
+super-resolution immediately when the complete RB/1 crop arrives and sends a
+same-cycle STATE after the final reference fragment, removing the avoidable one-frame
+eligibility delay without relaxing the PTS/registration safety gates. It was
+cross-built and deployed on 2026-08-27 to `192.168.0.101` with a checksum-verified,
+staged atomic swap; the prior application is retained as
+`/opt/atk/rknn_yolov8_seg_cam.backup_20260827_084150`. A board smoke run through
+`/dev/video-camera0` (linked to `/dev/video31`) loaded RKNN, RGA, MPP and Codec2,
+encoded/sent an IDR and a P frame, and exited successfully after `--max-frames=2`
+with audio and preview disabled. The previous `jitter` package had separately been
+validated for 180 `rebuild` frames with no sender errors, packet loss, reordering, or
+H.265 decode errors.
+
+> 上述 `20260827` 历史归档早于 ROEV/1 检测事件功能，不能用于本节的 `--event-*` 参数。
+> 使用事件推送前必须按前述 `./build-linux.sh` 从当前源码重新构建并部署；本次仅完成编译验证，
+> 未替换开发板上的历史归档。
+
+**2026-09-02 GAN cross-build and board-101 deployment**: the current source was
+archived, checksum-verified, and cross-built on Ubuntu `192.168.0.10` with the
+RK3588 AArch64 toolchain and Codec2 1.2.0. The deployable archive is
+`artifacts/videoCompressV2-goal0902-rk3588.tar.gz` (SHA-256
+`58e924f2b065b264e70203211d8cb010d3364f8931961780a3851be54f71a607`); the
+installed AArch64 binary SHA-256 is
+`2e57ee58d1e30c745fec7da510539dfdba5232637de8e6258a57da502619182b`.
+It was staged and atomically swapped into
+`/opt/atk/rknn_yolov8_seg_cam` on board `192.168.0.101`; the previous directory
+was retained as a timestamped backup. A board camera smoke run with
+`--mode=gan --gan-fps=8 --gan-inference-fps=4 --max-frames=2` loaded RKNN, RGA,
+MPP H.265, and Codec2 dependencies, emitted IDR/P frames,
+reported `RB/1=0 PATCH=0 STATE=0`, and exited with code 0. A real board RTP to PC
+run then received and decoded `256×144@8` with no loss, reorder, or decode errors;
+the `none` full-frame path produced `640×360` output with p50/p95/p99 total PC
+latency of `2.519/3.614/4.602 ms` under the 100 ms budget.
+
+Upload and unpack it with:
+
+```bash
+scp artifacts/rk3588_rebuild_refprefetch_20260827.tar.gz root@192.168.0.101:/tmp/
+ssh root@192.168.0.101 'mkdir -p /opt/atk/rknn_yolov8_seg_cam && \
+  tar -xzf /tmp/rk3588_rebuild_refprefetch_20260827.tar.gz \
+  -C /opt/atk/rknn_yolov8_seg_cam'
+```
+
+For an in-place upgrade, use the staged replacement command in `启动.md` rather
+than unpacking over a running application directory. It retains the old board
+directory under a timestamped backup name.
+
+Check that `LD_LIBRARY_PATH=$PWD/lib ldd ./rknn_yolov8_seg_cam` resolves
+`libcodec2.so.1.2` before starting the sender.
+
+On the ATK RKISP multi-planar camera path, use
+`--camera-device=/dev/video-camera0` (normally `/dev/video31`). The sender
+uses its native NV12 V4L2 fallback when OpenCV's V4L2 backend rejects that
+multi-planar node; ordinary V4L2 devices and input-video files retain the
+OpenCV capture path.
+
+```bash
+./rknn_yolov8_seg_cam \
+  --model=model/yolov8_seg.rknn --camera-device=/dev/video-camera0 \
+  --mode=segmentation --encoder-width=320 --encoder-height=180 --fps=10 \
+  --target-bitrate=42000 --gop=50 --qp-min=10 --qp-max=51 \
+  --qp-init=38 --qp-min-i=36 --qp-max-i=48 \
+  --intra-refresh=on --intra-refresh-rows=1 \
+  --max-reencode-times=3 --super-i-frame-bits=12000 --super-p-frame-bits=5500 \
+  --grayscale-encode=on \
+  --background-delta-qp=12 --halo-delta-qp=2 --core-delta-qp=-6 --edge-delta-qp=-10 \
+  --mask-occupancy-threshold=0.10 --erosion-radius=2 --dilation-radius=3 \
+  --roi-hold-frames=3 --roi-max-age=9 --max-roi-region=64 \
+  --udp-host=192.168.0.100 --udp-port=5004 --pacing-bitrate=60000 \
+  --send-queue-frames=3 --send-max-latency-ms=250 \
+  --audio=on --audio-device=hw:3,0 --audio-udp-port=5006 \
+  --audio-capture-rate=44100 --audio-channels=2 --audio-codec2-mode=2400 \
+  --audio-frames-per-packet=4 --audio-rtp-sdp-path=/tmp/roi-audio.sdp \
+  --audio-dtx=on --audio-dtx-preroll-ms=80 --audio-dtx-hangover-ms=600 --audio-dtx-keepalive-ms=1000 \
+  --audio-reserve-bitrate=0 --audio-max-latency-ms=160 \
+  --audio-preprocess=on --audio-highpass-hz=80 --audio-lowpass-hz=3600 \
+  --audio-noise-suppression-db=6 --audio-noise-gate-snr-db=2 \
+  --audio-noise-gate-attenuation-db=30 --audio-noise-gate-hangover-ms=600 \
+  --audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16 --audio-agc-max-gain-db=20 \
+  --audio-vad=on --audio-vad-start-frames=2 --audio-vad-min-voicing=42 \
+  --debug-roi=on --debug-roi-path=/tmp/roi/roi_{frame_id}.pgm
+```
+
+`pacing-bitrate` is a shared A/V ceiling, not a bandwidth target. The
+application rejects a value over 300,000 bit/s. It starts both centrally
+allocated child buckets empty and paces every H.265 and Codec2 RTP datagram
+using Ethernet-wire accounting (RTP, IPv4/UDP, Ethernet framing, preamble, and
+inter-frame gap). Their rates and burst budgets add up to the configured
+physical link rather than forming two independent bandwidth allowances.
+`--audio-reserve-bitrate=0` derives the required audio wire rate from Codec2 packet
+geometry (Codec2-2400/4 frames gives 102 B every 80 ms, about 10.2 kbps); it is an
+audio sub-bucket inside the same physical cap, so video receives the remainder
+rather than a second bandwidth allowance. `--audio-max-latency-ms=160`
+caps the separate complete-packet audio queue.
+
+On the current new-board Buildroot image, ES8388 is `card 3, device 0` (use `arecord -l`
+after a reflash to confirm the index).  Its verified recording format is:
+
+```bash
+--audio-device=hw:3,0 --audio-capture-rate=44100 --audio-channels=2
+```
+
+The sender downmixes it and uses a 3.6 kHz anti-alias low-pass before Codec2's
+required 8 kHz mono PCM. The recommended DTX profile uses Codec2 2400 bit/s
+and four 20 ms frames per RTP packet, so the packet interval remains 80 ms. It
+applies an 80 Hz high-pass, estimates stationary background during the first
+600 ms, limits broad-band attenuation to 6 dB for clarity, and uses a
+periodicity-plus-speech-band VAD before AGC. During confirmed silence Codec2
+still encodes locally, but DTX withholds regular RTP packets, retains the most
+recent 80 ms for the next talkspurt, keeps a talkspurt open for 600 ms across
+brief VAD misses, and sends one complete keepalive per second after real
+silence. Confirmed voice and its gate hangover are never attenuated by more
+than 3 dB before Codec2; AGC gain is held during that hangover so quiet
+consonants do not collapse in volume.
+The first board test should leave about 0.6 s of room tone after start before
+speaking so the initial estimate contains ambient noise rather than speech.
+
+Do **not** solve noise with the codec driver's `ALC Capture NG` mode when that
+mode is `Mute ADC Output`: it removes weak speech before this program sees it.
+For the software-processing A/B test, inspect the actual controls with
+`amixer -c 3 scontents`, then temporarily disable that hard gate if the control
+exists:
+
+```bash
+amixer -c 3 sset 'ALC Capture NG' off
+```
+
+For the supplied ES8388 mixer, the verified starting point is below.  Do not
+use the former `3 / 9 / 12` combination: its high `ALC Capture NG Threshold`
+only appears quiet because `Mute ADC Output` removes weak speech before Codec2
+or the software AGC can see it.  With `ALC Capture NG` off, that threshold has
+no effect.
+
+```bash
+amixer -c 3 sset 'ALC Capture Function' Stereo
+amixer -c 3 sset 'ALC Capture Max PGA' 5
+amixer -c 3 sset 'ALC Capture Target' 12
+amixer -c 3 sset 'ALC Capture NG' off
+```
+
+Keep the known-good microphone route and capture PGA unchanged at first; do
+not lower `ALC Capture Max PGA` merely to suppress noise.  `PCM Volume` is not
+necessarily the capture gain on every board image.  A known-good `plughw:3,0`
+setup may instead use `--audio-capture-rate=8000 --audio-channels=1` to let
+ALSA perform the device conversion.
+
+All preprocessing controls are sender-side and can be used for a repeatable
+A/B comparison. `--audio-preprocess=off` bypasses high-pass, adaptive
+attenuation, VAD, gate, and AGC while keeping the safe anti-alias rate
+conversion; when it is off, DTX automatically falls back to continuous RTP
+because no speech-state gate is available. The useful tuning order is: first
+verify the microphone route/PGA, then keep VAD on and adjust gate SNR, and
+only then adjust attenuation and AGC. `--audio-vad` is the speech-structure
+admission check; `--audio-vad-start-frames=2` rejects a single transient, and
+`--audio-vad-min-voicing=42` is the pitch-correlation threshold. Do not tune a
+hard ADC mute gate and the software gate at the same time. Use
+`--audio-dtx=off` only when a continuous audio RTP reference stream is needed.
+
+If the runtime log remains `audio_voice=0` and `audio_gate=0` while someone is
+speaking, use the weak-voice diagnostic override once: `--audio-vad=off
+--audio-noise-suppression-db=6 --audio-noise-gate-snr-db=1
+--audio-noise-gate-attenuation-db=12 --audio-noise-gate-hangover-ms=500
+--audio-noise-warmup-ms=600 --audio-agc-target-dbfs=-16
+--audio-agc-max-gain-db=20`. It intentionally trades environmental rejection
+for weak-speech admission; if it still does not make speech audible, the issue
+is the microphone route or analog PGA rather than Codec2 or RTP.
+
+Before the first live run, the board recording path can be checked independently:
+
+```bash
+arecord -D hw:3,0 -r 44100 -f S16_LE -d 3 -c 2 /tmp/es8388-check.wav
+aplay /tmp/es8388-check.wav
+```
+
+The token bucket and UDP socket run on their own worker thread. MPP submits
+complete H.265 access units to a bounded queue, so the encoder never sleeps for
+network pacing. Pending P access units older than `send-max-latency-ms` are
+dropped as a dependency group and MPP is immediately asked for a recovery IDR;
+this avoids forwarding broken P-frame reference chains. The 10 fps profile uses
+a 50-frame GOP, so a periodic recovery IDR is requested about every five seconds.
+I-frame QP, progressive row intra
+refresh, and MPP super-frame re-encoding keep that IDR within the physical-link
+frame budget instead of spreading an 8-15 KB frame over several seconds.
+
+Audio capture/Codec2 and UDP sending run in separate workers. The encoder keeps
+reading the sound card even while the video child bucket is busy; it queues complete RTP
+datagrams for at most `audio-max-latency-ms` and discards the oldest stale audio on
+overflow. The pacer refills an audio sub-bucket at the computed wire rate and a
+video sub-bucket at the remaining rate, while still enforcing one combined
+physical ceiling. It never blocks camera
+capture, RKNN inference, MPP encoding, or the board preview. Every audio RTP packet
+carries a fixed number of complete Codec2 frames, so a loss can be concealed at an
+audio packet boundary without misaligning subsequent frames. The periodic sender
+log includes
+`audio_noise_dbfs`, `audio_agc_db`, `audio_speech_snr_db`, `audio_voicing`,
+`audio_gate`, `audio_voice`, `audio_dtx_drop`, `audio_dtx_speech`, and
+`audio_dtx_keepalive`, plus `audio_q`, `audio_q_age_ms`, `audio_q_drop`,
+`audio_q_wait_ms`, and `audio_reserve_bps`. They respectively show the learned room-noise level,
+applied AGC gain, speech-band SNR, periodicity confidence (percent), soft-gate
+state, current VAD decision, suppressed Codec2 frames, generated talkspurt/
+keepalive packets, queued packets, oldest queued-audio age, stale packets dropped,
+last queue wait, and the derived/reserved wire bitrate. The speech-state and DTX values are
+meaningful only when `--audio-preprocess=on`.
+
+`--mtu` is the IPv4 MTU (default `1200`), not an RTP payload size. The sender
+therefore limits each UDP datagram to `mtu - 28` bytes and prevents IP
+fragmentation on the constrained link.
+
+## Board DSI preview
+
+The original YOLOv8-Seg application's annotated board preview is restored and
+is on by default. The preview consumes a latest-only queue in the main GUI
+thread, so a slow display never blocks capture, RKNN, MPP, or RTP. It renders
+the MPP-input NV12 frame with the source-space masks and boxes mapped onto it,
+then adds class labels and segmentation latency; use `--preview=off` for
+headless operation. On the supplied Buildroot image an SSH shell has no GUI
+variables, so the program automatically uses Weston's
+`/run/wayland-0` socket when present. Press `q` or `Esc` in the board preview to
+stop the application.
+
+The portrait preview displays the NV12 image sent to MPP, then rotates it **90
+degrees counter-clockwise before annotations are drawn**, so masks, boxes,
+labels, and status text remain upright. This makes the displayed content and
+its rotated 9:16 aspect match the H.265 receiver instead of showing the wider
+4:3 camera source. The verified portrait DSI output is `720x1280`, which is the
+default window size. This does not change capture or encoder resolution. To use
+a landscape display instead, override it with:
+
+```bash
+--preview=on --preview-rotate=none --preview-width=1280 --preview-height=960
+```
+
+The debug PGM values are `32=BACKGROUND`, `96=HALO`, `176=CORE`, and
+`255=EDGE`. Supplying `{frame_id}` writes one map per encoded frame; omitting it
+keeps only the latest map at that path.
+
+## Threading and data ownership
+
+`CameraCapture` produces source RGB for RKNN and encoder-sized NV12 using the
+existing RGA-backed conversion. It puts a shared frame into independent,
+latest-only queues. `YoloV8Seg` runs on one queue and publishes a `SegResult`
+with frame ID, PTS, class, confidence, box, and one source-coordinate binary
+mask per instance. The encoder consumes its own queue and obtains only the most
+recent non-future ROI map from `RoiManager`; it never waits for NPU inference.
+Capture emission is also capped at `--fps`, even if a V4L2 driver or file
+source ignores its requested frame-rate setting.
+
+Fresh targets rise immediately. Missing/jittering targets fade
+`EDGE → CORE → HALO → BACKGROUND` using `roi-hold-frames`, and maps older than
+`roi-max-age` become background-only. `RoiRegionMerger` partitions the 16×16
+map into non-overlapping rectangles and truncates over-limit sets in
+`EDGE > CORE > HALO > BACKGROUND` order. MPP receives relative QP regions with
+`force_intra=0` by default.
+
+## Standard PC receive and live display
+
+The HUD binds the selected UDP port, depacketizes RFC 7798, and consumes
+VPS/SPS/PPS in-band. Profile changes therefore do not require a receiver
+restart. It shows received and decoded FPS, RTP and estimated Ethernet-wire
+kbps, packet loss/reordering, decoder errors, display age, and last-IDR age
+directly on the video:
+
+```powershell
+python tools/live_h265_hud.py --udp-port=5004
+```
+
+Port `5004` is the default, so the shortest equivalent command is
+`python tools/live_h265_hud.py`.
+
+In `rebuild`, boxes are intentionally off. Add `--rebuild-boxes=on` only for a
+short diagnostic run; production display should keep the default `BOX OFF`.
+
+The HUD depacketizes RFC 7798 itself and sends Annex-B H.265 through a pipe to
+FFmpeg. It waits for a complete IDR before launching/relaunching the decoder,
+and reads self-delimiting decoded image frames, so it follows the active H.265
+frame size automatically. Do not run a second receiver on UDP 5004.
+The display defaults to counter-clockwise 90-degree rotation and bilateral
+edge-preserving denoising. Use `--rotate=none` or `--denoise=off` to disable
+either display post-processing; the transmitted H.265 stream is unchanged.
+The initial OpenCV window is sized from the rotated dimensions and is corrected
+again when the first decoded frame reports its actual size.
+
+Start this command first, wait for the `WAITING FOR COMPLETE IDR` window, and
+then start the board sender. It exclusively owns UDP 5004, so do not run
+another video receiver on that port. It requires Python, OpenCV, NumPy, and
+`ffmpeg.exe` in `PATH`; override the decoder with
+`--ffmpeg=D:\\ffmpeg\\bin\\ffmpeg.exe` when needed.
+
+If the sender was already running, wait for its next IDR (at most one GOP; the
+default is 5 seconds at 10 fps) before video appears. Allow inbound UDP 5004
+in the Windows firewall (UDP 5006 when audio is enabled, and UDP 5010 when the
+event receiver is used), and do not run a second receiver on an occupied port.
+
+### Two-board concurrent video test
+
+Use separate destination ports for the two physical boards. Do not launch two
+sender processes on one board: they would contend for its camera.
+
+| Stream item | Board A (`192.168.0.101`) | Board B (`192.168.0.102`) |
+| --- | --- | --- |
+| PC H.265 UDP port | `5004` | `5005` |
+| Optional Codec2 UDP port | `5006` | `5007` |
+
+For a video-only concurrency check, start one command in a terminal on each
+board. The HUDs can be started before the senders and wait for a complete IDR.
+
+```bash
+# Board A terminal
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5004 \
+  --audio=off --preview=off
+```
+
+```bash
+# Board B terminal
+cd /opt/atk/rknn_yolov8_seg_cam
+LD_LIBRARY_PATH="$PWD/lib" ./rknn_yolov8_seg_cam \
+  --rate-profile=rate60 --mode=segmentation --model=model/yolov8_seg.rknn \
+  --camera-device=/dev/video-camera0 \
+  --udp-host=192.168.0.100 --udp-port=5005 \
+  --audio=off --preview=off
+```
+
+Launch both HUDs with their assigned UDP ports in separate Windows terminals:
+
+```powershell
+# Windows terminal 1: Board A / UDP 5004
+python tools\live_h265_hud.py --udp-port=5004
+
+# Windows terminal 2: Board B / UDP 5005
+python tools\live_h265_hud.py --udp-port=5005
+```
+
+For subsequent tests, start both HUDs first and wait for their `WAITING FOR
+COMPLETE IDR` windows before launching both board senders.  Each HUD can bind
+only its assigned UDP port; do not run FFplay or another receiver on `5004` or
+`5005`.  For optional dual audio, assign Board A `5006` and Board B `5007`, with
+their own `roi-audio-101.sdp` / `roi-audio-102.sdp` files and one
+`receive_codec2_rtp.py` process per port.
+
+### Optional live Codec2 audio
+
+When `--audio=on` is used, the board writes the audio-only
+`/tmp/roi-audio.sdp` immediately. Copy it once:
+
+```bash
+scp root@192.168.0.101:/tmp/roi-audio.sdp runs/audio.sdp
+```
+
+Start the video HUD/FFplay receiver on UDP 5004 as above, then start the audio
+receiver on UDP 5006 in a second PC terminal:
+
+```powershell
+python tools\receive_codec2_rtp.py runs\audio.sdp --play `
+  --ffplay D:\ffmpeg\bin\ffplay.exe
+```
+
+The startup line comes from the supplied SDP, not a probe of the live sender.
+The recommended DTX profile must say `mode 2400, 4 frames/packet, 24 payload
+bytes, DTX on (1000 ms keepalive)`. If it says another mode, frame count, or
+does not report DTX, refresh the board-generated SDP and restart the receiver
+before diagnosing UDP:
+
+```powershell
+scp root@192.168.0.101:/tmp/roi-audio.sdp runs/audio.sdp
+```
+
+The receiver then prints one status line per second: `dtx-silence` means the
+sender is deliberately suppressing silence and is healthy; `waiting` means it
+is bound to UDP 5006 but has not received any valid RTP yet. A rising `invalid`
+count normally means its SDP framing does not match the sender. `codec` is only
+the Codec2 RTP payload bitrate (about 2.4 kbps for 24 bytes/80 ms); `wire` is the
+same Ethernet-wire accounting as the board pacer (about 10.2 kbps at 12.5 RTP pps),
+including RTP, IPv4/UDP, Ethernet, preamble, and inter-frame gap. `RTP` is the
+packet cadence, not a bitrate: 12.5 pps is one 80 ms packet. A sustained packet
+rate far above 12.5 pps would indicate a sender backlog;
+the bounded queue is designed to prevent that replay burst.
+
+`receive_codec2_rtp.py` also supports capture-only verification without a
+decoder: `--record runs\live.c2raw --duration 60`.  Its input is a raw,
+fixed-frame Codec2 stream; on this PC decode it with
+`D:\codec2\bin\c2dec.exe 2400 live.c2raw output.raw`.
+This project's Codec2 RTP payload needs the supplied helper for live audio.
+This PC has the native Codec2 1.2.0 decoder installed at
+`D:\codec2\bin\c2dec.exe`; the receiver automatically selects it on Windows,
+so UDP reception, Codec2 decoding, and FFplay playback all remain native.
+Its install provenance and Windows binary-pipe fix are documented in
+`D:\codec2\INSTALL.md`.
+On another PC, supply the native decoder through `--c2dec C:\codec2\c2dec.exe`.
+`--wsl-c2dec` is retained only as a compatibility fallback when no native
+decoder is installed.
+The helper automatically selects the FFplay 9 raw-PCM options
+(`-sample_rate` / `-ch_layout`) or the legacy FFplay options (`-ar` / `-ac`),
+so no FFplay audio-format flags need to be appended manually.
+
+## Reproducible A/B/C experiment
+
+Use a fixed file rather than a live camera for repeatable comparison. On the
+board, all three commands below share input, 320×180 resolution, 10 fps, target
+42 kbps, 50-frame GOP, and 60 kbps physical-wire pacing:
+
+```bash
+./tools/run_ab_sender.sh ./rknn_yolov8_seg_cam model/yolov8_seg.rknn input.mp4 90 runs 192.168.0.100
+```
+
+Set `RESOURCE_SAMPLER=./tools/sample_rk3588_resources.sh` to have that runner
+also create each `resources.csv`. The sampler records interval CPU utilization
+from the sender process's `/proc/<pid>/stat` tick deltas. Set `NPU_UTIL_CMD` and
+`VPU_UTIL_CMD` only when they each emit a real numeric board utilization
+percentage; otherwise their CSV fields remain blank and the report displays
+`n/a`.
+
+Start a PC receiver for each A, B, and C invocation and preserve the matching
+`sender.log` plus C's `roi/*.pgm`. Then evaluate on the PC:
+
+```bash
+python3 tools/compare_ab.py \
+  --reference input.mp4 --baseline runs/A.h265 --bbox runs/B.h265 --segmentation runs/C.h265 \
+  --roi-maps runs/C/roi --width 320 --height 180 --fps 10 \
+  --log A=runs/A/sender.log --log B=runs/B/sender.log --log C=runs/C/sender.log \
+  --resources A=runs/A/resources.csv --resources B=runs/B/resources.csv --resources C=runs/C/resources.csv \
+  --output runs/ab_report.json
+```
+
+The report includes actual average/one-second-peak bitrate, all-frame/ROI/
+background/edge PSNR and SSIM, average QP, and end-to-end latency. Each resource
+CSV has `cpu_percent,npu_percent,vpu_percent` columns sampled on RK3588 during
+the matching run. A missing resource log is rendered as `n/a`, not treated as a
+passing metric.
+
+## Local regressions
+
+The portable components can be checked without RK3588 hardware:
+
+```bash
+cd cpp
+bash tests/build_roi_tests.sh
+python3 -m py_compile ../tools/compare_ab.py
+python3 ../tools/test_receive_codec2_rtp.py
+python3 ../tools/test_detection_event_protocol.py
+```
+
+These regressions cover source-to-encoder mapping, 16×16 morphology-based
+four-level classification, temporal hysteresis and expiry, priority-limited
+rectangle merging, runtime parameter parsing, RTP H.265 fragmentation, and
+token-bucket startup pacing, shared audio/video pacing, Codec2 RTP framing and
+audio SDP parsing, audio-priority reservation, and stale whole-audio-packet
+dropping. They also cover anti-alias rejection during 44.1 kHz to
+8 kHz conversion, DC/high-pass removal, and the adaptive gate/AGC speech-versus-
+noise behavior.  Board validation still requires the MPP-enabled cross build
+plus an RK3588 run.  The ROEV/1 regression additionally verifies its fixed
+44-byte network-order layout, CRC rejection, four-class mapping, runtime
+parameter validation, and the loopback `STATE → HEARTBEAT → exit` sender path.

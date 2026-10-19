@@ -7,6 +7,7 @@ import argparse
 import collections
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,11 @@ from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
 
 DEFAULT_VIDEO_PORT = 5004
 GAN_PROFILES = ("gan2", "gan4", "ganq60", "ganq120", "ganq180")
+
+
+def is_gan_profile(profile: Optional[dict]) -> bool:
+    return bool(profile and (profile.get("gan_scale") in (2, 4) or
+                             profile.get("name") in GAN_PROFILES))
 
 
 def receiver_gan_profile(profile: dict, scale: int, baseline: bool) -> dict:
@@ -110,15 +116,21 @@ class LatestOnlyInitializer:
 
 
 def gan_profile_sizes(profile: dict) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    """Return source, AI-native, and presentation sizes for a GAN profile."""
+    """Return source, AI-native, and pre-rotation output sizes for a GAN profile."""
     width = int(profile.get("width", 0))
     height = int(profile.get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError(f"GAN profile has invalid input size {width}x{height}")
     scale = gan_scale(profile)
     native_size = (width * scale, height * scale)
-    output_size = (1280, 720) if str(profile.get("name", "")).startswith("ganq") else (
-        native_size if native_size == (1280, 720) else (640, 360))
+    if str(profile.get("name", "")).startswith("ganq"):
+        output_size = (1280, 720)
+    elif profile.get("gan_scale") in (2, 4) or native_size in ((960, 540), (1280, 720), (1920, 1080)):
+        # Preserve native 540p/720p/1080p output, including the default
+        # 480x270 streams: gan2 x2 is 540p and gan4 x4 is 1080p.
+        output_size = native_size
+    else:
+        output_size = (640, 360)
     return (width, height), native_size, output_size
 
 
@@ -242,7 +254,7 @@ class RtpStats:
         if payload_end > len(packet):
             return None
         payload = packet[offset + 4:payload_end]
-        if len(payload) < 8 or payload[0] != 1:
+        if len(payload) < 8 or payload[0] not in (1, 2):
             return None
         names = {
             0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan2",
@@ -251,12 +263,15 @@ class RtpStats:
             11: "ganq60", 12: "ganq120", 13: "ganq180",
         }
         name = names.get(payload[1], "unknown")
+        if payload[0] == 2 and (len(payload) < 16 or payload[12] not in (0, 2, 4)):
+            return None
+        scale = payload[12] if payload[0] == 2 else None
         target_bitrate_kbps = None
         link_cap_kbps = None
         # GAN v1 originally had an eight-byte core.  The current sender then
         # appended TARGET plus two reserved bytes; new senders reuse those
         # final two bytes as CAP without increasing the 12-byte tail layout.
-        if name in GAN_PROFILES:
+        if name in GAN_PROFILES or payload[0] == 2:
             if len(payload) >= 10:
                 advertised_target = int.from_bytes(payload[8:10], "big")
                 if advertised_target > 0:
@@ -266,6 +281,7 @@ class RtpStats:
                 if advertised_cap > 0:
                     link_cap_kbps = advertised_cap
         return {
+            **({"gan_scale": scale} if scale is not None else {}),
             "name": name,
             "width": int.from_bytes(payload[2:4], "big"),
             "height": int.from_bytes(payload[4:6], "big"),
@@ -409,13 +425,14 @@ class RtpStats:
 def profile_switch_key(profile: Optional[dict]) -> Tuple[Any, ...]:
     """Decoder identity; dimensions matter when a sender process restarts."""
     if profile is None:
-        return (-1, "legacy", 0, 0, 0)
+        return (-1, "legacy", 0, 0, 0, 0)
     return (
         int(profile.get("generation", -1)),
         str(profile.get("name", "unknown")),
         int(profile.get("width", 0)),
         int(profile.get("height", 0)),
         int(profile.get("fps", 0)),
+        int(profile.get("gan_scale", 0)),
     )
 
 
@@ -764,6 +781,7 @@ def gan_effective_output_budget_ms(
     requested_budget_ms: float = 0.0,
     latency_factor: float = 1.15,
     legacy_budget_ms: Optional[float] = None,
+    profile: Optional[dict] = None,
 ) -> float:
     """Resolve the output-age budget for one encoded source profile.
 
@@ -782,7 +800,26 @@ def gan_effective_output_budget_ms(
     if latency_factor <= 0.0:
         raise ValueError("GAN output latency factor must be positive")
     fps = max(1.0, float(source_fps))
-    return float(latency_factor) * 1000.0 / fps
+    budget = float(latency_factor) * 1000.0 / fps
+    # A source can arrive faster than native x2 enhancement can finish. Keep
+    # the existing 10-fps age ceiling for these rate profiles, independently
+    # of capture cadence; the worker still retains only the latest pending frame.
+    if (profile and profile.get("gan_scale") == 2 and
+            profile.get("name") in ("rate150", "rate180", "rate200", "rate300")):
+        budget = max(115.0, budget)
+    return budget
+
+
+def gan_effective_recovery_sequence_lag(
+    profile: dict, output_budget_ms: float, requested_lag: Optional[int] = None,
+) -> int:
+    """Use an age-bounded sequence window when inference skips source frames."""
+    if requested_lag is not None:
+        return requested_lag
+    if (profile.get("gan_scale") == 2 and
+            profile.get("name") in ("rate150", "rate180", "rate200", "rate300")):
+        return max(1, math.ceil(float(profile["fps"]) * output_budget_ms / 1000.0))
+    return 1
 
 
 def gan_fallback_stale_after_ms(source_fps: float, max_latency_ms: float) -> float:
@@ -1265,6 +1302,18 @@ def display_dimensions(width: int, height: int, rotation: str, scale: int) -> Tu
     return width * scale, height * scale
 
 
+DEFAULT_GAN_EXECUTION_PROVIDER = "tensorrt-fp16"
+
+
+def add_gan_execution_provider_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gan-execution-provider", choices=("auto", "cuda", "tensorrt-fp16"),
+        default=DEFAULT_GAN_EXECUTION_PROVIDER,
+        help=("inference provider; default TensorRT FP16 keeps CUDA for unsupported "
+              "model nodes"),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1314,11 +1363,7 @@ def main() -> int:
     )
     parser.add_argument("--gan-require-cuda", action="store_true",
                         help="compatibility alias for --gan-execution-provider=cuda")
-    parser.add_argument(
-        "--gan-execution-provider", choices=("auto", "cuda", "tensorrt-fp16"),
-        default="auto",
-        help="inference provider; TensorRT FP16 keeps CUDA for unsupported model nodes",
-    )
+    add_gan_execution_provider_argument(parser)
     parser.add_argument(
         "--gan-trt-cache-dir", default="runs/tensorrt_cache",
         help="TensorRT engine cache directory (device/model/version specific)",
@@ -1347,8 +1392,8 @@ def main() -> int:
         help="fresh consecutive GAN outputs required to leave fallback",
     )
     parser.add_argument(
-        "--gan-recovery-max-sequence-lag", type=int, default=1,
-        help="maximum decoded-frame sequence lag for GAN presentation/recovery",
+        "--gan-recovery-max-sequence-lag", type=int, default=None,
+        help="maximum sequence lag; default follows the bounded age budget for high-FPS x2",
     )
     parser.add_argument("--gan-display-fps", type=float, default=0.0,
                         help="presentation cadence; 0 follows the encoded source fps")
@@ -1375,11 +1420,13 @@ def main() -> int:
             (args.gan_max_inference_latency_ms is not None and
              args.gan_max_inference_latency_ms <= 0) or
             args.gan_hard_stall_ms <= 0 or args.gan_recovery_good_frames <= 0 or
-            args.gan_recovery_max_sequence_lag < 0 or
+            (args.gan_recovery_max_sequence_lag is not None and
+             args.gan_recovery_max_sequence_lag < 0) or
             args.gan_display_fps < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
-    if args.gan_require_cuda and args.gan_execution_provider == "tensorrt-fp16":
-        parser.error("--gan-require-cuda conflicts with --gan-execution-provider=tensorrt-fp16")
+    if args.gan_require_cuda:
+        # Preserve the legacy alias when the normal default is TensorRT FP16.
+        args.gan_execution_provider = "cuda"
 
     try:
         listen_port = resolve_video_port(args.sdp, args.video_port)
@@ -1528,13 +1575,15 @@ def main() -> int:
             input_size, native_size, output_size = gan_profile_sizes(profile)
             if profile.get("gan_baseline"):
                 native_size = output_size  # a single conventional scale for the baseline
+            display_size = display_dimensions(
+                output_size[0], output_size[1], args.rotate, 1)
         except (TypeError, ValueError) as error:
             print(f"GAN enhancer profile invalid: {error}", file=sys.stderr)
             return False
         if gan_worker is not None:
             return gan_worker_signature == signature
-        if profile.get("name") == "gan4" and args.gan_enhancer != "esrgan":
-            print("GAN4 requires --gan-enhancer=esrgan and a native x4 model", file=sys.stderr)
+        if gan_scale(profile) == 4 and not str(profile.get("name", "")).startswith("ganq") and args.gan_enhancer != "esrgan":
+            print("GAN x4 requires --gan-enhancer=esrgan and a native x4 model", file=sys.stderr)
             return False
         if gan_scale(profile) == 4 and args.gan_enhancer == "esrnet":
             print("Native x4 requires the x4 ESRGAN model", file=sys.stderr)
@@ -1552,6 +1601,7 @@ def main() -> int:
                 requested_budget_ms=args.gan_output_latency_budget_ms,
                 latency_factor=args.gan_output_latency_factor,
                 legacy_budget_ms=args.gan_max_inference_latency_ms,
+                profile=profile,
             )
         except ValueError as error:
             print(f"GAN latency budget invalid: {error}", file=sys.stderr)
@@ -1561,6 +1611,8 @@ def main() -> int:
             print(
                 f"GAN WARMING: backend={args.gan_enhancer} "
                 f"input={input_size[0]}x{input_size[1]} "
+                f"pre_rotate_output={output_size[0]}x{output_size[1]} "
+                f"display={display_size[0]}x{display_size[1]} rotate={args.rotate} "
                 f"warmup={args.gan_warmup}",
                 flush=True,
             )
@@ -1570,8 +1622,11 @@ def main() -> int:
                 input_size=input_size,
                 native_size=native_size,
                 output_size=output_size,
-                require_cuda=args.gan_require_cuda,
-                execution_provider=args.gan_execution_provider,
+                require_cuda=(args.gan_require_cuda and args.gan_enhancer != "none"),
+                execution_provider=(
+                    "auto" if args.gan_enhancer == "none"
+                    else args.gan_execution_provider
+                ),
                 tensorrt_cache_dir=args.gan_trt_cache_dir,
                 threads=args.gan_threads,
                 warmup=args.gan_warmup,
@@ -1603,7 +1658,8 @@ def main() -> int:
             output_budget_ms=output_budget_ms,
             hard_stall_ms=args.gan_hard_stall_ms,
             recovery_good_frames=args.gan_recovery_good_frames,
-            recovery_max_sequence_lag=args.gan_recovery_max_sequence_lag,
+            recovery_max_sequence_lag=gan_effective_recovery_sequence_lag(
+                profile, output_budget_ms, args.gan_recovery_max_sequence_lag),
         )
         set_gan_worker(worker, signature)
         budget_mode = (
@@ -1619,11 +1675,12 @@ def main() -> int:
             f"provider={worker.provider} precision={worker.execution_precision} "
             f"input={input_size[0]}x{input_size[1]} "
             f"native={gan_native_size_text(profile, native_size)} "
-            f"output={output_size[0]}x{output_size[1]} "
+            f"pre_rotate_output={output_size[0]}x{output_size[1]} "
+            f"display={display_size[0]}x{display_size[1]} rotate={args.rotate} "
             f"output_budget_ms={output_budget_ms:.1f} ({budget_mode}) "
             f"hard_stall_ms={args.gan_hard_stall_ms:.0f} "
             f"recovery={args.gan_recovery_good_frames}frames/"
-            f"lag<={args.gan_recovery_max_sequence_lag}",
+            f"lag<={gan_controller.recovery_max_sequence_lag}",
             flush=True,
         )
         return True
@@ -1811,7 +1868,7 @@ def main() -> int:
             values = stats.snapshot()
             profile = values["profile"]
             is_rebuild = profile is not None and profile["name"] == "rebuild"
-            is_gan = profile is not None and profile["name"] in GAN_PROFILES
+            is_gan = is_gan_profile(profile)
             requested_mode = "gan" if is_gan else ("rebuild" if is_rebuild else "normal")
             if current_mode != requested_mode:
                 previous_mode = current_mode
@@ -1899,7 +1956,9 @@ def main() -> int:
                         output_budget_ms=float(worker_values["max_latency_ms"]),
                         hard_stall_ms=args.gan_hard_stall_ms,
                         recovery_good_frames=args.gan_recovery_good_frames,
-                        recovery_max_sequence_lag=args.gan_recovery_max_sequence_lag,
+                        recovery_max_sequence_lag=gan_effective_recovery_sequence_lag(
+                            profile, float(worker_values["max_latency_ms"]),
+                            args.gan_recovery_max_sequence_lag),
                     )
                 decision = gan_controller.update(
                     now=now,
@@ -2136,6 +2195,8 @@ def main() -> int:
                         )
                     elif is_gan:
                         input_size, native_size, output_size = gan_profile_sizes(profile)
+                        display_size = display_dimensions(
+                            output_size[0], output_size[1], args.rotate, 1)
                         drop_counts = gan_values["drop_reason_counts"]
                         gan_text = (
                             f" source_fps={profile['fps']}"
@@ -2147,7 +2208,9 @@ def main() -> int:
                             f" provider={gan_values['provider']}"
                             f" input={input_size[0]}x{input_size[1]}"
                             f" native={gan_native_size_text(profile, native_size)}"
-                            f" output={output_size[0]}x{output_size[1]}"
+                            f" pre_rotate_output={output_size[0]}x{output_size[1]}"
+                            f" display={display_size[0]}x{display_size[1]}"
+                            f" rotate={args.rotate}"
                             f" output_budget_ms={gan_values['max_latency_ms']:.1f}"
                             f" infer_all_p50_ms={gan_values['infer_all_p50_ms']:.1f}"
                             f" infer_all_p95_ms={gan_values['infer_all_p95_ms']:.1f}"
@@ -2268,6 +2331,8 @@ def main() -> int:
                 ]
             elif is_gan:
                 input_size, native_size, output_size = gan_profile_sizes(profile)
+                display_size = display_dimensions(
+                    output_size[0], output_size[1], args.rotate, 1)
                 output_backend = (
                     "GAN WARMING / Lanczos4 (not AI output)" if worker is None else
                     "FALLBACK / Lanczos4" if gan_display_fallback else
@@ -2286,11 +2351,13 @@ def main() -> int:
                 if state_text == GanFallbackController.HARD_STALLED:
                     state_text = "HARD-STALL"
                 lines = [
-                    f"GAN H265-only RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} "
+                    f"GAN x{gan_scale(profile)} RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} "
                     f"ENH {gan_values['rolling_1s_fps']:.1f}  DISP {presentation_values['fps']:.1f} fps",
                     f"INPUT {input_size[0]}x{input_size[1]} "
                     f"NATIVE {gan_native_size_text(profile, native_size)}",
-                    f"OUTPUT {output_size[0]}x{output_size[1]}  {output_backend}",
+                    f"OUTPUT {output_size[0]}x{output_size[1]} -> DISPLAY "
+                    f"{display_size[0]}x{display_size[1]} {args.rotate.upper()}",
+                    output_backend,
                     gan_bitrate_hud_line(profile, values),
                     f"INFER ALL L/P50/P95/P99/MAX "
                     f"{gan_values['last_finished_infer_ms']:.0f}/"
