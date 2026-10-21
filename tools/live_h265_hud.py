@@ -1397,6 +1397,9 @@ def main() -> int:
     )
     parser.add_argument("--gan-display-fps", type=float, default=0.0,
                         help="presentation cadence; 0 follows the encoded source fps")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="enable CPU motion interpolation at this output fps (0 < fps <= 120); "
+                             "requires an AI GAN backend; omitted preserves original behavior")
     parser.add_argument("--gan-debug-log", default=None,
                         help="JSONL per-frame enhancer telemetry path")
     parser.add_argument("--rebuild-boxes", choices=("on", "off"), default="off",
@@ -1428,6 +1431,14 @@ def main() -> int:
         # Preserve the legacy alias when the normal default is TensorRT FP16.
         args.gan_execution_provider = "cuda"
 
+    if args.fps is not None:
+        if not math.isfinite(args.fps) or not 0 < args.fps <= 120:
+            parser.error("--fps must be a finite output frame rate in (0, 120]")
+        if args.gan_enhancer == "none":
+            parser.error("--fps motion interpolation requires --gan-enhancer=esrgan or esrnet")
+        if args.gan_display_fps:
+            parser.error("use --fps for motion interpolation; do not combine with --gan-display-fps")
+
     try:
         listen_port = resolve_video_port(args.sdp, args.video_port)
     except (OSError, ValueError) as error:
@@ -1437,6 +1448,9 @@ def main() -> int:
         f"H.265 RTP input: UDP {listen_port}, payload type 96, clock 90000 ({input_source})",
         flush=True,
     )
+    if args.fps is not None:
+        from interpolated_receiver import run_interpolated_receiver
+        return run_interpolated_receiver(args, listen_port)
     stats = RtpStats()
     video_log = None
     if args.quality_video_log is not None:

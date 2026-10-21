@@ -1314,3 +1314,40 @@ noise behavior.  Board validation still requires the MPP-enabled cross build
 plus an RK3588 run.  The ROEV/1 regression additionally verifies its fixed
 44-byte network-order layout, CRC rejection, four-class mapping, runtime
 parameter validation, and the loopback `STATE → HEARTBEAT → exit` sender path.
+
+## 接收端运动插帧：--fps
+
+运动插帧已接入正式入口 `tools/live_h265_hud.py`。在现有GAN接收命令末尾添加
+`--fps=15`，就会先做原生超分，再由CPU OpenCV DIS双向光流合成目标时刻的画面。
+`--fps` 表示接收端的目标输出帧率（有限正数，最高120），不改变发送端FPS、码率、GOP或ROI。
+不传 `--fps` 时保持原接收行为。它与只重复显示旧帧的 `--gan-display-fps` 不同，
+两者不能同时指定。无需再使用 `live_sr_interpolation.py`，该临时入口已移除。
+
+```powershell
+& D:\Python\Python311\python.exe .\tools\live_h265_hud.py --udp-port=5004 `
+  --gan-enhancer=esrgan --gan-execution-provider=tensorrt-fp16 `
+  --rotate=ccw90 --fps=15
+```
+
+先启动接收端，看到 `INTERPOLATION LISTENING` 后启动带 `--gan=x2` 或 `--gan=x4`
+的发送端。模型和尺寸由RTP元数据选择，无需在接收端再指定档位。rate60+x2为
+320×180@10→640×360，rate120+x2为480×270@10→960×540。x2默认使用
+RealESRGAN_x2_dynamic.onnx；x4沿用 `--gan-esrgan-x4-model`，ESRNet仅支持x2。
+超分provider/精度沿用现有配置，默认TensorRT FP16且明确报告CUDA/CPU后备provider链。
+本次实际板端验证为rate60/rate120+x2；其他档位、倍率或目标帧率的长期性能需单独验证。
+
+传入 `--fps` 时固定增加200ms播放预算，用30张解码帧中位数校准QPC时间轴。
+该配置不是摄像头到屏幕实测延迟。输入槽1张、定时输出最多8张，过期帧丢弃；
+SR过期预算继续遵循原有 `--gan-output-latency-budget-ms` 等配置。暂不支持该路径
+运行中切档；元数据变化时明确报错并提示按新档位重启，普通不带 `--fps` 的切档路径不受影响。
+
+HUD显示目标/有效输出FPS、源尺寸、AI原生尺寸、输出/显示尺寸、DIS CPU插帧及真实超分后端。
+新增帧与真实端点计入有效FPS，HOLD重绘、CUT_NEAREST切镜回退不计入。快速运动和遮挡仍可能
+重影或扭曲，DIS不是RIFE；原始10fps不会变为15fps真实采样。rate60继续保留原档位灰度。
+
+默认持续运行，按q/Esc退出；需要定时退出可沿用 `--duration`。正式日志沿用
+`--gan-debug-log`、`--quality-packet-log`、`--quality-video-log`，不再要求实验输出目录。
+逐帧事件带 `FPS_` 类型，视频日志保存接收H.265及首张真实插帧HUD截图，
+不默认录制MP4。线速仍需按实际包测量，档位名称不代表任意1秒绝对不超帽。
+
+回归：`D:\Python\Python311\python.exe -m unittest tools.test_receiver_fps tools.test_motion_interpolation tools.test_live_h265_hud -q`。
