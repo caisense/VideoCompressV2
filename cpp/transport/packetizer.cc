@@ -21,8 +21,8 @@ size_t startCodeLength(const uint8_t *data, size_t length, size_t offset) {
 size_t headerBytes(const RtpStreamProfile *profile) {
     if (!profile || !profile->valid) return kRtpHeaderBytes;
     return kRtpHeaderBytes + kRtpExtensionHeaderBytes + kProfileRecordBytes +
-           ((profile->gan_scale != 0 || profile->target_bitrate_kbps != 0 || profile->link_cap_kbps != 0)
-                ? kProfileTargetTailBytes : 0U) + (profile->gan_scale ? 4U : 0U);
+           ((profile->runtime_selection || profile->gan_scale != 0 || profile->target_bitrate_kbps != 0 || profile->link_cap_kbps != 0)
+                ? kProfileTargetTailBytes : 0U) + ((profile->gan_scale || profile->runtime_selection) ? 4U : 0U);
 }
 
 }  // namespace
@@ -55,14 +55,14 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
         // VPS of a new profile; standard RTP/H.265 receivers simply skip it.
         // GAN appends a four-byte aligned TARGET/CAP tail while preserving the
         // v1 layout. Independent scale uses v2 with one extra aligned word.
-        const bool include_gan_tail = profile->gan_scale != 0 || profile->target_bitrate_kbps != 0 ||
+        const bool include_gan_tail = profile->runtime_selection || profile->gan_scale != 0 || profile->target_bitrate_kbps != 0 ||
                                       profile->link_cap_kbps != 0;
         header.reserve(headerBytes(profile));
         header.push_back(0x52);
         header.push_back(0x4f);
         header.push_back(0x00);
-        header.push_back(profile->gan_scale ? 0x04 : (include_gan_tail ? 0x03 : 0x02));
-        header.push_back(profile->gan_scale ? 0x02 : 0x01);  // metadata version
+        header.push_back((profile->gan_scale || profile->runtime_selection) ? 0x04 : (include_gan_tail ? 0x03 : 0x02));
+        header.push_back(profile->runtime_selection ? 0x03 : (profile->gan_scale ? 0x02 : 0x01));  // metadata version
         header.push_back(profile->profile);
         header.push_back(static_cast<uint8_t>(profile->width >> 8));
         header.push_back(static_cast<uint8_t>(profile->width));
@@ -76,9 +76,10 @@ std::vector<uint8_t> H265RtpPacketizer::makeHeader(bool marker, uint32_t timesta
             header.push_back(static_cast<uint8_t>(profile->link_cap_kbps >> 8));
             header.push_back(static_cast<uint8_t>(profile->link_cap_kbps));
         }
-        if (profile->gan_scale) {
+        if (profile->gan_scale || profile->runtime_selection) {
             header.push_back(profile->gan_scale);
-            header.insert(header.end(), 3, 0);
+            header.push_back(profile->receiver_output_fps);
+            header.insert(header.end(), 2, 0);
         }
     }
     return header;

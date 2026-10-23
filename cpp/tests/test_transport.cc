@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include <thread>
 
 #include "transport/packetizer.h"
 #include "transport/codec2_rtp_packetizer.h"
@@ -82,6 +83,24 @@ void testRatePacerStartsWithoutLargeBurst() {
     CHECK(pacer.bitrateBps() == 8000);
     CHECK(elapsed_us >= 200);
     CHECK(elapsed_us < 100000);
+}
+
+void testRollingWireCapAfterIdleAndReset() {
+    roi_h265::RatePacer pacer(32000, 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::vector<std::chrono::steady_clock::time_point> sent;
+    for (int i = 0; i < 45; ++i) {
+        pacer.waitForTokens(200);
+        sent.push_back(std::chrono::steady_clock::now());
+        if (i == 19) pacer.reset(32000, 1000);
+    }
+    for (size_t i = 0; i < sent.size(); ++i) {
+        size_t bytes = 0;
+        for (size_t j = 0; j <= i; ++j) {
+            if (sent[i] - sent[j] < std::chrono::milliseconds(999)) bytes += 200;
+        }
+        CHECK(bytes <= 4000U);
+    }
 }
 
 void testAudioPacketPacerKeepsOnePacketPer80Ms() {
@@ -212,6 +231,7 @@ int main() {
     testH265RtpPacketization();
     testRatePacerStartsWithoutLargeBurst();
     testAudioPacketPacerKeepsOnePacketPer80Ms();
+    testRollingWireCapAfterIdleAndReset();
     testPhysicalWireAccountingAndCodec2Packet();
     testProfileMetadataUsesRtpHeaderExtension();
     if (failures) return EXIT_FAILURE;

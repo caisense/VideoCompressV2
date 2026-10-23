@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <thread>
+#include <stdexcept>
 
 namespace roi_h265 {
 
@@ -51,7 +52,7 @@ void RatePacer::waitForTokens(size_t bytes) {
     size_t remaining = bytes;
     while (remaining > 0) {
         std::unique_lock<std::mutex> lock(mutex_);
-        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         refillLocked(now);
         const double allowed = std::min<double>(remaining, max_burst_bytes_);
         if (tokens_ >= allowed) {
@@ -59,10 +60,31 @@ void RatePacer::waitForTokens(size_t bytes) {
             remaining -= static_cast<size_t>(allowed);
             continue;
         }
-        const double missing = allowed - tokens_;
-        const double seconds = missing * 8.0 / bitrate_bps_;
+        const double seconds = (allowed - tokens_) * 8.0 / bitrate_bps_;
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    }
+    // Charge the whole datagram at its final admission time, even if its
+    // token cost was acquired in several pieces. Keep history across reset.
+    for (;;) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        while (!window_.empty() && now - window_.front().first >= std::chrono::seconds(1)) {
+            window_bytes_ -= window_.front().second;
+            window_.pop_front();
+        }
+        const size_t limit = std::max<size_t>(1, static_cast<size_t>(bitrate_bps_ / 8));
+        if (bytes > limit) {
+            throw std::invalid_argument("datagram exceeds one-second physical wire budget");
+        }
+        if (window_bytes_ + bytes <= limit) {
+            window_.push_back(std::make_pair(now, bytes));
+            window_bytes_ += bytes;
+            return;
+        }
+        const auto wake = window_.front().first + std::chrono::seconds(1);
+        lock.unlock();
+        std::this_thread::sleep_until(wake);
     }
 }
 

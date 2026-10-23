@@ -254,7 +254,7 @@ class RtpStats:
         if payload_end > len(packet):
             return None
         payload = packet[offset + 4:payload_end]
-        if len(payload) < 8 or payload[0] not in (1, 2):
+        if len(payload) < 8 or payload[0] not in (1, 2, 3):
             return None
         names = {
             0: "rate60", 1: "rate150", 2: "rate300", 3: "rebuild", 4: "gan2",
@@ -263,15 +263,18 @@ class RtpStats:
             11: "ganq60", 12: "ganq120", 13: "ganq180",
         }
         name = names.get(payload[1], "unknown")
-        if payload[0] == 2 and (len(payload) < 16 or payload[12] not in (0, 2, 4)):
+        if payload[0] in (2, 3) and (len(payload) < 16 or payload[12] not in (0, 2, 4)):
             return None
-        scale = payload[12] if payload[0] == 2 else None
+        scale = payload[12] if payload[0] in (2, 3) else None
+        output_fps = payload[13] if payload[0] == 3 else None
+        if output_fps is not None and (output_fps > 120 or (output_fps and (not scale or output_fps <= payload[6]))):
+            return None
         target_bitrate_kbps = None
         link_cap_kbps = None
         # GAN v1 originally had an eight-byte core.  The current sender then
         # appended TARGET plus two reserved bytes; new senders reuse those
         # final two bytes as CAP without increasing the 12-byte tail layout.
-        if name in GAN_PROFILES or payload[0] == 2:
+        if name in GAN_PROFILES or payload[0] in (2, 3):
             if len(payload) >= 10:
                 advertised_target = int.from_bytes(payload[8:10], "big")
                 if advertised_target > 0:
@@ -282,6 +285,7 @@ class RtpStats:
                     link_cap_kbps = advertised_cap
         return {
             **({"gan_scale": scale} if scale is not None else {}),
+            **({"output_fps": output_fps} if output_fps is not None else {}),
             "name": name,
             "width": int.from_bytes(payload[2:4], "big"),
             "height": int.from_bytes(payload[4:6], "big"),
@@ -399,7 +403,7 @@ class RtpStats:
             self._trim(now)
             packet_count = len(self.samples)
             payload_total = sum(item[1] for item in self.samples)
-            return {
+            result = {
                 "rx_fps": float(len(self.markers)),
                 "p_fps": float(len(self.p_frames)),
                 "i_fps": float(len(self.i_frames)),
@@ -421,6 +425,14 @@ class RtpStats:
                 "profile": None if self.stream_profile is None else dict(self.stream_profile),
             }
 
+            if os.environ.get("VC_RUNTIME_RECEIVER_WORKER") == "1":
+                from runtime_profile_receiver import runtime_network_stats, NETWORK_FIELDS
+                network = runtime_network_stats()
+                if network is not None:
+                    result.update({k:network[k] for k in NETWORK_FIELDS})
+                    result["wire_scope"] = "router UDP ingress (not loopback forwarding)"
+            return result
+
 
 def profile_switch_key(profile: Optional[dict]) -> Tuple[Any, ...]:
     """Decoder identity; dimensions matter when a sender process restarts."""
@@ -433,6 +445,7 @@ def profile_switch_key(profile: Optional[dict]) -> Tuple[Any, ...]:
         int(profile.get("height", 0)),
         int(profile.get("fps", 0)),
         int(profile.get("gan_scale", 0)),
+        profile.get("output_fps"),
     )
 
 
@@ -1358,8 +1371,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--gan-esrgan-x4-model",
-        default=str(Path(__file__).resolve().parents[1] / "model" / "RealESRGAN_x4plus_dynamic.onnx"),
-        help="Real-ESRGAN x4 ONNX model; selected automatically for profile gan4",
+        default=str(Path(__file__).resolve().parents[1] / "model" / "realesr-general-x4v3_dn05_dynamic.onnx"),
+        help="Real-ESRGAN x4 ONNX model; selected automatically for x4 profiles",
     )
     parser.add_argument("--gan-require-cuda", action="store_true",
                         help="compatibility alias for --gan-execution-provider=cuda")
@@ -1448,6 +1461,9 @@ def main() -> int:
         f"H.265 RTP input: UDP {listen_port}, payload type 96, clock 90000 ({input_source})",
         flush=True,
     )
+    if args.gan_enhancer != "none" and os.environ.get("VC_RUNTIME_RECEIVER_WORKER") != "1":
+        from runtime_profile_receiver import run_runtime_receiver
+        return run_runtime_receiver(args, listen_port)
     if args.fps is not None:
         from interpolated_receiver import run_interpolated_receiver
         return run_interpolated_receiver(args, listen_port)
@@ -1455,7 +1471,7 @@ def main() -> int:
     video_log = None
     if args.quality_video_log is not None:
         args.quality_video_log.parent.mkdir(parents=True, exist_ok=True)
-        video_log = args.quality_video_log.open("wb")
+        video_log = args.quality_video_log.open("ab" if os.environ.get("VC_RUNTIME_APPEND_LOGS") == "1" else "wb")
         source_files = [Path(__file__), Path(sys.modules['full_frame_enhancer'].__file__)]
         args.quality_video_log.with_suffix('.runtime.json').write_text(json.dumps(dict(
             python=sys.executable, python_version=sys.version, platform=sys.platform,
@@ -1466,7 +1482,7 @@ def main() -> int:
     packet_log = None
     if args.quality_packet_log is not None:
         args.quality_packet_log.parent.mkdir(parents=True, exist_ok=True)
-        packet_log = args.quality_packet_log.open("w", encoding="utf-8")
+        packet_log = args.quality_packet_log.open("a" if os.environ.get("VC_RUNTIME_APPEND_LOGS") == "1" else "w", encoding="utf-8")
     switch_gate = ProfileSwitchGate()
     depacketizer = HevcRtpDepacketizer()
     latest = LatestFrame()
@@ -1521,6 +1537,8 @@ def main() -> int:
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     receiver.bind(("0.0.0.0", listen_port))
+    from runtime_profile_receiver import notify_runtime_ready
+    notify_runtime_ready(stopping)
     receiver.settimeout(0.2)
     frame_rate_args = ffmpeg_frame_rate_args(args.ffmpeg)
     if frame_rate_args:
@@ -1858,6 +1876,7 @@ def main() -> int:
     started_at = time.monotonic()
     last_report = 0.0
     last_quality_status = 0.0
+    last_runtime_status = 0.0
     next_rebuild_present = started_at
     next_gan_present = started_at
     current_canvas: Optional[np.ndarray] = None
@@ -2040,7 +2059,13 @@ def main() -> int:
                 # result may upgrade the same source frame while recovery is
                 # still collecting its required consecutive samples; retain it
                 # until a newer decoded source needs the live fallback.
-                if gan_controller.fallback_active and frame is not None and source_sequence is not None:
+                # Before the first accepted GAN result the controller can be
+                # HEALTHY yet request USE_LANCZOS. All neural results may miss
+                # the budget; refresh live video instead of holding warmup's
+                # final canvas forever while waiting for a first good result.
+                if ((gan_controller.fallback_active or
+                     decision.action == GanAction.USE_LANCZOS) and
+                        frame is not None and source_sequence is not None):
                     if (current_canvas is None or
                             source_sequence != current_source_sequence or
                             fallback_entered_this_tick):
@@ -2165,6 +2190,14 @@ def main() -> int:
                     flush=True,
                 )
                 first_video_logged = True
+            if os.environ.get("VC_RUNTIME_RECEIVER_WORKER") == "1" and now-last_runtime_status >= 1:
+                from runtime_profile_receiver import runtime_worker_status
+                runtime_worker_status(mode=current_mode, profile=profile,
+                    decoded_fps=values["decode_fps"], source_sequence=current_source_sequence,
+                    canvas=None if current_canvas is None else [current_canvas.shape[1], current_canvas.shape[0]],
+                    gan_completed=gan_values.get("completed", 0), provider=gan_values.get("provider"),
+                    precision=gan_values.get("execution_precision"))
+                last_runtime_status = now
             if args.headless:
                 # A headless report can fall between two rebuild presentation
                 # ticks (12 fps).  Refresh the synchronized PTS here so the
@@ -2438,6 +2471,10 @@ def main() -> int:
                             20 + index * line_height if is_rebuild else 24 + index * line_height),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                             (80, 255, 80), 1, cv2.LINE_AA)
+            if (not is_gan and frame is not None and not quality_hud_attempted
+                    and args.quality_video_log is not None):
+                quality_hud_attempted = True
+                cv2.imwrite(str(args.quality_video_log.with_suffix(".hud.png")), canvas)
             cv2.imshow(window, canvas)
             key = cv2.waitKey(1 if (is_rebuild or is_gan) else 20) & 0xFF
             if is_gan and worker is not None and current_source_sequence is not None:

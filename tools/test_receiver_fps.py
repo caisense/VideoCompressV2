@@ -22,7 +22,7 @@ def options(**overrides):
 class ReceiverFpsTests(unittest.TestCase):
     def test_fps_dispatches_from_real_entrypoint_with_existing_flags(self):
         run = mock.Mock(return_value=7)
-        with mock.patch.dict(sys.modules, {"interpolated_receiver": SimpleNamespace(run_interpolated_receiver=run)}):
+        with mock.patch.dict(sys.modules, {"interpolated_receiver": SimpleNamespace(run_interpolated_receiver=run)}), mock.patch.dict(__import__("os").environ, {"VC_RUNTIME_RECEIVER_WORKER": "1"}):
             with mock.patch.object(sys, "argv", ["live_h265_hud.py", "--fps=15", "--udp-port=5014", "--gan-enhancer=esrgan"]):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(hud.main(), 7)

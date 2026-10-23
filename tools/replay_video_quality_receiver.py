@@ -7,6 +7,7 @@ normal RTP/decode/profile/GAN path; the source must be a real captured bitstream
 import argparse
 import hashlib
 import json
+import math
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import time
 from pathlib import Path
 
 import cv2
+import psutil
 
 
 def decoded_hashes(ffmpeg, source, frames):
@@ -37,6 +39,8 @@ def main():
     parser.add_argument('--duration', type=int, default=20)
     parser.add_argument('--fps', type=int, default=8,
                         help='actual source FPS; used for RTP pacing and profile metadata')
+    parser.add_argument('--output-fps', type=float, default=None,
+                        help='exercise production --fps interpolation; source pacing stays --fps')
     parser.add_argument('--display', action='store_true')
     parser.add_argument('--ffmpeg', default='ffmpeg')
     parser.add_argument('--port', type=int, default=5094)
@@ -44,6 +48,11 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.fps <= 60 or args.duration <= 0:
         parser.error('FPS must be 1..60 and duration must be positive')
+    if args.output_fps is not None and args.enhancer == 'none':
+        parser.error('--output-fps requires an AI enhancer')
+    if args.output_fps is not None and (not math.isfinite(args.output_fps)
+                                        or not 0 < args.output_fps <= 120):
+        parser.error('--output-fps must be finite and in (0, 120]')
     args.output = args.output.resolve()
     args.source = args.source.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -57,11 +66,21 @@ def main():
     payload = bytes([1, {60: 11, 120: 12, 180: 13}[args.cap]]) + width.to_bytes(2, 'big') + \
         height.to_bytes(2, 'big') + bytes([args.fps, 0]) + target.to_bytes(2, 'big') + args.cap.to_bytes(2, 'big')
     extension = b'RO\x00\x03' + payload
+    if args.output_fps is not None:
+        # Match the composed rate-profile + GAN metadata used by production,
+        # including native output size (ganq historically post-scales to 720p).
+        target = {60: 42, 120: 88, 180: 135}[args.cap]
+        payload = bytes([2, {60: 0, 120: 7, 180: 8}[args.cap]]) + \
+            width.to_bytes(2, 'big') + height.to_bytes(2, 'big') + \
+            bytes([args.fps, 0]) + target.to_bytes(2, 'big') + \
+            args.cap.to_bytes(2, 'big') + bytes([2 if args.enhancer == 'x2' else 4, 0, 0, 0])
+        extension = b'RO\x00\x04' + payload
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(('127.0.0.1', args.port + 1))
     udp.settimeout(.2)
     done = threading.Event()
     def proxy():
+        sequence = 0
         while not done.is_set():
             try:
                 packet, _ = udp.recvfrom(65535)
@@ -74,8 +93,26 @@ def main():
             offset = 12 + 4 * (packet[0] & 15)
             if packet[0] & 16:
                 continue
-            udp.sendto(bytes([packet[0] | 16]) + packet[1:offset] + extension + packet[offset:],
-                       ('127.0.0.1', args.port))
+            bodies = [packet[offset:]]
+            if args.output_fps is not None and (bodies[0][0] >> 1) & 63 == 48:
+                # FFmpeg aggregates small IDRs with parameter sets. The board
+                # uses single NAL/FU packets; reproduce that packetization so
+                # the production IDR gate sees the same access-unit structure.
+                bodies, cursor = [], offset + 2
+                while cursor + 2 <= len(packet):
+                    size = int.from_bytes(packet[cursor:cursor+2], 'big')
+                    cursor += 2
+                    if size < 2 or cursor + size > len(packet):
+                        raise ValueError('malformed replay aggregation packet')
+                    bodies.append(packet[cursor:cursor+size])
+                    cursor += size
+            for i, body in enumerate(bodies):
+                header = bytearray(packet[:offset])
+                header[0] |= 16
+                header[1] = (header[1] & 127) | (packet[1] & 128 if i == len(bodies)-1 else 0)
+                header[2:4] = (sequence & 65535).to_bytes(2, 'big')
+                sequence += 1
+                udp.sendto(bytes(header) + extension + body, ('127.0.0.1', args.port))
     thread = threading.Thread(target=proxy)
     thread.start()
     root = Path(__file__).resolve().parents[1]
@@ -89,6 +126,8 @@ def main():
         f'--quality-video-log={args.output / "received.h265"}']
     if not args.display:
         receiver.append('--headless')
+    if args.output_fps is not None:
+        receiver.append(f'--fps={args.output_fps}')
     sender = [args.ffmpeg, '-hide_banner', '-loglevel', 'warning', '-re', '-r', str(args.fps), '-i', str(args.source),
               '-frames:v', str(args.duration * args.fps), '-c:v', 'copy', '-an', '-payload_type', '96', '-f', 'rtp',
               f'rtp://127.0.0.1:{args.port + 1}?pkt_size=1156']
@@ -100,15 +139,35 @@ def main():
         with (args.output / 'receiver.log').open('w', encoding='utf-8') as log:
             rx = subprocess.Popen(receiver, stdout=log, stderr=subprocess.STDOUT, cwd=root)
             ready_deadline = time.monotonic() + 10
-            while 'H.265 RTP input:' not in (args.output / 'receiver.log').read_text(errors='replace'):
+            ready_message = ('INTERPOLATION LISTENING:' if args.output_fps is not None
+                             else 'H.265 RTP input:')
+            while ready_message not in (args.output / 'receiver.log').read_text(errors='replace'):
                 if rx.poll() is not None or time.monotonic() > ready_deadline:
                     rx.terminate()
                     rx.wait(timeout=5)
                     raise RuntimeError('replay receiver did not bind before bounded readiness deadline')
                 time.sleep(.05)
             try:
-                tx = subprocess.run(sender, capture_output=True, text=True, timeout=args.duration + 10)
-                (args.output / 'replay.log').write_text(tx.stdout + tx.stderr, encoding='utf-8')
+                memory = []
+                with (args.output / 'replay.log').open('w', encoding='utf-8') as tx_log:
+                    tx = subprocess.Popen(sender, stdout=tx_log, stderr=subprocess.STDOUT)
+                    tx_deadline = time.monotonic() + args.duration + 10
+                    try:
+                        while tx.poll() is None:
+                            if rx.poll() is not None:
+                                raise RuntimeError('receiver exited during replay')
+                            if time.monotonic() > tx_deadline:
+                                raise RuntimeError('bounded replay deadline exceeded')
+                            parent = psutil.Process(rx.pid)
+                            processes = [parent] + parent.children(recursive=True)
+                            rss = sum(p.memory_info().rss for p in processes if p.is_running())
+                            memory.append(dict(at=time.perf_counter(), rss_mb=rss / 1048576))
+                            time.sleep(2)
+                    finally:
+                        if tx.poll() is None:
+                            tx.terminate()
+                            tx.wait(timeout=5)
+                (args.output / 'memory.json').write_text(json.dumps(memory, indent=2))
                 rx.wait(timeout=args.duration + 15)
                 result['returncodes'] = [tx.returncode, rx.returncode]
             finally:

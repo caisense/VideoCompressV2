@@ -184,6 +184,8 @@ struct GanBandwidthPreset {
 struct GanConfig {
     // Independent receiver enhancement hint: 0=off, 2=x2, 4=x4.
     int scale;
+    int receiver_output_fps;
+    bool runtime_selection;
     // The board source/encoder cadence is 6, 8, 10 or 12 fps.
     int fps;
     // Zero means run YOLO at the source cadence; a positive value enables
@@ -331,6 +333,16 @@ struct AppConfig {
 bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error);
 const char *pipelineModeName(PipelineMode mode);
 const char *rateProfileName(RateProfile profile);
+// Runtime FIFO selection is atomically published as one packed value.
+struct RuntimeProfileSelection {
+    RateProfile profile;
+    int gan_scale;
+    int output_fps;
+    int packed() const {
+        return static_cast<int>(profile) | (gan_scale << 8) | (output_fps << 16);
+    }
+};
+bool parseRuntimeProfileSelection(const std::string &name, RuntimeProfileSelection *selection);
 bool parseRateProfile(const std::string &name, RateProfile *profile);
 bool isGanRateProfile(RateProfile profile);
 bool isGanQualityProfile(RateProfile profile);

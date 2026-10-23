@@ -242,7 +242,7 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
         return;
     }
     std::fprintf(stderr,
-        "Runtime control ready: echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|ganq60|ganq120|ganq180|image|video > %s\n",
+        "Runtime control ready: rateNN[_x2|_x4][_fpsN]; echo rate60|rate80|rate100|rate120|rate150|rate180|rate200|rate300|rebuild|ganq60|ganq120|ganq180|image|video > %s\n",
         path.c_str());
     std::string pending;
     while (running->load()) {
@@ -263,11 +263,11 @@ void profileControlLoop(const std::string &path, std::atomic<bool> *running,
             std::istringstream input(command);
             std::string name;
             input >> name;
-            RateProfile profile;
-            if (parseRateProfile(name, &profile)) {
-                requested_profile->store(static_cast<int>(profile));
+            RuntimeProfileSelection selection;
+            if (parseRuntimeProfileSelection(name, &selection)) {
+                requested_profile->store(selection.packed() | (1 << 24));
                 requested_transport_mode->store(static_cast<int>(TRANSPORT_MODE_VIDEO));
-                std::fprintf(stderr, "Runtime profile requested: %s\n", rateProfileName(profile));
+                std::fprintf(stderr, "Runtime profile requested: %s\n", name.c_str());
             } else {
                 TransportMode mode;
                 if (parseTransportMode(name, &mode)) {
@@ -511,7 +511,9 @@ int main(int argc, char **argv) {
         pipeline_failed.store(true);
         running.store(false);
     };
-    std::atomic<int> requested_profile(static_cast<int>(config.rate_profile));
+    const RuntimeProfileSelection initial_selection = {config.rate_profile, config.gan.scale, 0};
+    std::atomic<int> requested_profile(initial_selection.packed());
+    std::atomic<int> active_selection(initial_selection.packed());
     std::atomic<int> active_profile(static_cast<int>(config.rate_profile));
     std::atomic<int> requested_transport_mode(static_cast<int>(config.transport.mode));
     std::atomic<int> active_transport_mode(static_cast<int>(config.transport.mode));
@@ -678,14 +680,17 @@ int main(int argc, char **argv) {
         AdaptiveRateController adaptive_controller;
         uint64_t key_prediction_mismatches = 0;
         while (running.load() && encoder_queue.pop(&frame)) {
-            const RateProfile desired = static_cast<RateProfile>(requested_profile.load());
+            const int selection = requested_profile.load();
+            const RateProfile desired = static_cast<RateProfile>(selection & 0xff);
+            const int desired_scale = (selection >> 8) & 0xff;
+            const int desired_output_fps = (selection >> 16) & 0xff;
             const TransportMode desired_transport = static_cast<TransportMode>(
                 requested_transport_mode.load());
-            if (runtimeConfig().gan.scale != 0 &&
+            if (desired_scale != 0 &&
                 (desired == RATE_PROFILE_REBUILD || isGanRateProfile(desired) ||
                  desired_transport != TRANSPORT_MODE_VIDEO)) {
                 std::fprintf(stderr, "GAN enhancement requires a rate video profile; restart with --gan=off for this mode\n");
-                requested_profile.store(active_profile.load());
+                requested_profile.store(active_selection.load());
                 requested_transport_mode.store(active_transport_mode.load());
                 continue;
             }
@@ -693,13 +698,13 @@ int main(int argc, char **argv) {
                 isGanQualityProfile(desired) != isGanQualityProfile(
                     static_cast<RateProfile>(active_profile.load()))) {
                 std::fprintf(stderr, "ganq/legacy profile switch requires restart to preserve legacy defaults\n");
-                requested_profile.store(active_profile.load());
+                requested_profile.store(active_selection.load());
                 requested_transport_mode.store(active_transport_mode.load());
                 continue;
             }
             if (isGanQualityProfile(desired) && (audio_sender || desired_transport != TRANSPORT_MODE_VIDEO)) {
                 std::fprintf(stderr, "ganq runtime switch rejected: restart with audio=off and transport=video\n");
-                requested_profile.store(active_profile.load());
+                requested_profile.store(active_selection.load());
                 requested_transport_mode.store(active_transport_mode.load());
                 continue;
             }
@@ -707,11 +712,15 @@ int main(int argc, char **argv) {
                 active_transport_mode.load());
             if (desired_transport != active_transport ||
                 (desired_transport == TRANSPORT_MODE_VIDEO &&
-                 desired != static_cast<RateProfile>(active_profile.load()))) {
+                 selection != active_selection.load())) {
                 AppConfig next = runtimeConfig();
                 if (desired != static_cast<RateProfile>(active_profile.load())) {
                     applyRateProfile(desired, &next);
                 }
+                next.gan.scale = desired_scale;
+                next.gan.receiver_output_fps = desired_output_fps;
+                next.gan.runtime_selection = !isGanRateProfile(desired) &&
+                    desired != RATE_PROFILE_REBUILD;
                 next.transport.mode = desired_transport;
                 const int audio_reserve_bps = audio_sender
                     ? audio_sender->snapshot().reserved_wire_bitrate_bps : 0;
@@ -747,6 +756,7 @@ int main(int argc, char **argv) {
                         std::lock_guard<std::mutex> lock(runtime_config_mutex);
                         runtime_config = next;
                     }
+                    active_selection.store(selection);
                     active_profile.store(static_cast<int>(desired));
                     active_transport_mode.store(static_cast<int>(TRANSPORT_MODE_IMAGE));
                     const unsigned int generation = profile_generation.fetch_add(1) + 1;
@@ -786,6 +796,7 @@ int main(int argc, char **argv) {
                     std::lock_guard<std::mutex> lock(runtime_config_mutex);
                     runtime_config = next;
                 }
+                active_selection.store(selection);
                 active_profile.store(static_cast<int>(desired));
                 active_transport_mode.store(static_cast<int>(TRANSPORT_MODE_VIDEO));
                 const unsigned int generation = profile_generation.fetch_add(1) + 1;
@@ -939,12 +950,14 @@ int main(int argc, char **argv) {
             // Carry it in RO metadata for independent enhancement and legacy GAN;
             // zero keeps every other profile on its original metadata layout.
             transport_unit.stream_profile.gan_scale = static_cast<uint8_t>(live.gan.scale);
+            transport_unit.stream_profile.runtime_selection = live.gan.runtime_selection;
+            transport_unit.stream_profile.receiver_output_fps = static_cast<uint8_t>(live.gan.receiver_output_fps);
             transport_unit.stream_profile.target_bitrate_kbps =
-                (live.gan.scale != 0 || isGanRateProfile(live.rate_profile))
+                (live.gan.scale != 0 || live.gan.runtime_selection || isGanRateProfile(live.rate_profile))
                     ? static_cast<uint16_t>(live.encoder.target_bitrate_bps / 1000)
                     : 0U;
             transport_unit.stream_profile.link_cap_kbps =
-                (live.gan.scale != 0 || isGanRateProfile(live.rate_profile))
+                (live.gan.scale != 0 || live.gan.runtime_selection || isGanRateProfile(live.rate_profile))
                     ? static_cast<uint16_t>(live.transport.pacing_bitrate_bps / 1000)
                     : 0U;
             if (!sender.enqueue(std::move(transport_unit), &encoder_error)) {

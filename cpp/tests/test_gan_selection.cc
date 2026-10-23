@@ -14,6 +14,41 @@ static bool parse(std::vector<std::string> args, AppConfig *config) {
 }
 int main() {
     for (const std::string rate : {"rate60", "rate80", "rate100", "rate120", "rate150", "rate180", "rate200", "rate300"}) {
+        AppConfig source;
+        assert(parse({"--rate-profile="+rate}, &source));
+        RuntimeProfileSelection choice;
+        assert(parseRuntimeProfileSelection(rate, &choice));
+        assert(choice.gan_scale == 0 && choice.output_fps == 0);
+        for (int scale : {2, 4}) {
+            const bool supported = scale == 2 || rate == "rate60" || rate == "rate80" || rate == "rate100" || rate == "rate120";
+            const std::string enhanced = rate+"_x"+std::to_string(scale);
+            assert(parseRuntimeProfileSelection(enhanced, &choice) == supported);
+            const bool interpolates = supported && !(rate == "rate120" && scale == 4);
+            assert(parseRuntimeProfileSelection(enhanced+"_fps30", &choice) == interpolates);
+            if (!interpolates) continue;
+            assert(choice.profile == source.rate_profile && choice.output_fps == 30 && choice.gan_scale == scale);
+            assert(((choice.packed() >> 16) & 255) == 30);
+            assert(!parseRuntimeProfileSelection(enhanced+"_fps"+std::to_string(source.encoder.fps), &choice));
+        }
+        assert(!parseRuntimeProfileSelection(rate+"_fps30", &choice));
+    }
+    for (const std::string bad : {"rate60_x2_fps0", "rate60_x2_fps121", "rate60_x3", "rate60_x2_fpsnan", "rate60_x2_fps15_extra", "rate60_x2_", "rate60_x2_fps999999999999999"}) {
+        RuntimeProfileSelection ignored;
+        assert(!parseRuntimeProfileSelection(bad, &ignored));
+    }
+    for (int scale : {0, 2, 4}) {
+        RtpStreamProfile p;
+        p.valid = true; p.runtime_selection = true; p.gan_scale = scale;
+        p.receiver_output_fps = scale ? 30 : 0;
+        p.width = 320; p.height = 180; p.fps = 10;
+        const uint8_t nal[] = {0,0,1,38,1,42};
+        H265RtpPacketizer packetizer(0, 1, 64);
+        const auto packets = packetizer.packetize(nal, sizeof(nal), 0, &p);
+        assert(packets[0][16] == 3 && packets[0][28] == scale);
+        assert(packets[0][29] == (scale ? 30 : 0));
+        assert(packets[0].size() == 35);
+    }
+    for (const std::string rate : {"rate60", "rate80", "rate100", "rate120", "rate150", "rate180", "rate200", "rate300"}) {
         AppConfig plain;
         assert(parse({"--rate-profile=" + rate}, &plain));
         for (const int scale : {0, 2, 4}) {

@@ -581,6 +581,15 @@ class HudTests(unittest.TestCase):
         finally:
             worker.stop()
 
+    def test_no_first_good_output_requires_live_fallback_even_when_healthy(self):
+        controller = HUD.GanFallbackController(115.0)
+        for sequence in range(1, 301):
+            decision = controller.update(
+                sequence / 10.0, 10.0, sequence, idle_worker_snapshot())
+            self.assertFalse(controller.fallback_active)
+            self.assertIsNone(controller.last_good_completed_at)
+            self.assertEqual(decision.action, HUD.GanAction.USE_LANCZOS)
+
     def test_soft_overdue_reports_good_age_not_run_age(self):
         controller = HUD.GanFallbackController(143.75)
         controller.update(

@@ -55,6 +55,8 @@ def interpolation_settings(args, profile):
 def _open_optional(path, mode):
     if path is None:
         return None
+    if os.environ.get("VC_RUNTIME_APPEND_LOGS") == "1":
+        mode = mode.replace("w", "a")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.open(mode, **({"encoding": "utf8", "buffering": 1} if "b" not in mode else {}))
@@ -88,6 +90,8 @@ def run_interpolated_receiver(args, listen_port):
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     receiver.bind(("0.0.0.0", listen_port))
+    from runtime_profile_receiver import notify_runtime_ready
+    notify_runtime_ready(stop)
     receiver.settimeout(.2)
     command = [args.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning",
                "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "1024",
@@ -211,7 +215,7 @@ def run_interpolated_receiver(args, listen_port):
                          precision=enhancer.execution_precision, phase="CLOCK CALIBRATING")
             event("BACKEND", sr_provider=enhancer.provider, sr_precision=enhancer.execution_precision,
                   sr_model=str(Path(settings["model"]).resolve()),
-                  interpolation="OpenCV DIS FAST CPU bidirectional warp", source=list(settings["source"]),
+                  interpolation="OpenCV DIS FAST CPU consistency/occlusion gated warp", source=list(settings["source"]),
                   native=list(settings["native"]), output=list(settings["output"]),
                   output_fps=args.fps, playout_delay_ms=PLAYOUT_MS)
             print(f"FPS READY: source={settings['source']} native={settings['native']} "
@@ -235,6 +239,7 @@ def run_interpolated_receiver(args, listen_port):
                     counts["sr_expired"] += 1
                     event("SR_DROP", seq=current["seq"], reason="source_age_budget")
                     previous = None
+                    state["phase"] = "SR RESULT EXPIRED (no fresh AI output)"
                     continue
                 counts["sr_completed"] += 1
                 if previous is None or not calibrated.is_set():
@@ -267,9 +272,13 @@ def run_interpolated_receiver(args, listen_port):
                             counts["output_replaced"] += 1
                         outputs.append(job)
                     event("GRID_READY", index=index, pts=timestamp, kind=kind,
-                          flow_ms=flow_ms, warp_ms=warp_ms, queue_depth=len(outputs))
+                          flow_ms=flow_ms, warp_ms=warp_ms, queue_depth=len(outputs),
+                          motion_quality=dict(pair.diagnostics))
                 previous = current
-                state["phase"] = "FLOW ACTIVE"
+                state["phase"] = ("CUT PROTECTION" if pair.cut else
+                                  "UNRELIABLE MOTION PROTECTION" if (pair.global_fallback or
+                                      pair.diagnostics.get('frame_rejected', False)) else
+                                  "FLOW ACTIVE")
         except Exception as error:
             if not stop.is_set():
                 event("ERROR", stage="super_resolution_interpolation", error=str(error))
@@ -283,14 +292,20 @@ def run_interpolated_receiver(args, listen_port):
     for thread in threads:
         thread.start()
     window = "RK3588 H.265 HUD - motion interpolation"
-    if not args.headless:
+    native_window = None
+    if not args.headless and os.name == "nt":
+        from win32_video_window import Win32VideoWindow
+        native_window = Win32VideoWindow(window)
+        event("DISPLAY_BACKEND", backend="win32-dib-timer", hwnd=int(native_window._hwnd))
+    elif not args.headless:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     print(f"INTERPOLATION LISTENING: UDP {listen_port}, --fps={args.fps:g}, CPU DIS, "
           f"playout={PLAYOUT_MS:g}ms; waiting for sender GAN metadata", flush=True)
     event("START", target_fps=args.fps, playout_delay_ms=PLAYOUT_MS, headless=args.headless)
     if args.quality_video_log is not None:
         paths = [Path(__file__), Path(__file__).with_name("live_h265_hud.py"),
-                 Path(__file__).with_name("motion_interpolation.py")]
+                 Path(__file__).with_name("motion_interpolation.py"),
+                 Path(__file__).with_name("win32_video_window.py")]
         args.quality_video_log.with_suffix(".runtime.json").write_text(json.dumps(dict(
             python=sys.executable, python_version=sys.version, headless=args.headless,
             source_sha256={str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}), indent=2))
@@ -298,6 +313,10 @@ def run_interpolated_receiver(args, listen_port):
     previous_canvas, snapshot_saved = None, False
     try:
         while not stop.is_set() and (args.duration <= 0 or time.perf_counter()-started < args.duration):
+            if native_window is not None:
+                for commit in native_window.take_late_commits():
+                    counts["native_commit_late"] += 1
+                    event("NATIVE_LATE_COMMIT", **commit)
             now, candidate = time.perf_counter(), None
             with output_lock:
                 while outputs and outputs[0]["due"] <= now:
@@ -316,13 +335,14 @@ def run_interpolated_receiver(args, listen_port):
                 presented.popleft()
             key = 255
             if candidate is not None or now-last_idle >= .1:
+                prepare_started = time.perf_counter()
                 values, settings = stats.snapshot(), state["settings"]
                 if candidate is not None:
                     canvas = postprocess_frame(candidate["frame"], args.rotate, False)
                     if args.scale > 1:
                         canvas = cv2.resize(canvas, (canvas.shape[1]*args.scale, canvas.shape[0]*args.scale),
                                             interpolation=cv2.INTER_LANCZOS4)
-                    previous_canvas = canvas.copy()
+                    clean_canvas = canvas.copy()
                 else:
                     canvas = (previous_canvas.copy() if previous_canvas is not None else
                               np.zeros((360, 640, 3), dtype=np.uint8))
@@ -330,7 +350,8 @@ def run_interpolated_receiver(args, listen_port):
                 phase = ("SR HARD STALL (no fresh output)" if running_ms > args.gan_hard_stall_ms else state["phase"])
                 lines = [f"INTERP DIS CPU | target {args.fps:g} effective {len(presented):g} fps",
                          f"RX {values['rx_fps']:.1f} DEC {values['decode_fps']:.1f} | {phase}",
-                         f"FRAME {candidate['kind'] if candidate is not None else 'HOLD (no new output)'}"]
+                         f"FRAME {candidate['kind'] if candidate is not None else 'HOLD (no new output)'}",
+                         "GATE forward/backward + photo + motion"]
                 if settings:
                     source, native, output = settings["source"], settings["native"], settings["output"]
                     lines += [f"{state['profile']['name']} SRC {source[0]}x{source[1]} @{settings['source_fps']:g}",
@@ -338,27 +359,62 @@ def run_interpolated_receiver(args, listen_port):
                               f"DISPLAY {canvas.shape[1]}x{canvas.shape[0]} {args.rotate}"]
                 lines += [f"SR {state['precision'] or 'WARMING'}", f"Playout {PLAYOUT_MS:g}ms | fresh FLOW / real only",
                           f"WIRE {values['wire_kbps']:.1f}kbps LOSS {values['lost']} REO {values['reordered']} ERR {values['decode_errors']}",
-                          f"SR {counts['sr_completed']} FLOW {counts['flow_display']} REAL {counts['real_display']} CUT {counts['cut_display']}",
+                          f"SR {counts['sr_completed']} FLOW {counts['flow_display']} REAL {counts['real_display']} CUT {counts['cut_display']} UNSAFE {counts['unreliable_display']}",
                           f"DROP late {counts['compute_late']+counts['presentation_late']} SR {counts['sr_expired']} replace {counts['input_replaced']}"]
                 if histories["latency"]:
                     lines.append(f"PC reference median {statistics.median(histories['latency']):.0f}ms (not camera-to-glass)")
                 wrapped = [part for line in lines for part in textwrap.wrap(line, max(25, int(canvas.shape[1]/6.8)))]
                 for n, line in enumerate(wrapped):
                     cv2.putText(canvas, line, (8, 18+n*17), cv2.FONT_HERSHEY_SIMPLEX, .36, (80,255,80), 1, cv2.LINE_AA)
-                if not args.headless:
+                prepared = time.perf_counter()
+                # Preparation and scheduling can consume the remaining deadline.
+                # Recheck immediately before submitting pixels to HighGUI.
+                if candidate is not None and prepared-candidate["due"] > .033:
+                    counts["prepare_late"] += 1
+                    event("GRID_DROP", index=candidate["index"], reason="prepare_late",
+                          prepare_ms=(prepared-prepare_started)*1000)
+                    continue
+                submitted = prepared
+                native_shown = None
+                if native_window is not None:
+                    native_shown = native_window.show(
+                        canvas, candidate["due"]+.033 if candidate is not None
+                        else time.perf_counter()+.033,
+                        tag=candidate["index"] if candidate is not None else None)
+                    key = native_window.poll_key()
+                    if candidate is not None and native_shown is None:
+                        counts["display_deadline_drop"] += 1
+                        event("GRID_DROP", index=candidate["index"], reason="display_deadline")
+                        continue
+                    submitted = native_shown or time.perf_counter()
+                elif not args.headless:
                     if candidate is not None and last_index < 0:
                         cv2.resizeWindow(window, canvas.shape[1], canvas.shape[0])
                     cv2.imshow(window, canvas)
-                    key = cv2.waitKey(1) & 255
+                    submitted = time.perf_counter()
+                    # Win32 waitKey's timed wait can be delayed by message/key
+                    # processing. pollKey drains events without a timed wait.
+                    key = cv2.pollKey() & 255
+                if candidate is not None:
+                    previous_canvas = clean_canvas
                 last_idle = now
                 if candidate is not None:
-                    shown = time.perf_counter()
+                    shown = native_shown if native_shown is not None else time.perf_counter()
                     latency = (shown-(candidate["a_decoded"]*(1-candidate["alpha"])+candidate["b_decoded"]*candidate["alpha"]))*1000
                     histories["latency"].append(latency)
-                    if candidate["kind"] in ("FLOW", "REAL_A", "REAL_B"):
+                    timely = shown-candidate["due"] <= .033
+                    if not timely:
+                        counts["display_commit_late"] += 1
+                    if timely and candidate["kind"] in ("FLOW", "REAL_A", "REAL_B"):
                         presented.append(shown)
-                    counts[{"FLOW":"flow_display", "REAL_A":"real_display", "REAL_B":"real_display"}.get(candidate["kind"], "cut_display")] += 1
+                    counts[{"FLOW":"flow_display", "REAL_A":"real_display", "REAL_B":"real_display",
+                            "CUT_NEAREST":"cut_display", "UNRELIABLE_NEAREST":"unreliable_display"}[candidate["kind"]]] += 1
                     event("DISPLAY", **{k:v for k,v in candidate.items() if k not in ("frame", "due", "a_decoded", "b_decoded")},
+                          display_backend="win32-dib-timer" if native_window is not None else "headless" if args.headless else "highgui",
+                          prepare_ms=(prepared-prepare_started)*1000,
+                          imshow_ms=(submitted-prepared)*1000,
+                          event_pump_ms=(shown-submitted)*1000,
+                          timely=timely, camera_to_glass_ms=None,
                           headless=args.headless, lateness_ms=(shown-candidate["due"])*1000,
                           pc_grid_latency_ms=(shown-state["origin"]-candidate["pts"])*1000,
                           interpolated_decode_latency_ms=latency,
@@ -371,7 +427,16 @@ def run_interpolated_receiver(args, listen_port):
             if key in (27, ord('q')):
                 break
             if now-last_status >= 5:
-                event("STATUS", stats=stats.snapshot(), pts_queue=pts_queue.snapshot(), counters=dict(counts), effective_fps=len(presented))
+                from runtime_profile_receiver import runtime_worker_status
+                runtime_worker_status(mode="interpolation", profile=state["profile"],
+                    decoded_fps=stats.snapshot()["decode_fps"], effective_fps=len(presented),
+                    gan_completed=counts["sr_completed"], provider=state["provider"],
+                    precision=state["precision"], output_fps=args.fps,
+                    native_output=None if state["settings"] is None else list(state["settings"]["output"]),
+                    canvas=None if previous_canvas is None else [previous_canvas.shape[1], previous_canvas.shape[0]])
+                event("STATUS", stats=stats.snapshot(), pts_queue=pts_queue.snapshot(), counters=dict(counts), effective_fps=len(presented),
+                      native_presenter=None if native_window is None else dict(
+                          modal_entries=native_window.modal_entries, modal_paints=native_window.modal_paints))
                 print(f"FPS target={args.fps:g} effective={len(presented)} state={state['phase']} "
                       f"loss={stats.snapshot()['lost']} errors={stats.snapshot()['decode_errors']}", flush=True)
                 last_status = now
@@ -394,7 +459,9 @@ def run_interpolated_receiver(args, listen_port):
         for thread in threads:
             thread.join(4)
         event("FINISH", stats=stats.snapshot(), counters=dict(counts), elapsed=time.perf_counter()-started)
-        if not args.headless:
+        if native_window is not None:
+            native_window.close()
+        elif not args.headless:
             cv2.destroyAllWindows()
         for stream in (log, packets_log, video):
             if stream is not None:

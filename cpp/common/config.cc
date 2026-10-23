@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 namespace roi_h265 {
 
@@ -24,7 +25,7 @@ EncoderConfig::EncoderConfig()
       super_i_frame_bits(12000), super_p_frame_bits(5500), grayscale_encode(true) {}
 
 GanConfig::GanConfig()
-    : scale(0), fps(10), inference_fps(0), link_cap_kbps(100), video_bitrate_kbps(75),
+    : scale(0), receiver_output_fps(0), runtime_selection(false), fps(10), inference_fps(0), link_cap_kbps(100), video_bitrate_kbps(75),
       max_inference_latency_ms(100), gop_seconds(2), super_frame_policy("current"),
       idr_roi_scale_percent(100), native_720p(false) {}
 
@@ -385,6 +386,42 @@ bool parseRateProfile(const std::string &name, RateProfile *profile) {
     else if (name == "ganq120") *profile = RATE_PROFILE_GANQ120;
     else if (name == "ganq180") *profile = RATE_PROFILE_GANQ180;
     else return false;
+    return true;
+}
+
+bool parseRuntimeProfileSelection(const std::string &name, RuntimeProfileSelection *selection) {
+    if (!selection) return false;
+    std::istringstream input(name);
+    std::vector<std::string> parts;
+    std::string part;
+    while (std::getline(input, part, '_')) parts.push_back(part);
+    if (name.empty() || name.back() == '_' || parts.empty() || parts.size() > 3) return false;
+    RuntimeProfileSelection next;
+    if (!parseRateProfile(parts[0], &next.profile)) return false;
+    next.gan_scale = 0;
+    next.output_fps = 0;
+    if (parts.size() > 1) {
+        const bool rate = parts[0] == "rate60" || parts[0] == "rate80" ||
+            parts[0] == "rate100" || parts[0] == "rate120" || parts[0] == "rate150" ||
+            parts[0] == "rate180" || parts[0] == "rate200" || parts[0] == "rate300";
+        if (!rate || (parts[1] != "x2" && parts[1] != "x4")) return false;
+        next.gan_scale = parts[1] == "x2" ? 2 : 4;
+        if (next.gan_scale == 4 && parts[0] != "rate60" && parts[0] != "rate80" &&
+            parts[0] != "rate100" && parts[0] != "rate120") return false;
+    }
+    if (parts.size() == 3) {
+        // The current bounded CPU-DIS path cannot present native 1080p x4
+        // frames within its 200 ms budget; do not advertise a no-output mode.
+        if (next.profile == RATE_PROFILE_RATE120 && next.gan_scale == 4) return false;
+        const std::string number = parts[2].substr(0, 3) == "fps" ? parts[2].substr(3) : "";
+        if (number.empty() || number.size() > 3 ||
+            number.find_first_not_of("0123456789") != std::string::npos) return false;
+        next.output_fps = std::atoi(number.c_str());
+        AppConfig baseline;
+        applyRateProfile(next.profile, &baseline);
+        if (next.output_fps <= baseline.encoder.fps || next.output_fps > 120) return false;
+    }
+    *selection = next;
     return true;
 }
 

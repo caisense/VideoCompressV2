@@ -5,10 +5,13 @@
 
 #include <chrono>
 #include <mutex>
+#include <deque>
+#include <utility>
 
 namespace roi_h265 {
 
-// A byte-token bucket with a deliberately small burst allowance. It is placed
+// A byte-token bucket additionally constrained by a rolling one-second cap.
+// It is placed
 // after MPP so an oversized IDR is paced fragment-by-fragment over UDP/RTP.
 class RatePacer {
 public:
@@ -28,6 +31,8 @@ private:
     int bitrate_bps_;
     double tokens_;
     double max_burst_bytes_;
+    size_t window_bytes_ = 0;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, size_t> > window_;
     std::chrono::steady_clock::time_point last_refill_;
 };
 
